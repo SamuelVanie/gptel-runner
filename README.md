@@ -67,10 +67,19 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
 The dashboard uses `g` to refresh, `RET` to inspect a run journal, `v` to
-visit a live worker, `c` to abort a call, and `a` to abort a run.
+visit an agent transcript, `c` to abort a call, and `a` to abort a run.
 Programmatically use `gptel-runner-abort-call` and
 `gptel-runner-abort-run`.  Every appended `gptel-runner-event` is also passed
 to `gptel-runner-event-hook`.
+
+Each gptel call has a visible buffer named
+`*gptel-runner:RUN:NODE:CALL*`.  It displays the exact prompt, reasoning when
+enabled by gptel, proposed tool calls and confirmation controls, tool results,
+and the final response.  These buffers are retained by default for human
+inspection but are not reused as agent memory.  Set
+`gptel-runner-retain-worker-buffers` to nil to remove them automatically when
+calls finish.  Events and runtime state remain authoritative; editing a
+transcript does not alter the run.
 
 Run options include `:driver`, `:max-requests`, `:max-calls`,
 `:max-concurrency`, `:max-duration`, `:allow-writes`, and

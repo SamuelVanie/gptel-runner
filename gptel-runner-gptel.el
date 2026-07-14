@@ -22,11 +22,13 @@
 (declare-function gptel--fsm-transition "gptel-request")
 (declare-function gptel--handle-post "gptel-request")
 (declare-function gptel--apply-preset "gptel")
-(declare-function gptel--display-tool-calls "gptel")
+(declare-function gptel--insert-response "gptel")
+(declare-function gptel-mode "gptel")
 
 (defvar gptel-request--transitions)
 (defvar gptel-request--handlers)
 (defvar gptel-confirm-tool-calls)
+(defvar gptel-default-mode)
 
 (cl-defstruct (gptel-runner-gptel-driver
                (:constructor gptel-runner-gptel-driver-create))
@@ -50,7 +52,9 @@
     (gptel-runner-gptel--compatibility-error 'gptel))
   (unless (require 'gptel-request nil t)
     (gptel-runner-gptel--compatibility-error 'gptel-request-library))
-  (dolist (function '(gptel-request gptel-abort))
+  (dolist (function '(gptel-request gptel-abort gptel-make-fsm
+                      gptel--fsm-transition gptel--handle-post
+                      gptel--apply-preset gptel--insert-response))
     (unless (fboundp function)
       (gptel-runner-gptel--compatibility-error function)))
   t)
@@ -61,14 +65,34 @@
            (gptel-runner-call-buffer call))
       (let ((buffer
              (generate-new-buffer
-              (format " *gptel-runner:%s:%s:%s*"
+              (format "*gptel-runner:%s:%s:%s*"
                       (gptel-runner-run-id (gptel-runner-call-run call))
                       (gptel-runner-node-id (gptel-runner-call-node call))
                       (gptel-runner-call-id call)))))
         (setf (gptel-runner-call-buffer call) buffer)
         (with-current-buffer buffer
+          (when (and (boundp 'gptel-default-mode)
+                     (symbolp gptel-default-mode)
+                     (fboundp gptel-default-mode))
+            (funcall gptel-default-mode))
+          (when (fboundp 'gptel-mode) (gptel-mode 1))
+          ;; Major-mode initialization clears buffer-local variables, so set
+          ;; runner identity and workspace only after the display modes.
           (setq-local default-directory (gptel-runner-call-workspace call))
-          (setq-local gptel-runner--call call))
+          (setq-local gptel-runner--call call)
+          (let ((inhibit-read-only t)
+                (run (gptel-runner-call-run call)))
+            (insert
+             (format
+              (concat "Runner call: %s\nRun: %s\nNode: %s\nAgent: %s\n"
+                      "Workspace: %s\n\nUser prompt\n===========\n\n%s\n")
+              (gptel-runner-call-id call)
+              (gptel-runner-run-id run)
+              (gptel-runner-node-id (gptel-runner-call-node call))
+              (gptel-runner-agent-name (gptel-runner-call-agent call))
+              (gptel-runner-call-workspace call)
+              (gptel-runner-call-prompt call)))
+            (goto-char (point-max))))
         buffer)))
 
 (defun gptel-runner-gptel--apply-preset-locally (preset)
@@ -106,19 +130,23 @@ preset setter is private and has changed across releases."
   (cond
    ((stringp response)
     (push response (gptel-runner-call-response-parts call))
-    (funcall observe 'response response))
+    (funcall observe 'response response)
+    (gptel--insert-response response info))
    ((eq response 'abort) nil)
    ((null response) nil)
    ((consp response)
     (pcase (car response)
-      ('reasoning (funcall observe 'reasoning (cdr response)))
+      ('reasoning
+       (funcall observe 'reasoning (cdr response))
+       (gptel--insert-response response info))
       ('tool-call
        (funcall observe 'tool-calls (cdr response))
        (funcall observe 'waiting-confirmation (cdr response))
-       ;; This is gptel's normal confirmation UI.  Its callbacks resume the
-       ;; same FSM after the user accepts or rejects each pending tool call.
-       (gptel--display-tool-calls (cdr response) info))
-      ('tool-result (funcall observe 'tool-results (cdr response)))
+       ;; The normal gptel renderer adds its confirmation UI and callbacks.
+       (gptel--insert-response response info))
+      ('tool-result
+       (funcall observe 'tool-results (cdr response))
+       (gptel--insert-response response info))
       (_ (funcall observe 'response-part response))))
    (t (funcall observe 'response-part response))))
 

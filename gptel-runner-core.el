@@ -18,8 +18,9 @@
   "Deterministic workflows over stateless agent calls."
   :group 'applications)
 
-(defcustom gptel-runner-retain-worker-buffers nil
-  "When non-nil, gptel driver worker buffers survive terminal calls."
+(defcustom gptel-runner-retain-worker-buffers t
+  "When non-nil, gptel worker transcripts survive terminal calls.
+Set this to nil to kill a worker buffer as soon as its call terminalizes."
   :type 'boolean)
 
 (defcustom gptel-runner-default-driver nil

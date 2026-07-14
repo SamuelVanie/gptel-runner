@@ -36,10 +36,31 @@
          (buffer (gptel-runner-gptel--worker-buffer call)))
     (unwind-protect
         (progn
-          (should (string-prefix-p " *gptel-runner:" (buffer-name buffer)))
+          (should (string-prefix-p "*gptel-runner:" (buffer-name buffer)))
           (should (eq (buffer-local-value 'gptel-runner--call buffer) call))
           (should (equal (buffer-local-value 'default-directory buffer)
-                         default-directory)))
+                         default-directory))
+          (with-current-buffer buffer
+            (should (string-match-p "Runner call: call" (buffer-string)))
+            (should (string-match-p "User prompt" (buffer-string)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gptel-runner-gptel-worker-renders-final-response ()
+  (let* ((agent (gptel-runner-agent-create :name 'a :preset nil))
+         (run (gptel-runner-run-create :id "run"))
+         (node (gptel-runner-node-create :id 'node))
+         (call (gptel-runner-call-create
+                :id "call" :agent agent :run run :node node
+                :prompt "Inspect the project" :workspace default-directory))
+         (buffer (gptel-runner-gptel--worker-buffer call)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-max))
+          (let ((info (list :buffer buffer :position (point-marker))))
+            (gptel-runner-gptel--callback
+             call (lambda (&rest _ignored)) "Visible answer" info))
+          (should (string-match-p "Inspect the project" (buffer-string)))
+          (should (string-match-p "Visible answer" (buffer-string))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gptel-runner-gptel-direct-worker-abort-cancels-runner-only ()

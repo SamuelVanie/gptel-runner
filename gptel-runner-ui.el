@@ -123,12 +123,13 @@
       (display-buffer (current-buffer)))))
 
 (defun gptel-runner-dashboard-visit-worker ()
-  "Visit the live worker buffer for the call at point."
+  "Visit the retained or active worker transcript for the call at point."
   (interactive)
   (let* ((call (or (gptel-runner-ui--call-at-point)
                    (user-error "No call on this row")))
          (buffer (gptel-runner-call-buffer call)))
-    (unless (buffer-live-p buffer) (user-error "Call has no live worker"))
+    (unless (buffer-live-p buffer)
+      (user-error "Call has no retained worker transcript"))
     (pop-to-buffer buffer)))
 
 (defun gptel-runner-dashboard-abort-call ()
