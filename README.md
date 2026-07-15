@@ -77,6 +77,22 @@ save a snapshot, `l` to load one, `c` to abort a call, and `a` to abort a run.
 Workflow headers contain their run summary rows, and each run contains its
 agent-call rows; registered workflows with no runs remain visible.
 
+Dashboard columns are a configurable set.  Their order in the value is
+ignored so the table keeps a stable canonical layout:
+
+```elisp
+(setq gptel-runner-dashboard-columns
+      '(workflow run node state elapsed))
+```
+
+Available symbols are `workflow`, `run`, `node`, `call`, `state`, `elapsed`,
+`attempts`, `iteration`, `requests`, and `calls`.  Press `g` in an open
+dashboard after changing the variable, or press `V` to toggle one column
+interactively.  The default is deliberately compact, rows are truncated
+instead of wrapped, and the current row is highlighted.  The spelling
+`gptel-runner-dashboards-column` is accepted as an alias, although
+`gptel-runner-dashboard-columns` is the preferred option name.
+
 Use `d` on a run or call row to forget that run, `D` on any row in a workflow
 group to unregister the workflow and forget its retained runs, and `C` to
 clear all terminal runs.  Cleanup kills retained worker and event buffers but

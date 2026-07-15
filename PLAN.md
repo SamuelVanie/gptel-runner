@@ -39,7 +39,7 @@ normal verification commands where applicable.
 ## User experience and hardening
 
 - [x] Workflow-grouped session dashboard with inspect, visit, lifecycle,
-  cleanup, and abort actions.
+  cleanup, configurable columns, and abort actions.
 - [x] Versioned atomic snapshots, pause/resume across Emacs sessions, restored
   transcript buffers, in-buffer human feedback, and active-duration accounting.
 - [x] Implement/review and fan-out/synthesis examples.

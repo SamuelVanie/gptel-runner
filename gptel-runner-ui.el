@@ -18,8 +18,84 @@
 (declare-function gptel-runner-complete-call-from-buffer
                   "gptel-runner-gptel")
 
+(defconst gptel-runner-dashboard--column-specs
+  '((workflow "Workflow" 22)
+    (run "Run" 16)
+    (node "Node" 20)
+    (call "Call" 16)
+    (state "State" 20)
+    (elapsed "Elapsed" 9)
+    (attempts "Attempts" 9)
+    (iteration "Iteration" 9)
+    (requests "Requests left" 13)
+    (calls "Calls left" 10))
+  "Canonical dashboard column definitions and display order.")
+
+(defvaralias 'gptel-runner-dashboards-column
+  'gptel-runner-dashboard-columns
+  "Alias for `gptel-runner-dashboard-columns'.")
+
+(defcustom gptel-runner-dashboard-columns
+  '(workflow run node state elapsed)
+  "Columns visible in the runner dashboard.
+List order is ignored; columns always use the canonical dashboard order."
+  :type '(set
+          (const :tag "Workflow" workflow)
+          (const :tag "Run" run)
+          (const :tag "Node" node)
+          (const :tag "Call" call)
+          (const :tag "State" state)
+          (const :tag "Elapsed time" elapsed)
+          (const :tag "Request attempts" attempts)
+          (const :tag "Workflow iteration" iteration)
+          (const :tag "Requests remaining" requests)
+          (const :tag "Calls remaining" calls))
+  :group 'gptel-runner)
+
 (defvar gptel-runner-dashboard-buffer "*gptel-runner*"
   "Name of the session dashboard buffer.")
+
+(defun gptel-runner-ui--selected-column-specs ()
+  "Return selected column specifications in canonical display order."
+  (let* ((known (mapcar #'car gptel-runner-dashboard--column-specs))
+         (unknown (cl-set-difference gptel-runner-dashboard-columns known))
+         (selected
+          (cl-remove-if-not
+           (lambda (spec) (memq (car spec) gptel-runner-dashboard-columns))
+           gptel-runner-dashboard--column-specs)))
+    (when unknown
+      (user-error "Unknown dashboard column%s: %S"
+                  (if (= (length unknown) 1) "" "s") unknown))
+    (unless selected
+      (user-error "Select at least one dashboard column"))
+    selected))
+
+(defun gptel-runner-ui--format ()
+  "Build `tabulated-list-format' from the selected dashboard columns."
+  (vconcat
+   (mapcar (lambda (spec)
+             (list (nth 1 spec) (nth 2 spec) nil))
+           (gptel-runner-ui--selected-column-specs))))
+
+(defun gptel-runner-ui--row-vector (values)
+  "Build a dashboard row vector from column alist VALUES."
+  (vconcat
+   (mapcar (lambda (spec)
+             (or (alist-get (car spec) values) ""))
+           (gptel-runner-ui--selected-column-specs))))
+
+(defun gptel-runner-ui--state (state)
+  "Return STATE as a dashboard string with an appropriate face."
+  (propertize
+   (format "%s" state)
+   'face
+   (pcase state
+     ('succeeded 'success)
+     ((or 'failed 'blocked 'stalled 'cancelled) 'error)
+     ((or 'waiting-confirmation 'waiting-feedback 'paused 'retry-wait)
+      'warning)
+     ((or 'running 'ready) 'font-lock-keyword-face)
+     (_ 'shadow))))
 
 (defun gptel-runner-ui--elapsed (run &optional call)
   "Return elapsed seconds for RUN or CALL as a compact string."
@@ -57,48 +133,54 @@
   "Create a workflow NAME dashboard header containing RUN-COUNT."
   (list
    (list 'workflow name)
-   (vector
-    (propertize (if name (symbol-name name) "<anonymous>")
-                'face 'font-lock-function-name-face)
-    "" "" ""
-    (format "%d run%s" run-count (if (= run-count 1) "" "s"))
-    "" "" "" "" "")))
+   (gptel-runner-ui--row-vector
+    `((workflow . ,(propertize
+                    (if name (symbol-name name) "<anonymous>")
+                    'face 'font-lock-function-name-face))
+      (state . ,(propertize
+                 (format "%d run%s" run-count (if (= run-count 1) "" "s"))
+                 'face 'shadow))))))
 
 (defun gptel-runner-ui--run-entry (run)
   "Return the dashboard summary entry for RUN."
   (list
    (list 'run (gptel-runner-run-id run))
-   (vector
-    "" (concat "  " (gptel-runner-run-id run)) "" ""
-    (format "%s" (gptel-runner-run-state run))
-    (gptel-runner-ui--elapsed run) "-" "-"
-    (gptel-runner-ui--remaining
-     run #'gptel-runner-budget-requests
-     #'gptel-runner-budget-max-requests)
-    (gptel-runner-ui--remaining
-     run #'gptel-runner-budget-calls
-     #'gptel-runner-budget-max-calls))))
+   (gptel-runner-ui--row-vector
+    `((run . ,(concat "  " (gptel-runner-run-id run)))
+      (state . ,(gptel-runner-ui--state (gptel-runner-run-state run)))
+      (elapsed . ,(gptel-runner-ui--elapsed run))
+      (attempts . "-")
+      (iteration . "-")
+      (requests . ,(gptel-runner-ui--remaining
+                    run #'gptel-runner-budget-requests
+                    #'gptel-runner-budget-max-requests))
+      (calls . ,(gptel-runner-ui--remaining
+                 run #'gptel-runner-budget-calls
+                 #'gptel-runner-budget-max-calls))))))
 
 (defun gptel-runner-ui--call-entry (run call)
   "Return the dashboard detail entry for CALL belonging to RUN."
   (let ((node (gptel-runner-call-node call)))
     (list
      (list 'call (gptel-runner-call-id call))
-     (vector
-      "" ""
-      (concat "    " (format "%s" (gptel-runner-node-id node)))
-      (concat "  " (gptel-runner-call-id call))
-      (format "%s" (gptel-runner-call-state call))
-      (gptel-runner-ui--elapsed run call)
-      (number-to-string (gptel-runner-call-request-attempt call))
-      (number-to-string
-       (gptel-runner-iteration run (gptel-runner-node-id node)))
-      (gptel-runner-ui--remaining
-       run #'gptel-runner-budget-requests
-       #'gptel-runner-budget-max-requests)
-      (gptel-runner-ui--remaining
-       run #'gptel-runner-budget-calls
-       #'gptel-runner-budget-max-calls)))))
+     (gptel-runner-ui--row-vector
+      `((node . ,(concat "    " (format "%s"
+                                     (gptel-runner-node-id node))))
+        (call . ,(concat "  " (gptel-runner-call-id call)))
+        (state . ,(gptel-runner-ui--state
+                   (gptel-runner-call-state call)))
+        (elapsed . ,(gptel-runner-ui--elapsed run call))
+        (attempts . ,(number-to-string
+                      (gptel-runner-call-request-attempt call)))
+        (iteration . ,(number-to-string
+                       (gptel-runner-iteration
+                        run (gptel-runner-node-id node))))
+        (requests . ,(gptel-runner-ui--remaining
+                      run #'gptel-runner-budget-requests
+                      #'gptel-runner-budget-max-requests))
+        (calls . ,(gptel-runner-ui--remaining
+                   run #'gptel-runner-budget-calls
+                   #'gptel-runner-budget-max-calls)))))))
 
 (defun gptel-runner-ui--entries ()
   "Return dashboard entries grouped as workflow, run, and call rows."
@@ -109,10 +191,11 @@
               (lambda (run)
                 (eq name (gptel-runner-ui--workflow-name run)))
               runs)))
-        (setq entries
-              (nconc entries
-                     (list (gptel-runner-ui--workflow-entry
-                            name (length workflow-runs)))))
+        (when (memq 'workflow gptel-runner-dashboard-columns)
+          (setq entries
+                (nconc entries
+                       (list (gptel-runner-ui--workflow-entry
+                              name (length workflow-runs))))))
         (dolist (run workflow-runs)
           (setq entries
                 (nconc entries
@@ -124,14 +207,44 @@
 (define-derived-mode gptel-runner-dashboard-mode tabulated-list-mode
   "Runner-Dashboard"
   "Major mode for inspecting session-local gptel-runner state."
-  (setq tabulated-list-format
-        [("Workflow" 24 nil) ("Run" 16 nil) ("Node" 22 nil)
-         ("Call" 16 nil) ("State" 20 nil)
-         ("Elapsed" 9 nil) ("Attempts" 9 nil) ("Iteration" 9 nil)
-         ("Requests left" 13 nil) ("Calls left" 10 nil)])
-  (setq tabulated-list-padding 2
+  (setq tabulated-list-format (gptel-runner-ui--format)
+        tabulated-list-padding 2
         tabulated-list-entries #'gptel-runner-ui--entries)
+  (setq-local truncate-lines t)
+  (hl-line-mode 1)
   (tabulated-list-init-header))
+
+(defun gptel-runner-dashboard-refresh ()
+  "Refresh dashboard data and apply the current column selection."
+  (interactive)
+  (setq tabulated-list-format (gptel-runner-ui--format))
+  (tabulated-list-init-header)
+  (tabulated-list-print t))
+
+(defun gptel-runner-dashboard-toggle-column (column)
+  "Toggle visibility of dashboard COLUMN and refresh the table."
+  (interactive
+   (list
+    (intern
+     (completing-read
+      "Toggle dashboard column: "
+      (mapcar (lambda (spec) (symbol-name (car spec)))
+              gptel-runner-dashboard--column-specs)
+      nil t))))
+  (unless (assq column gptel-runner-dashboard--column-specs)
+    (user-error "Unknown dashboard column: %S" column))
+  (if (memq column gptel-runner-dashboard-columns)
+      (if (= (length gptel-runner-dashboard-columns) 1)
+          (user-error "The dashboard must retain at least one column")
+        (setq gptel-runner-dashboard-columns
+              (delq column (copy-sequence
+                            gptel-runner-dashboard-columns))))
+    (push column gptel-runner-dashboard-columns))
+  (gptel-runner-dashboard-refresh)
+  (message "%s column %s"
+           (if (memq column gptel-runner-dashboard-columns)
+               "Showing" "Hiding")
+           column))
 
 (defun gptel-runner-ui--call-at-point ()
   "Return runner call represented by the current dashboard row."
@@ -313,9 +426,10 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
   (define-key map (kbd "d") #'gptel-runner-dashboard-forget-run)
   (define-key map (kbd "D") #'gptel-runner-dashboard-forget-workflow)
   (define-key map (kbd "C") #'gptel-runner-dashboard-clear-finished)
+  (define-key map (kbd "V") #'gptel-runner-dashboard-toggle-column)
   (define-key map (kbd "c") #'gptel-runner-dashboard-abort-call)
   (define-key map (kbd "a") #'gptel-runner-dashboard-abort-run)
-  (define-key map (kbd "g") #'revert-buffer))
+  (define-key map (kbd "g") #'gptel-runner-dashboard-refresh))
 
 ;;;###autoload
 (defun gptel-runner-show-dashboard ()
@@ -324,7 +438,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
   (let ((buffer (get-buffer-create gptel-runner-dashboard-buffer)))
     (with-current-buffer buffer
       (gptel-runner-dashboard-mode)
-      (tabulated-list-print t))
+      (gptel-runner-dashboard-refresh))
     (pop-to-buffer buffer)))
 
 (provide 'gptel-runner-ui)

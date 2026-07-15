@@ -537,6 +537,19 @@
                                   (buffer-string)))
           (should (string-match-p "empty-workflow" (buffer-string))))))))
 
+(ert-deftest gptel-runner-dashboard-columns-are-configurable-as-a-set ()
+  (let ((gptel-runner-dashboard-columns '(state workflow call)))
+    (should (equal
+             (mapcar #'car (append (gptel-runner-ui--format) nil))
+             '("Workflow" "Call" "State")))
+    (should (= (length
+                (cadr (gptel-runner-ui--workflow-entry 'workflow 2)))
+               3)))
+  (let ((gptel-runner-dashboard-columns '(bogus workflow)))
+    (should-error (gptel-runner-ui--format) :type 'user-error))
+  (let ((gptel-runner-dashboard-columns nil))
+    (should-error (gptel-runner-ui--format) :type 'user-error)))
+
 (ert-deftest gptel-runner-forget-run-and-workflow-clean-session-noise ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
