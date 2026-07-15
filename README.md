@@ -43,6 +43,9 @@ linear researcher-to-planner-to-implementer handoff.  The
 [natural-language review loop](examples/natural-language-review-loop.el)
 shows fresh implementer/reviewer calls communicating through a minimal file
 without `gptel-runner-review`.  The
+[dual-review loop](examples/dual-review-loop.el) demonstrates a writer followed
+by two parallel independent reviewers, strict verdict parsing, automatic
+one-shot output repair, bounded revisions, and stall detection.  The
 [structured implementation/review](examples/implement-review.el) and
 [parallel design](examples/parallel-design.el) examples demonstrate the
 optional schema helpers and fan-out/synthesis workflows.
