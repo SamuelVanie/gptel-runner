@@ -172,6 +172,11 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
   (prog1 (gethash name gptel-runner--agents)
     (remhash name gptel-runner--agents)))
 
+(defun gptel-runner-unregister-workflow (name)
+  "Remove registered workflow NAME and return it when it existed."
+  (prog1 (gethash name gptel-runner--workflows)
+    (remhash name gptel-runner--workflows)))
+
 (defun gptel-runner--agent (name)
   "Return registered agent NAME or signal a user error."
   (or (gethash name gptel-runner--agents)
@@ -198,6 +203,59 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
     (sort runs (lambda (a b)
                  (> (gptel-runner-run-started-at a)
                     (gptel-runner-run-started-at b))))))
+
+(defun gptel-runner--forgettable-run-p (run)
+  "Return non-nil when RUN can be safely removed from session state."
+  (or (gptel-runner--run-terminal-p run)
+      (eq (gptel-runner-run-state run) 'paused)))
+
+(defun gptel-runner-forget-run (run &optional delete-snapshot)
+  "Remove RUN from session state and kill its inspection buffers.
+RUN may be a run object or its identifier.  It must be terminal or paused.
+When DELETE-SNAPSHOT is non-nil, also delete its durable snapshot file."
+  (when (stringp run)
+    (setq run (gethash run gptel-runner--runs)))
+  (unless (gptel-runner-run-p run)
+    (user-error "Unknown gptel-runner run"))
+  (unless (gptel-runner--forgettable-run-p run)
+    (user-error "Run %s is active; abort or pause it before removing it"
+                (gptel-runner-run-id run)))
+  (dolist (call (gptel-runner-run-calls run))
+    (when (buffer-live-p (gptel-runner-call-buffer call))
+      (kill-buffer (gptel-runner-call-buffer call))
+      (setf (gptel-runner-call-buffer call) nil)))
+  (when-let ((events-buffer
+              (get-buffer (format "*gptel-runner events:%s*"
+                                  (gptel-runner-run-id run)))))
+    (kill-buffer events-buffer))
+  (when (and delete-snapshot
+             (gptel-runner-run-snapshot-file run)
+             (file-exists-p (gptel-runner-run-snapshot-file run)))
+    (delete-file (gptel-runner-run-snapshot-file run)))
+  (remhash (gptel-runner-run-id run) gptel-runner--runs)
+  run)
+
+(defun gptel-runner-forget-workflow (name &optional delete-snapshots)
+  "Remove workflow NAME registration and retained run history.
+Signal if any associated run is still active.  When DELETE-SNAPSHOTS is
+non-nil, also delete snapshot files belonging to the removed runs."
+  (let* ((workflow (gethash name gptel-runner--workflows))
+         (runs
+          (cl-remove-if-not
+           (lambda (run)
+             (eq name (gptel-runner-workflow-name
+                       (gptel-runner-run-workflow run))))
+           (gptel-runner-list-runs)))
+         (active (cl-find-if-not #'gptel-runner--forgettable-run-p runs)))
+    (unless (or workflow runs)
+      (user-error "Unknown gptel-runner workflow: %S" name))
+    (when active
+      (user-error "Workflow %S has active run %s; abort or pause it first"
+                  name (gptel-runner-run-id active)))
+    (dolist (run runs)
+      (gptel-runner-forget-run run delete-snapshots))
+    (gptel-runner-unregister-workflow name)
+    workflow))
 
 (defun gptel-runner--set-node-state (run node state &optional data)
   "Set NODE state in RUN to STATE and emit its transition with DATA."

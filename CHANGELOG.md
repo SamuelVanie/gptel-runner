@@ -11,3 +11,4 @@
   gptel transcript buffers.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
+- Group dashboard rows by workflow and add safe run/workflow cleanup commands.

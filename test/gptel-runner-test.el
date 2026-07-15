@@ -510,5 +510,86 @@
                 (should (= (length (gptel-runner-run-calls restored)) 1)))))
         (delete-directory snapshot-directory t)))))
 
+(ert-deftest gptel-runner-dashboard-groups-workflows-runs-and-calls ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (gptel-runner-defworkflow alpha-workflow ()
+      (gptel-runner-agent-step
+       :id 'alpha-step :agent 'worker :prompt "alpha"))
+    (gptel-runner-defworkflow empty-workflow ()
+      (gptel-runner-agent-step
+       :id 'empty-step :agent 'worker :prompt "empty"))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'worker '(:value "done"))
+      (let* ((run (gptel-runner-start 'alpha-workflow :driver driver))
+             (call (car (gptel-runner-run-calls run)))
+             (ids (mapcar #'car (gptel-runner-ui--entries))))
+        (should (equal ids
+                       (list '(workflow alpha-workflow)
+                             (list 'run (gptel-runner-run-id run))
+                             (list 'call (gptel-runner-call-id call))
+                             '(workflow empty-workflow))))
+        (with-temp-buffer
+          (gptel-runner-dashboard-mode)
+          (tabulated-list-print t)
+          (should (string-match-p "alpha-workflow" (buffer-string)))
+          (should (string-match-p (gptel-runner-run-id run)
+                                  (buffer-string)))
+          (should (string-match-p "empty-workflow" (buffer-string))))))))
+
+(ert-deftest gptel-runner-forget-run-and-workflow-clean-session-noise ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (gptel-runner-defworkflow disposable-workflow ()
+      (gptel-runner-agent-step
+       :id 'work :agent 'worker :prompt "work"))
+    (let ((driver (gptel-runner-fake-driver-create))
+          (snapshot (make-temp-file "gptel-runner-forget-")))
+      (unwind-protect
+          (progn
+            (gptel-runner-fake-queue driver 'worker '(:value "done"))
+            (let* ((run (gptel-runner-start 'disposable-workflow
+                                            :driver driver))
+                   (call (car (gptel-runner-run-calls run)))
+                   (worker-buffer (generate-new-buffer " *runner-worker*"))
+                   (events-buffer
+                    (get-buffer-create
+                     (format "*gptel-runner events:%s*"
+                             (gptel-runner-run-id run)))))
+              (setf (gptel-runner-call-buffer call) worker-buffer
+                    (gptel-runner-run-snapshot-file run) snapshot)
+              (gptel-runner-forget-workflow 'disposable-workflow)
+              (should-not (gethash 'disposable-workflow
+                                   gptel-runner--workflows))
+              (should-not (gethash (gptel-runner-run-id run)
+                                   gptel-runner--runs))
+              (should-not (buffer-live-p worker-buffer))
+              (should-not (buffer-live-p events-buffer))
+              ;; Forgetting dashboard state preserves durable recovery data
+              ;; unless snapshot deletion was explicitly requested.
+              (should (file-exists-p snapshot)))
+            (gptel-runner-defworkflow disposable-workflow ()
+              (gptel-runner-agent-step
+               :id 'work :agent 'worker :prompt "work"))
+            (gptel-runner-fake-queue driver 'worker '(:value "done again"))
+            (let ((run (gptel-runner-start 'disposable-workflow
+                                           :driver driver)))
+              (setf (gptel-runner-run-snapshot-file run) snapshot)
+              (gptel-runner-forget-run run t)
+              (should-not (file-exists-p snapshot))))
+        (when (file-exists-p snapshot) (delete-file snapshot))))
+    (gptel-runner-defworkflow active-workflow ()
+      (gptel-runner-agent-step
+       :id 'active :agent 'worker :prompt "wait"))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'worker '(:manual t))
+      (let ((run (gptel-runner-start 'active-workflow :driver driver)))
+        (should-error (gptel-runner-forget-run run) :type 'user-error)
+        (should-error (gptel-runner-forget-workflow 'active-workflow)
+                      :type 'user-error)
+        (gptel-runner-abort-run run)
+        (gptel-runner-forget-workflow 'active-workflow)
+        (should-not (gethash 'active-workflow gptel-runner--workflows))))))
+
 (provide 'gptel-runner-test)
 ;;; gptel-runner-test.el ends here

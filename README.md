@@ -74,9 +74,21 @@ The dashboard uses `g` to refresh, `RET` to inspect a run journal, `v` to
 visit an agent transcript, `p` to pause a call for feedback, `x` to accept its
 latest response, `P` to pause and snapshot a run, `r` to resume it, `s` to
 save a snapshot, `l` to load one, `c` to abort a call, and `a` to abort a run.
+Workflow headers contain their run summary rows, and each run contains its
+agent-call rows; registered workflows with no runs remain visible.
+
+Use `d` on a run or call row to forget that run, `D` on any row in a workflow
+group to unregister the workflow and forget its retained runs, and `C` to
+clear all terminal runs.  Cleanup kills retained worker and event buffers but
+preserves durable snapshots by default.  Use `C-u d`, `C-u D`, or `C-u C` to
+delete the corresponding snapshots as well.  Active runs are protected: pause
+or abort them before cleanup.  Paused runs may be forgotten because their
+snapshot remains recoverable unless snapshot deletion was explicitly chosen.
 Programmatically use `gptel-runner-abort-call` and
-`gptel-runner-abort-run`.  Every appended `gptel-runner-event` is also passed
-to `gptel-runner-event-hook`.
+`gptel-runner-abort-run`; cleanup is available through
+`gptel-runner-forget-run`, `gptel-runner-forget-workflow`, and
+`gptel-runner-unregister-workflow`.  Every appended `gptel-runner-event` is
+also passed to `gptel-runner-event-hook`.
 
 Each gptel call has a visible buffer named
 `*gptel-runner:RUN:NODE:CALL*`.  It displays the exact prompt, reasoning when
