@@ -6,4 +6,8 @@
 - Add fake and gptel drivers, retries, budgets, cancellation, and events.
 - Add structured review cycles, stall detection, and parallel joins.
 - Add a session dashboard, examples, and ERT coverage.
-
+- Add atomic persistent snapshots and cross-session workflow resume.
+- Add pausable agent calls that can be guided and completed from their normal
+  gptel transcript buffers.
+- Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
+  and the runner leaves `waiting-confirmation`.

@@ -12,6 +12,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'text-property-search)
 (require 'gptel-runner-core)
 
 (declare-function gptel-request "gptel-request")
@@ -24,6 +25,8 @@
 (declare-function gptel--apply-preset "gptel")
 (declare-function gptel--insert-response "gptel")
 (declare-function gptel-mode "gptel")
+(declare-function gptel-runner--complete-restored-call "gptel-runner-flow")
+(declare-function gptel-runner-resume-run "gptel-runner-flow")
 
 (defvar gptel-request--transitions)
 (defvar gptel-request--handlers)
@@ -33,9 +36,6 @@
 (cl-defstruct (gptel-runner-gptel-driver
                (:constructor gptel-runner-gptel-driver-create))
   "Driver backed by `gptel-request'.")
-
-(defvar-local gptel-runner--call nil
-  "Runner call associated with the current private worker buffer.")
 
 (defvar gptel-runner-gptel--cancelling nil)
 
@@ -95,6 +95,21 @@
             (goto-char (point-max))))
         buffer)))
 
+(defun gptel-runner-gptel-restore-worker-buffer (call transcript)
+  "Restore CALL's human-readable worker buffer from TRANSCRIPT."
+  (gptel-runner-gptel--check-api)
+  (let ((buffer (gptel-runner-gptel--worker-buffer call)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert transcript)
+        (goto-char (point-max)))
+      (setq-local gptel-runner--call call)
+      (setq-local default-directory (gptel-runner-call-workspace call))
+      (gptel-runner-gptel--apply-preset-locally
+       (gptel-runner-agent-preset (gptel-runner-call-agent call))))
+    buffer))
+
 (defun gptel-runner-gptel--apply-preset-locally (preset)
   "Apply symbol or plist PRESET in the current worker buffer.
 The symbol path is intentionally isolated here because gptel's buffer-local
@@ -125,13 +140,15 @@ preset setter is private and has changed across releases."
           :status (plist-get info :status)
           :error (plist-get info :error))))
 
-(defun gptel-runner-gptel--callback (call observe response info)
-  "Use OBSERVE to record gptel RESPONSE and INFO for CALL."
+(defun gptel-runner-gptel--callback (call observe response info &optional raw)
+  "Use OBSERVE to record gptel RESPONSE and INFO for CALL.
+RAW is gptel's internal flag for already formatted transcript content."
   (cond
    ((stringp response)
-    (push response (gptel-runner-call-response-parts call))
-    (funcall observe 'response response)
-    (gptel--insert-response response info))
+    (unless raw
+      (push response (gptel-runner-call-response-parts call))
+      (funcall observe 'response response))
+    (gptel--insert-response response info raw))
    ((eq response 'abort) nil)
    ((null response) nil)
    ((consp response)
@@ -190,8 +207,11 @@ preset setter is private and has changed across releases."
   (let* ((info (gptel-fsm-info fsm))
          (call (plist-get info :context)))
     (gptel-runner-gptel--post-once call fsm)
-    (funcall (gptel-runner-gptel--complete-function call)
-             'cancelled nil nil)))
+    (if (plist-get (gptel-runner-call-driver-data call) :pausing)
+        (setf (gptel-runner-call-driver-data call)
+              (plist-put (gptel-runner-call-driver-data call) :pausing nil))
+      (funcall (gptel-runner-gptel--complete-function call)
+               'cancelled nil nil))))
 
 (defun gptel-runner-gptel--make-fsm ()
   "Create a per-call FSM with only runner terminal handlers replaced."
@@ -247,8 +267,9 @@ preset setter is private and has changed across releases."
               (gptel-runner-call-prompt call)
             :buffer buffer :stream nil :context call :schema schema :fsm fsm
             :callback
-            (lambda (response info)
-              (gptel-runner-gptel--callback call observe response info))))))))
+            (lambda (response info &optional raw)
+              (gptel-runner-gptel--callback
+               call observe response info raw))))))))
 
 (cl-defmethod gptel-runner-driver-cancel
   ((_driver gptel-runner-gptel-driver) call)
@@ -257,11 +278,81 @@ preset setter is private and has changed across releases."
     (let ((gptel-runner-gptel--cancelling t))
       (gptel-abort (gptel-runner-call-buffer call)))
     (when (and (not (gptel-runner--call-terminal-p call))
-               (gptel-runner-call-fsm call))
+               (gptel-runner-call-fsm call)
+               (not (eq (gptel-fsm-state (gptel-runner-call-fsm call))
+                        'ABRT)))
       ;; During retry backoff or confirmation there may be no process for
       ;; `gptel-abort' to find, so explicitly enter the same ABRT handler.
       (gptel--fsm-transition (gptel-runner-call-fsm call) 'ABRT))
     (gptel-runner-gptel--cleanup call)))
+
+(cl-defmethod gptel-runner-driver-pause
+  ((_driver gptel-runner-gptel-driver) call)
+  "Stop CALL's provider work while retaining its transcript for feedback."
+  (setf (gptel-runner-call-driver-data call)
+        (plist-put (gptel-runner-call-driver-data call) :pausing t))
+  (when (buffer-live-p (gptel-runner-call-buffer call))
+    (let ((gptel-runner-gptel--cancelling t))
+      (gptel-abort (gptel-runner-call-buffer call)))
+    (when (and (gptel-runner-call-fsm call)
+               (not (eq (gptel-fsm-state (gptel-runner-call-fsm call))
+                        'ABRT)))
+      (gptel--fsm-transition (gptel-runner-call-fsm call) 'ABRT))
+    (with-current-buffer (gptel-runner-call-buffer call)
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert
+         (concat
+          "\n\nRunner intervention\n===================\n\n"
+          "This workflow call is paused.  Add feedback and continue with "
+          "ordinary gptel commands in this buffer.  When the response should "
+          "be returned to the workflow, select it or leave point after the "
+          "latest response and run M-x "
+          "gptel-runner-complete-call-from-buffer.\n"))))))
+
+(defun gptel-runner-gptel--last-response (buffer)
+  "Return the last gptel response text found in BUFFER."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-max))
+      (when-let ((match (text-property-search-backward
+                         'gptel 'response t)))
+        (buffer-substring-no-properties
+         (prop-match-beginning match) (prop-match-end match))))))
+
+(defun gptel-runner-complete-call-from-buffer (&optional result call)
+  "Complete paused CALL with RESULT from its gptel worker buffer.
+Interactively, use the active region when present, otherwise use the last text
+marked by gptel as a response.  In the original Emacs session this releases
+the preserved workflow continuation.  For a restored snapshot it records the
+node result and reconstructs the continuation from the workflow AST."
+  (interactive
+   (list (and (use-region-p)
+              (buffer-substring-no-properties
+               (region-beginning) (region-end)))
+         nil))
+  (setq call (or call
+                 (and (boundp 'gptel-runner--call) gptel-runner--call)))
+  (unless (gptel-runner-call-p call)
+    (user-error "No runner call is associated with this buffer"))
+  (unless (memq (gptel-runner-call-state call) '(waiting-feedback paused))
+    (user-error "Call %s is not waiting for feedback" (gptel-runner-call-id call)))
+  (setq result
+        (or result
+            (and (buffer-live-p (gptel-runner-call-buffer call))
+                 (gptel-runner-gptel--last-response
+                  (gptel-runner-call-buffer call)))))
+  (unless (and (stringp result) (not (string-empty-p result)))
+    (user-error "Select a response or continue the gptel conversation first"))
+  (let* ((run (gptel-runner-call-run call))
+         (resume-afterward (eq (gptel-runner-run-state run) 'paused)))
+    (if (gptel-runner-call-on-complete call)
+        (gptel-runner--finish-call call 'succeeded result)
+      (gptel-runner--complete-restored-call call result))
+    (when (and resume-afterward
+               (eq (gptel-runner-run-state run) 'paused))
+      (gptel-runner-resume-run run)))
+  call)
 
 (defun gptel-runner-gptel--around-abort (original &optional buffer)
   "Integrate ORIGINAL `gptel-abort' with runner worker BUFFER."
@@ -269,6 +360,8 @@ preset setter is private and has changed across releases."
          (call (and (buffer-live-p target)
                     (buffer-local-value 'gptel-runner--call target))))
     (when (and call (not gptel-runner-gptel--cancelling)
+               (memq (gptel-runner-call-state call)
+                     '(running retry-wait waiting-confirmation))
                (not (gptel-runner--call-terminal-p call)))
       (gptel-runner-abort-call call 'gptel-abort))
     (funcall original target)))

@@ -1,7 +1,8 @@
 # gptel-runner
 
-`gptel-runner` is a deterministic, session-local workflow engine for stateless
-Emacs AI agent calls.  It composes registered gptel presets into sequences,
+`gptel-runner` is a deterministic workflow engine for stateless Emacs AI
+agent calls, with durable checkpoints and inspectable agent transcripts.  It
+composes registered gptel presets into sequences,
 branches, bounded review loops, and parallel fan-out/synthesis workflows while
 keeping budgets, retries, cancellation, and terminal decisions in Emacs Lisp.
 
@@ -67,7 +68,9 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
 The dashboard uses `g` to refresh, `RET` to inspect a run journal, `v` to
-visit an agent transcript, `c` to abort a call, and `a` to abort a run.
+visit an agent transcript, `p` to pause a call for feedback, `x` to accept its
+latest response, `P` to pause and snapshot a run, `r` to resume it, `s` to
+save a snapshot, `l` to load one, `c` to abort a call, and `a` to abort a run.
 Programmatically use `gptel-runner-abort-call` and
 `gptel-runner-abort-run`.  Every appended `gptel-runner-event` is also passed
 to `gptel-runner-event-hook`.
@@ -81,10 +84,79 @@ inspection but are not reused as agent memory.  Set
 calls finish.  Events and runtime state remain authoritative; editing a
 transcript does not alter the run.
 
+### Human feedback in an agent buffer
+
+Use `M-x gptel-runner-pause-call` in an active worker buffer, or press `p` on
+its dashboard row.  The provider request is stopped without failing the
+workflow node and the buffer becomes an ordinary gptel conversation.  Add
+your correction, use the normal gptel commands to obtain a new response, then
+run `M-x gptel-runner-complete-call-from-buffer`.  An active region is used
+when present; otherwise the latest gptel response is returned to the workflow.
+The workflow then continues from that node's original continuation.
+
+This is deliberately different from `gptel-runner-abort-call`: aborting is a
+terminal cancellation, while pausing enters the `waiting-feedback` state.
+
+### Durable snapshots and overnight resume
+
+Persistent runs must use a named workflow and stable explicit node IDs.  Add
+`:persist t` to the workflow defaults or start call:
+
+```elisp
+(gptel-runner-defworkflow durable-handoff (:persist t)
+  (gptel-runner-sequence
+   :id 'durable-handoff-sequence
+   (gptel-runner-agent-step
+    :id 'investigate :agent 'researcher :prompt #'research-prompt
+    :save-as 'findings)
+   (gptel-runner-agent-step
+    :id 'implement :agent 'implementer :prompt #'implement-prompt
+    :save-as 'report)))
+
+(gptel-runner-start 'durable-handoff
+ :goal "Implement the requested change"
+ :workspace (project-root (project-current t))
+ :allow-writes t)
+```
+
+Safe checkpoints are written atomically beneath
+`gptel-runner-snapshot-directory` (by default
+`~/.emacs.d/gptel-runner/snapshots/`).  Pause the entire process with
+`M-x gptel-runner-pause-run` from a worker or `P` in the dashboard.  The
+active-duration clock stops while paused.
+
+After restarting Emacs, load the same workflow and agent definitions, then:
+
+```elisp
+(setq my-run
+      (gptel-runner-load-run
+       "/path/to/run-12.snapshot.el"
+       (lambda (run)
+         (message "Restored run: %s" (gptel-runner-run-state run)))))
+
+(gptel-runner-resume-run my-run "Please prefer the smaller public API")
+```
+
+Alternatively, use `l` and `r` in the dashboard.  If the snapshot contains a
+call paused for feedback, visit its restored transcript with `v`, continue it
+as a normal gptel conversation, and accept it with
+`gptel-runner-complete-call-from-buffer`; the reconstructed workflow resumes
+after that node.
+
+Snapshots preserve the goal, canonical workspace, blackboard, completed node
+states, repeat iterations, budgets, event journal, calls, and retained
+transcripts.  Completion callbacks and live provider processes are not
+serializable: supply a new callback to `gptel-runner-load-run`, and expect an
+unfinished call to restart statelessly unless you complete its restored
+feedback buffer.  Calls consumed before pausing remain charged to call and
+request budgets.  Snapshot files have mode `0600`, but they contain prompts,
+outputs, tool results, and possibly secrets; protect and delete them as you
+would other sensitive local state.
+
 Run options include `:driver`, `:max-requests`, `:max-calls`,
 `:max-concurrency`, `:max-duration`, `:allow-writes`, and
-`:allow-unconfirmed-tools`.  Workflow defaults are used when an option is not
-provided.
+`:allow-unconfirmed-tools`, and `:persist`.  Workflow defaults are used when
+an option is not provided.
 
 ## Semantics and safety
 
@@ -104,14 +176,17 @@ provided.
 - Request retries reuse one logical call and consume request attempts.  An
   agent-step retry creates a new call.  An implementation revision is a new
   workflow iteration.  These are intentionally separate counters.
-- Events and in-memory state are authoritative.  v0.1 does not persist or
-  resume runs.
+- Events and runtime state are authoritative.  Snapshots are versioned
+  projections written at safe checkpoints; they do not serialize Lisp
+  continuations, provider connections, timers, or external tool processes.
 
 ## Extension points
 
 Custom agents combine any gptel preset with a runner parser, validator,
 schema, retry policy, and metadata.  Custom drivers implement
-`gptel-runner-driver-start` and `gptel-runner-driver-cancel`.  Prompt,
+`gptel-runner-driver-start`, `gptel-runner-driver-cancel`, and optionally
+`gptel-runner-driver-pause` (which defaults to stopping external work without
+terminalizing the runner call).  Prompt,
 branch, repeat-stop, and progress-key functions receive the live run and can
 read explicit blackboard values.  Parsers and validators remain runner-owned,
 so provider schema support is a reliability hint rather than an approval
@@ -131,6 +206,8 @@ can change; CI checks v0.9.9.4 and uses current master as an early-warning job.
 | Run is `stalled` | Inspect repeated review issues/diff and adjust the workflow or agent prompt. |
 | `invalid-output` | The original and one repair response both failed validation. |
 | Cancellation cannot undo a tool | Stop/undo the external tool action separately. |
+| Snapshot cannot find a node | Reload the same named workflow with stable explicit node IDs. |
+| Snapshot cannot be saved | Keep blackboard keys/values and the run goal readable as Emacs Lisp data. |
 
 ## Development
 

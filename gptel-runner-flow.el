@@ -26,11 +26,16 @@ Required keys are `:id', `:agent', and `:prompt'.  `:save-as', `:retries',
    :id (gptel-runner--node-id properties 'agent)
    :kind 'agent :properties properties))
 
-(defun gptel-runner-sequence (&rest children)
-  "Return a fail-fast sequence containing CHILDREN."
-  (gptel-runner-node-create
-   :id (intern (gptel-runner--id "sequence"))
-   :kind 'sequence :children children))
+(defun gptel-runner-sequence (&rest arguments)
+  "Return a fail-fast sequence described by ARGUMENTS.
+An optional leading `:id' and its value give the sequence a stable identity;
+the remaining arguments are child nodes."
+  (let ((id (when (eq (car arguments) :id)
+              (pop arguments)
+              (or (pop arguments) (user-error "Sequence :id cannot be nil")))))
+    (gptel-runner-node-create
+     :id (or id (intern (gptel-runner--id "sequence")))
+     :kind 'sequence :children arguments)))
 
 (defun gptel-runner-branch (&rest properties)
   "Return a predicate branch described by PROPERTIES.
@@ -184,8 +189,27 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
 
 (defun gptel-runner--prompt (run node)
   "Resolve NODE's prompt for RUN."
-  (let ((prompt (plist-get (gptel-runner-node-properties node) :prompt)))
-    (if (functionp prompt) (funcall prompt run node) prompt)))
+  (let* ((prompt (plist-get (gptel-runner-node-properties node) :prompt))
+         (resolved (if (functionp prompt) (funcall prompt run node) prompt))
+         (feedback (gethash 'gptel-runner-resume-feedback
+                            (gptel-runner-run-blackboard run))))
+    (if feedback
+        (progn
+          (remhash 'gptel-runner-resume-feedback
+                   (gptel-runner-run-blackboard run))
+          (concat resolved
+                  "\n\nHuman feedback supplied when resuming this workflow:\n\n"
+                  (format "%s" feedback)))
+      resolved)))
+
+(defun gptel-runner--subtree-state-p (run node state)
+  "Return non-nil when NODE or a descendant has STATE in RUN."
+  (or (eq (gethash (gptel-runner-node-id node)
+                   (gptel-runner-run-node-states run) 'pending)
+          state)
+      (cl-some (lambda (child)
+                 (gptel-runner--subtree-state-p run child state))
+               (gptel-runner-node-children node))))
 
 (defun gptel-runner--parse-agent-result (agent node value)
   "Parse and validate VALUE for AGENT and NODE.
@@ -316,16 +340,20 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
          (until (plist-get props :until))
          (stop (plist-get props :stop-when))
          (progress-fn (plist-get props :progress-key))
-         previous-key)
+         (progress-slot (list 'gptel-runner-progress
+                              (gptel-runner-node-id node)))
+         (previous-key (gptel-runner-get run progress-slot))
+         (continue-current (gptel-runner--subtree-state-p
+                            run body 'succeeded)))
     (cl-labels
         ((iterate
-          ()
+          (resume-body)
           (if (>= (gptel-runner-iteration run (gptel-runner-node-id node))
                   maximum)
               (let ((failure (list :type 'iteration-budget :max maximum)))
                 (gptel-runner--set-node-state run node 'failed failure)
                 (funcall done 'failed failure))
-            (gptel-runner--reset-subtree run body)
+            (unless resume-body (gptel-runner--reset-subtree run body))
             (gptel-runner--execute-node
              run body
              (lambda (state value)
@@ -350,13 +378,18 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
                      (let ((failure (list :type 'stalled :progress-key key)))
                        (gptel-runner--set-node-state run node 'stalled failure)
                        (funcall done 'stalled failure)))
-                    (t (setq previous-key key) (iterate))))))))))
+                    (t
+                     (setq previous-key key)
+                     (puthash progress-slot key
+                              (gptel-runner-run-blackboard run))
+                     (gptel-runner--checkpoint run)
+                     (iterate nil))))))))))
       (gptel-runner--set-node-state run node 'running)
       (if (and until (funcall until run))
           (progn
             (gptel-runner--set-node-state run node 'succeeded)
             (funcall done 'succeeded nil))
-        (iterate)))))
+        (iterate continue-current)))))
 
 (defun gptel-runner--execute-parallel (run node done)
   "Execute parallel NODE in RUN and invoke DONE according to its join policy."
@@ -423,16 +456,31 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
 
 (defun gptel-runner--execute-node (run node done)
   "Execute NODE in RUN, then call DONE with terminal state and value."
-  (unless (gptel-runner--run-terminal-p run)
-    (pcase (gptel-runner-node-kind node)
-      ('agent (gptel-runner--execute-agent run node done))
-      ('sequence (gptel-runner--execute-sequence run node done))
-      ('branch (gptel-runner--execute-branch run node done))
-      ('repeat (gptel-runner--execute-repeat run node done))
-      ('parallel (gptel-runner--execute-parallel run node done))
-      (_ (funcall done 'failed
-                  (list :type 'invalid-node
-                        :kind (gptel-runner-node-kind node)))))))
+  (let ((saved-state
+         (gethash (gptel-runner-node-id node)
+                  (gptel-runner-run-node-states run) 'pending)))
+    (cond
+     ((eq saved-state 'succeeded)
+      (funcall done 'succeeded
+               (when (eq (gptel-runner-node-kind node) 'agent)
+                 (when-let ((key (plist-get
+                                  (gptel-runner-node-properties node)
+                                  :save-as)))
+                   (gptel-runner-get run key)))))
+     ((not (eq (gptel-runner-run-state run) 'running)) nil)
+     (t
+      (when (eq saved-state 'skipped)
+        (puthash (gptel-runner-node-id node) 'pending
+                 (gptel-runner-run-node-states run)))
+      (pcase (gptel-runner-node-kind node)
+        ('agent (gptel-runner--execute-agent run node done))
+        ('sequence (gptel-runner--execute-sequence run node done))
+        ('branch (gptel-runner--execute-branch run node done))
+        ('repeat (gptel-runner--execute-repeat run node done))
+        ('parallel (gptel-runner--execute-parallel run node done))
+        (_ (funcall done 'failed
+                    (list :type 'invalid-node
+                          :kind (gptel-runner-node-kind node)))))))))
 
 (defun gptel-runner--option (key explicit defaults fallback)
   "Select KEY from EXPLICIT, DEFAULTS, or FALLBACK."
@@ -444,13 +492,14 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
     (workflow &rest arguments
               &key goal workspace driver max-requests max-calls
               max-concurrency max-duration allow-writes
-              allow-unconfirmed-tools callback &allow-other-keys)
+              allow-unconfirmed-tools persist callback &allow-other-keys)
   "Start WORKFLOW with keyword ARGUMENTS and return its run immediately.
 GOAL and WORKSPACE describe the stateless task.  DRIVER defaults to
 `gptel-runner-default-driver'.  MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
 MAX-DURATION override workflow defaults.  ALLOW-WRITES must be explicitly
 non-nil for any workflow containing a write agent.
 ALLOW-UNCONFIRMED-TOOLS disables gptel confirmation only when explicitly set.
+PERSIST enables versioned snapshots at workflow checkpoints.
 CALLBACK runs exactly once with the terminal run."
   (ignore max-requests max-calls max-concurrency max-duration
           allow-unconfirmed-tools)
@@ -479,7 +528,12 @@ CALLBACK runs exactly once with the terminal run."
                 :max-duration
                 (gptel-runner--option :max-duration arguments defaults nil)
                 :allow-writes allow-writes
-                :allow-unconfirmed-tools allow-unconfirmed-tools)))
+                :allow-unconfirmed-tools allow-unconfirmed-tools
+                :persist (gptel-runner--option
+                          :persist arguments defaults persist))))
+    (when (and (plist-get options :persist)
+               (null (gptel-runner-workflow-name definition)))
+      (user-error "Persistent runs require a named workflow"))
     (unless (and (integerp (plist-get options :max-concurrency))
                  (> (plist-get options :max-concurrency) 0))
       (user-error ":max-concurrency must be positive"))
@@ -496,22 +550,93 @@ CALLBACK runs exactly once with the terminal run."
                  :iterations (make-hash-table :test #'equal)
                  :events nil :budget budget :driver selected-driver
                  :queue nil :active-calls nil :calls nil
-                 :started-at (float-time) :callback callback :options options)))
+                 :started-at (float-time) :callback callback :options options
+                 :duration-remaining
+                 (gptel-runner-budget-max-duration budget))))
       (puthash (gptel-runner-run-id run) run gptel-runner--runs)
       (gptel-runner--emit run 'run-started nil nil
                           (list :goal goal :workspace directory))
       (when-let ((duration (gptel-runner-budget-max-duration budget)))
         (unless (and (numberp duration) (> duration 0))
-          (user-error ":max-duration must be positive"))
-        (setf (gptel-runner-run-duration-timer run)
-              (run-at-time duration nil #'gptel-runner--duration-expired
-                           run (gptel-runner-run-generation run))))
+          (user-error ":max-duration must be positive")))
+      (gptel-runner--start-duration-clock run)
       (gptel-runner--execute-node
        run root
        (lambda (state value)
          (when (eq (gptel-runner-run-state run) 'running)
            (gptel-runner--finish-run run state value))))
+      (gptel-runner--checkpoint run)
       run)))
+
+(defun gptel-runner--prepare-node-states-for-resume (run)
+  "Reset unfinished node states in RUN while preserving completed work."
+  (maphash
+   (lambda (id state)
+     (unless (memq state '(succeeded skipped))
+       (puthash id 'pending (gptel-runner-run-node-states run))))
+   (gptel-runner-run-node-states run)))
+
+(defun gptel-runner--supersede-paused-calls (run)
+  "Mark every unfinished historical call skipped before resuming RUN."
+  (dolist (call (gptel-runner-run-calls run))
+    (unless (gptel-runner--call-terminal-p call)
+      (setf (gptel-runner-call-state call) 'skipped
+            (gptel-runner-call-finished-at call) (float-time)
+            (gptel-runner-call-on-complete call) nil)
+      (gptel-runner--emit run 'call-skipped
+                          (gptel-runner-call-node call) call
+                          'superseded-by-resume))))
+
+(defun gptel-runner-resume-run (run &optional feedback callback)
+  "Resume paused RUN with optional human FEEDBACK and CALLBACK.
+Completed nodes remain complete.  The first unfinished agent prompt receives
+FEEDBACK, and execution restarts from the workflow AST's safe checkpoint."
+  (unless (eq (gptel-runner-run-state run) 'paused)
+    (user-error "Run %s is not paused" (gptel-runner-run-id run)))
+  (when feedback
+    (puthash 'gptel-runner-resume-feedback feedback
+             (gptel-runner-run-blackboard run)))
+  (when callback
+    (setf (gptel-runner-run-callback run) callback
+          (gptel-runner-run-callback-called run) nil))
+  (gptel-runner--supersede-paused-calls run)
+  (gptel-runner--prepare-node-states-for-resume run)
+  (cl-incf (gptel-runner-run-generation run))
+  (setf (gptel-runner-run-state run) 'running
+        (gptel-runner-run-paused-at run) nil
+        (gptel-runner-run-finished-at run) nil
+        (gptel-runner-run-active-calls run) nil
+        (gptel-runner-run-queue run) nil
+        (gptel-runner-run-active-count run) 0
+        (gptel-runner-run-writer-active run) 0)
+  (gptel-runner--emit run 'run-resumed nil nil
+                      (and feedback (list :feedback feedback)))
+  (gptel-runner--start-duration-clock run)
+  (when (eq (gptel-runner-run-state run) 'running)
+    (gptel-runner--execute-node
+     run (gptel-runner-workflow-root (gptel-runner-run-workflow run))
+     (lambda (state value)
+       (when (eq (gptel-runner-run-state run) 'running)
+         (gptel-runner--finish-run run state value)))))
+  (gptel-runner--checkpoint run)
+  run)
+
+(defun gptel-runner--complete-restored-call (call value)
+  "Complete restored CALL with VALUE and resume its reconstructed workflow."
+  (let* ((run (gptel-runner-call-run call))
+         (node (gptel-runner-call-node call))
+         (agent (gptel-runner-call-agent call))
+         (parsed (gptel-runner--parse-agent-result agent node value)))
+    (unless (car parsed)
+      (user-error "Manual response is invalid: %S" (cdr parsed)))
+    (gptel-runner--finish-call call 'succeeded (cdr parsed))
+    (when-let ((key (plist-get (gptel-runner-node-properties node) :save-as)))
+      (gptel-runner-put run key (cdr parsed)))
+    (puthash (gptel-runner-node-id node) 'succeeded
+             (gptel-runner-run-node-states run))
+    (if (eq (gptel-runner-run-state run) 'paused)
+        (gptel-runner-resume-run run)
+      (gptel-runner--checkpoint run))))
 
 (provide 'gptel-runner-flow)
 ;;; gptel-runner-flow.el ends here

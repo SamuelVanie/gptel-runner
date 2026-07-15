@@ -12,6 +12,12 @@
 (require 'tabulated-list)
 (require 'gptel-runner-core)
 
+(declare-function gptel-runner-save-run "gptel-runner-store")
+(declare-function gptel-runner-load-run "gptel-runner-store")
+(declare-function gptel-runner-resume-run "gptel-runner-flow")
+(declare-function gptel-runner-complete-call-from-buffer
+                  "gptel-runner-gptel")
+
 (defvar gptel-runner-dashboard-buffer "*gptel-runner*"
   "Name of the session dashboard buffer.")
 
@@ -146,9 +152,67 @@
    (or (gptel-runner-ui--run-at-point) (user-error "No run on this row")))
   (revert-buffer))
 
+(defun gptel-runner-dashboard-pause-call ()
+  "Pause the active call at point and visit its feedback buffer."
+  (interactive)
+  (let ((call (or (gptel-runner-ui--call-at-point)
+                  (user-error "No call on this row"))))
+    (gptel-runner-pause-call call 'dashboard)
+    (if (buffer-live-p (gptel-runner-call-buffer call))
+        (pop-to-buffer (gptel-runner-call-buffer call))
+      (revert-buffer))))
+
+(defun gptel-runner-dashboard-complete-call ()
+  "Complete the feedback call at point from its latest gptel response."
+  (interactive)
+  (gptel-runner-complete-call-from-buffer
+   nil (or (gptel-runner-ui--call-at-point)
+           (user-error "No call on this row")))
+  (revert-buffer))
+
+(defun gptel-runner-dashboard-pause-run ()
+  "Pause and durably snapshot the run at point."
+  (interactive)
+  (let* ((run (or (gptel-runner-ui--run-at-point)
+                  (user-error "No run on this row")))
+         (file (progn (gptel-runner-pause-run run 'dashboard)
+                      (gptel-runner-run-snapshot-file run))))
+    (revert-buffer)
+    (message "Paused %s; snapshot saved to %s"
+             (gptel-runner-run-id run) file)))
+
+(defun gptel-runner-dashboard-save-run ()
+  "Save a snapshot of the run at point without pausing it."
+  (interactive)
+  (let* ((run (or (gptel-runner-ui--run-at-point)
+                  (user-error "No run on this row")))
+         (file (gptel-runner-save-run run)))
+    (message "Snapshot saved to %s" file)))
+
+(defun gptel-runner-dashboard-resume-run ()
+  "Resume the paused run at point with optional human feedback."
+  (interactive)
+  (let* ((run (or (gptel-runner-ui--run-at-point)
+                  (user-error "No run on this row")))
+         (feedback (read-string "Feedback for the next unfinished agent: ")))
+    (gptel-runner-resume-run run (unless (string-empty-p feedback) feedback))
+    (revert-buffer)))
+
+(defun gptel-runner-dashboard-load-snapshot (file)
+  "Load paused run from snapshot FILE into the dashboard."
+  (interactive "fSnapshot file: ")
+  (gptel-runner-load-run file)
+  (revert-buffer))
+
 (let ((map gptel-runner-dashboard-mode-map))
   (define-key map (kbd "RET") #'gptel-runner-dashboard-inspect-events)
   (define-key map (kbd "v") #'gptel-runner-dashboard-visit-worker)
+  (define-key map (kbd "p") #'gptel-runner-dashboard-pause-call)
+  (define-key map (kbd "x") #'gptel-runner-dashboard-complete-call)
+  (define-key map (kbd "P") #'gptel-runner-dashboard-pause-run)
+  (define-key map (kbd "s") #'gptel-runner-dashboard-save-run)
+  (define-key map (kbd "r") #'gptel-runner-dashboard-resume-run)
+  (define-key map (kbd "l") #'gptel-runner-dashboard-load-snapshot)
   (define-key map (kbd "c") #'gptel-runner-dashboard-abort-call)
   (define-key map (kbd "a") #'gptel-runner-dashboard-abort-run)
   (define-key map (kbd "g") #'revert-buffer))

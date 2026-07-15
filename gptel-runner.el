@@ -8,7 +8,8 @@
 
 ;; gptel-runner schedules inspectable workflow ASTs over stateless agent calls.
 ;; It provides sequence, branch, bounded repeat, and parallel nodes together
-;; with budgets, retries, cancellation, an event journal, and a dashboard.
+;; with budgets, retries, cancellation, durable snapshots, human feedback,
+;; an event journal, and a dashboard.
 ;; See README.md and the examples directory for usage.
 
 ;;; Code:
@@ -18,6 +19,7 @@
 (require 'gptel-runner-fake)
 (require 'gptel-runner-gptel)
 (require 'gptel-runner-ui)
+(require 'gptel-runner-store)
 
 (provide 'gptel-runner)
 ;;; gptel-runner.el ends here

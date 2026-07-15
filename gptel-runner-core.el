@@ -14,6 +14,8 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+(declare-function gptel-runner-save-run "gptel-runner-store")
+
 (defgroup gptel-runner nil
   "Deterministic workflows over stateless agent calls."
   :group 'applications)
@@ -29,6 +31,9 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
 
 (defvar gptel-runner-event-hook nil
   "Hook run with one argument, the newly appended runner event.")
+
+(defvar-local gptel-runner--call nil
+  "Runner call associated with the current worker buffer.")
 
 (defvar gptel-runner--agents (make-hash-table :test #'eq)
   "Registered agents by symbolic name.")
@@ -93,7 +98,8 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
   id workflow goal workspace (state 'pending) blackboard node-states
   iterations active-calls calls events budget driver queue (active-count 0)
   (writer-active 0) started-at finished-at callback callback-called
-  duration-timer (generation 0) options)
+  duration-timer duration-remaining active-started-at
+  paused-at snapshot-file (generation 0) options)
 
 (cl-defgeneric gptel-runner-driver-start (driver call complete observe)
   "Start CALL with DRIVER.
@@ -103,6 +109,13 @@ defensive against duplicate and late calls.")
 
 (cl-defgeneric gptel-runner-driver-cancel (driver call)
   "Ask DRIVER to cancel CALL.")
+
+(cl-defgeneric gptel-runner-driver-pause (driver call)
+  "Pause CALL through DRIVER without terminalizing runner state.")
+
+(cl-defmethod gptel-runner-driver-pause (driver call)
+  "Default pause behavior asks DRIVER to cancel CALL's external work."
+  (gptel-runner-driver-cancel driver call))
 
 (defun gptel-runner--id (prefix)
   "Return a new identifier beginning with PREFIX."
@@ -171,6 +184,7 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
 (defun gptel-runner-put (run key value)
   "Store VALUE at KEY on RUN's blackboard and return VALUE."
   (puthash key value (gptel-runner-run-blackboard run))
+  (gptel-runner--checkpoint run)
   value)
 
 (defun gptel-runner-iteration (run node-id)
@@ -195,14 +209,50 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
       (gptel-runner--emit run (intern (format "node-%s" state)) node nil data)
       t)))
 
+(defun gptel-runner--persistent-p (run)
+  "Return non-nil when RUN has durable snapshotting enabled."
+  (plist-get (gptel-runner-run-options run) :persist))
+
+(defun gptel-runner--checkpoint (run)
+  "Persist RUN at a safe checkpoint when persistence is enabled."
+  (when (and (gptel-runner--persistent-p run)
+             (fboundp 'gptel-runner-save-run))
+    (condition-case err
+        (gptel-runner-save-run run)
+      (error
+       (gptel-runner--emit run 'snapshot-error nil nil err)
+       nil))))
+
+(defun gptel-runner--stop-duration-clock (run)
+  "Stop RUN's active-duration clock and preserve remaining seconds."
+  (when (timerp (gptel-runner-run-duration-timer run))
+    (cancel-timer (gptel-runner-run-duration-timer run)))
+  (setf (gptel-runner-run-duration-timer run) nil)
+  (when (and (numberp (gptel-runner-run-duration-remaining run))
+             (numberp (gptel-runner-run-active-started-at run)))
+    (setf (gptel-runner-run-duration-remaining run)
+          (max 0 (- (gptel-runner-run-duration-remaining run)
+                    (- (float-time)
+                       (gptel-runner-run-active-started-at run))))))
+  (setf (gptel-runner-run-active-started-at run) nil))
+
+(defun gptel-runner--start-duration-clock (run)
+  "Start or resume RUN's active-duration clock."
+  (when-let ((remaining (gptel-runner-run-duration-remaining run)))
+    (if (<= remaining 0)
+        (gptel-runner--duration-expired
+         run (gptel-runner-run-generation run))
+      (setf (gptel-runner-run-active-started-at run) (float-time)
+            (gptel-runner-run-duration-timer run)
+            (run-at-time remaining nil #'gptel-runner--duration-expired
+                         run (gptel-runner-run-generation run))))))
+
 (defun gptel-runner--finish-run (run state &optional data)
   "Terminalize RUN as STATE once, recording DATA."
   (unless (gptel-runner--run-terminal-p run)
     (setf (gptel-runner-run-state run) state
           (gptel-runner-run-finished-at run) (float-time))
-    (when (timerp (gptel-runner-run-duration-timer run))
-      (cancel-timer (gptel-runner-run-duration-timer run)))
-    (setf (gptel-runner-run-duration-timer run) nil)
+    (gptel-runner--stop-duration-clock run)
     (gptel-runner--emit run
                         (if (eq state 'succeeded)
                             'run-completed
@@ -212,6 +262,7 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
       (setf (gptel-runner-run-callback-called run) t)
       (when-let ((callback (gptel-runner-run-callback run)))
         (funcall callback run)))
+    (gptel-runner--checkpoint run)
     t))
 
 (defun gptel-runner--budget-failure (run kind limit)
@@ -259,8 +310,12 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
   (when (and (= generation (gptel-runner-call-generation call))
              (not (gptel-runner--call-terminal-p call)))
     (let ((run (gptel-runner-call-run call)))
-      (when (eq type 'waiting-confirmation)
+      (cond
+       ((eq type 'waiting-confirmation)
         (setf (gptel-runner-call-state call) 'waiting-confirmation))
+       ((and (eq type 'tool-results)
+             (eq (gptel-runner-call-state call) 'waiting-confirmation))
+        (setf (gptel-runner-call-state call) 'running)))
       (gptel-runner--emit run type (gptel-runner-call-node call) call data))))
 
 (defun gptel-runner--retryable-p (call status metadata)
@@ -398,6 +453,7 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
         (setf (gptel-runner-call-on-complete call) nil)
         (funcall done call state value))
       (gptel-runner--drain-queue run)
+      (gptel-runner--checkpoint run)
       t)))
 
 (defun gptel-runner--can-start-p (run call)
@@ -409,7 +465,7 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
 
 (defun gptel-runner--drain-queue (run)
   "Process queued work in RUN as budgets and locks permit."
-  (unless (gptel-runner--run-terminal-p run)
+  (when (eq (gptel-runner-run-state run) 'running)
     (let ((progress t))
       (while progress
         (setq progress nil)
@@ -466,10 +522,84 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
             (gptel-runner-run-queue run)
             (delq call (gptel-runner-run-queue run)))
       (when (memq (gptel-runner-call-state call)
-                  '(running retry-wait waiting-confirmation))
+                  '(running retry-wait waiting-confirmation waiting-feedback))
         (ignore-errors
           (gptel-runner-driver-cancel (gptel-runner-run-driver run) call)))
       (gptel-runner--finish-call call 'cancelled (or reason 'user)))))
+
+(defun gptel-runner--suspend-call (call state reason keep-continuation)
+  "Suspend CALL in STATE for REASON.
+When KEEP-CONTINUATION is nil, discard the in-memory workflow continuation so
+the workflow can later be reconstructed from a snapshot."
+  (unless (or (gptel-runner--call-terminal-p call)
+              (memq (gptel-runner-call-state call) '(paused waiting-feedback)))
+    (let ((run (gptel-runner-call-run call)))
+      (cl-incf (gptel-runner-call-generation call))
+      (when (timerp (gptel-runner-call-retry-timer call))
+        (cancel-timer (gptel-runner-call-retry-timer call)))
+      (setf (gptel-runner-call-retry-timer call) nil
+            (gptel-runner-run-queue run)
+            (delq call (gptel-runner-run-queue run)))
+      (when (memq (gptel-runner-call-state call)
+                  '(running retry-wait waiting-confirmation))
+        (ignore-errors
+          (gptel-runner-driver-pause (gptel-runner-run-driver run) call)))
+      (gptel-runner--deactivate-call call)
+      (unless keep-continuation
+        (setf (gptel-runner-call-on-complete call) nil))
+      (setf (gptel-runner-call-state call) state)
+      (gptel-runner--emit run (intern (format "call-%s" state))
+                          (gptel-runner-call-node call) call reason)
+      (gptel-runner--drain-queue run)
+      t)))
+
+(defun gptel-runner-pause-call (call &optional reason)
+  "Pause CALL for REASON without completing its workflow node.
+The associated worker buffer remains a normal gptel buffer.  After continuing
+the conversation, use `gptel-runner-complete-call-from-buffer' to return its
+latest response to the workflow."
+  (interactive
+   (list (and (boundp 'gptel-runner--call) gptel-runner--call) 'user))
+  (unless (gptel-runner-call-p call)
+    (user-error "No runner call is associated with this buffer"))
+  (unless (gptel-runner--suspend-call
+           call 'waiting-feedback (or reason 'user) t)
+    (user-error "Call %s cannot be paused from state %s"
+                (gptel-runner-call-id call) (gptel-runner-call-state call)))
+  (gptel-runner--checkpoint (gptel-runner-call-run call))
+  call)
+
+(defun gptel-runner-pause-run (run &optional reason)
+  "Pause RUN for REASON and save a durable snapshot.
+Active provider work is stopped.  Completed nodes and blackboard values are
+preserved; unfinished nodes restart from their last safe checkpoint."
+  (interactive
+   (list (and (boundp 'gptel-runner--call)
+              (gptel-runner-call-p gptel-runner--call)
+              (gptel-runner-call-run gptel-runner--call))
+         'user))
+  (unless (gptel-runner-run-p run)
+    (user-error "Run this command from a runner worker or the dashboard"))
+  (unless (gptel-runner-workflow-name (gptel-runner-run-workflow run))
+    (user-error "Pausing durably requires a named workflow"))
+  (unless (fboundp 'gptel-runner-save-run)
+    (user-error "Load gptel-runner-store before pausing a run"))
+  (unless (or (gptel-runner--run-terminal-p run)
+              (eq (gptel-runner-run-state run) 'paused))
+    (setf (gptel-runner-run-state run) 'pausing)
+    (cl-incf (gptel-runner-run-generation run))
+    (gptel-runner--stop-duration-clock run)
+    (dolist (call (copy-sequence (gptel-runner-run-calls run)))
+      (unless (gptel-runner--call-terminal-p call)
+        (gptel-runner--suspend-call call 'paused
+                                    (or reason 'run-paused) nil)))
+    (setf (gptel-runner-run-state run) 'paused
+          (gptel-runner-run-paused-at run) (float-time)
+          (gptel-runner-run-options run)
+          (plist-put (gptel-runner-run-options run) :persist t))
+    (gptel-runner--emit run 'run-paused nil nil (or reason 'user))
+    (gptel-runner-save-run run)
+    run))
 
 (defun gptel-runner-abort-run (run &optional reason)
   "Cancel RUN for REASON, including queued and active work."
@@ -484,7 +614,10 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
   "Fail RUN if its duration timer for GENERATION is still current."
   (when (and (= generation (gptel-runner-run-generation run))
              (not (gptel-runner--run-terminal-p run)))
-    (setf (gptel-runner-run-state run) 'timing-out)
+    (setf (gptel-runner-run-state run) 'timing-out
+          (gptel-runner-run-duration-timer run) nil
+          (gptel-runner-run-duration-remaining run) 0
+          (gptel-runner-run-active-started-at run) nil)
     (dolist (call (copy-sequence (gptel-runner-run-calls run)))
       (gptel-runner-abort-call call 'duration-budget))
     (gptel-runner--finish-run

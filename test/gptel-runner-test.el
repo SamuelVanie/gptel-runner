@@ -384,5 +384,131 @@
         (should (eq (gethash 'no (gptel-runner-run-node-states run))
                     'skipped))))))
 
+(ert-deftest gptel-runner-call-feedback-continues-original-workflow ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(first second))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'first '(:manual t))
+      (gptel-runner-fake-queue driver 'second '(:value "second result"))
+      (let* ((run
+              (gptel-runner-start
+               (gptel-runner-sequence
+                (gptel-runner-test--step 'first 'first 'first-result)
+                (gptel-runner-test--step 'second 'second 'second-result))
+               :driver driver))
+             (call (car (gptel-runner-run-calls run))))
+        (gptel-runner-pause-call call 'test-feedback)
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (should (eq (gptel-runner-run-state run) 'running))
+        (gptel-runner-complete-call-from-buffer "corrected result" call)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'first-result)
+                       "corrected result"))
+        (should (equal (gptel-runner-get run 'second-result)
+                       "second result"))
+        (should (= (length (gptel-runner-run-calls run)) 2))))))
+
+(ert-deftest gptel-runner-snapshot-load-resume-next-session ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(first second))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-snapshot-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create))
+           (callbacks 0)
+           observed-prompt)
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow persisted-handoff (:persist t)
+              (gptel-runner-sequence
+               :id 'handoff
+               (gptel-runner-test--step 'first 'first 'first-result)
+               (gptel-runner-test--step 'second 'second 'second-result)))
+            (gptel-runner-fake-queue driver 'first '(:value "kept result"))
+            (gptel-runner-fake-queue driver 'second '(:manual t))
+            (let* ((run (gptel-runner-start
+                         'persisted-handoff :goal "ship it" :driver driver
+                         :max-calls 5 :max-requests 5
+                         :callback (lambda (_run) (cl-incf callbacks))))
+                   (file (progn (gptel-runner-pause-run run 'overnight)
+                                (gptel-runner-run-snapshot-file run))))
+              (should (eq (gptel-runner-run-state run) 'paused))
+              (should (file-exists-p file))
+              (should (= (file-modes file) #o600))
+              (should (= callbacks 0))
+              ;; Model a fresh Emacs session: definitions remain loaded, but
+              ;; no runtime objects or callbacks survive.
+              (setq gptel-runner--runs (make-hash-table :test #'equal))
+              (let ((resume-driver (gptel-runner-fake-driver-create)))
+                (gptel-runner-fake-queue
+                 resume-driver 'second
+                 (lambda (call)
+                   (setq observed-prompt (gptel-runner-call-prompt call))
+                   '(:value "resumed result")))
+                (let ((restored
+                       (gptel-runner-load-run
+                        file (lambda (_run) (cl-incf callbacks)) resume-driver)))
+                  (should (eq (gptel-runner-run-state restored) 'paused))
+                  (should (equal (gptel-runner-get restored 'first-result)
+                                 "kept result"))
+                  (gptel-runner-resume-run restored "Use the smaller API")
+                  (should (eq (gptel-runner-run-state restored) 'succeeded))
+                  (should (string-match-p "Use the smaller API"
+                                          observed-prompt))
+                  (should (equal (gptel-runner-get restored 'second-result)
+                                 "resumed result"))
+                  (should (= callbacks 1))
+                  (should (= (gptel-runner-budget-calls
+                              (gptel-runner-run-budget restored)) 3))
+                  (should (= (gptel-runner-budget-requests
+                              (gptel-runner-run-budget restored)) 3))
+                  (should (= (length (gptel-runner-run-calls restored)) 3))
+                  (should (eq (gptel-runner-call-state
+                               (nth 1 (gptel-runner-run-calls restored)))
+                              'skipped))))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-persistence-requires-named-workflow ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (should-error
+     (gptel-runner-start
+      (gptel-runner-test--step 'work 'worker)
+     :driver (gptel-runner-fake-driver-create) :persist t)
+     :type 'user-error)))
+
+(ert-deftest gptel-runner-restored-feedback-buffer-completes-node ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-feedback-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow persisted-feedback (:persist t)
+              (gptel-runner-agent-step
+               :id 'work :agent 'worker :prompt "work" :save-as 'report))
+            (gptel-runner-fake-queue driver 'worker '(:manual t))
+            (let* ((run (gptel-runner-start 'persisted-feedback
+                                            :driver driver))
+                   (call (car (gptel-runner-run-calls run))))
+              (gptel-runner-pause-call call 'feedback)
+              (gptel-runner-pause-run run 'overnight)
+              (setq gptel-runner--runs (make-hash-table :test #'equal))
+              (let* ((restored (gptel-runner-load-run
+                                (gptel-runner-run-snapshot-file run)
+                                nil (gptel-runner-fake-driver-create)))
+                     (restored-call (car (gptel-runner-run-calls restored))))
+                (should (eq (gptel-runner-call-state restored-call)
+                            'waiting-feedback))
+                (gptel-runner-complete-call-from-buffer
+                 "human-guided result" restored-call)
+                (should (eq (gptel-runner-run-state restored) 'succeeded))
+                (should (equal (gptel-runner-get restored 'report)
+                               "human-guided result"))
+                (should (= (length (gptel-runner-run-calls restored)) 1)))))
+        (delete-directory snapshot-directory t)))))
+
 (provide 'gptel-runner-test)
 ;;; gptel-runner-test.el ends here

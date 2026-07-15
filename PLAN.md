@@ -39,12 +39,14 @@ normal verification commands where applicable.
 ## User experience and hardening
 
 - [x] Session-local tabulated dashboard with inspect, visit, and abort actions.
+- [x] Versioned atomic snapshots, pause/resume across Emacs sessions, restored
+  transcript buffers, in-buffer human feedback, and active-duration accounting.
 - [x] Implement/review and fan-out/synthesis examples.
 - [x] Automated tests for core workflow behavior, budgets, retries,
   cancellation, output repair, stalls, parallel joins, and writer safety.
 - [x] Installation, API, safety, compatibility, and troubleshooting docs.
-- [ ] Persistent snapshots/resume, human gates, worktrees, enforced tool
-  wrappers, gptel-agent files, bounded dialogue, and streaming (post-v0.1).
+- [ ] Dedicated human gate nodes, worktrees, enforced tool wrappers,
+  gptel-agent files, bounded dialogue, and streaming (post-v0.1).
 - [ ] Add a start-time custom-input API, such as `:inputs', that initializes
   the run blackboard before the first node can dispatch.  Prompt functions
   will read these values with `gptel-runner-get`; arbitrary inputs will not

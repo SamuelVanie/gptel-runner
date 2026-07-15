@@ -69,6 +69,7 @@
 (gptel-runner-defworkflow three-stage-handoff
     (:max-requests 12 :max-calls 3 :max-concurrency 1 :max-duration 1800)
   (gptel-runner-sequence
+   :id 'three-stage-handoff-sequence
    (gptel-runner-agent-step
     :id 'research
     :agent 'handoff-researcher
@@ -93,6 +94,7 @@
 ;;  'three-stage-handoff
 ;;  :goal "Add a health-check command to this package"
 ;;  :workspace (project-root (project-current t))
+;;  :persist t
 ;;  :allow-writes t
 ;;  :callback
 ;;  (lambda (run)
@@ -102,4 +104,3 @@
 
 (provide 'three-stage-handoff)
 ;;; three-stage-handoff.el ends here
-
