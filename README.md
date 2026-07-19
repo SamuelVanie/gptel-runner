@@ -88,8 +88,10 @@ ignored so the table keeps a stable canonical layout:
 Available symbols are `workflow`, `run`, `node`, `call`, `state`, `elapsed`,
 `attempts`, `iteration`, `requests`, and `calls`.  Press `g` in an open
 dashboard after changing the variable, or press `V` to toggle one column
-interactively.  The default is deliberately compact, rows are truncated
-instead of wrapped, and the current row is highlighted.  The spelling
+interactively.  The default is deliberately compact, rows stay on one line
+instead of wrapping, and the current row is highlighted.  Values longer than
+their column are shortened with an ellipsis so later columns stay aligned;
+hovering the shortened value shows its complete text.  The spelling
 `gptel-runner-dashboards-column` is accepted as an alias, although
 `gptel-runner-dashboard-columns` is the preferred option name.
 

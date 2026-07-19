@@ -550,6 +550,35 @@
   (let ((gptel-runner-dashboard-columns nil))
     (should-error (gptel-runner-ui--format) :type 'user-error)))
 
+(ert-deftest gptel-runner-dashboard-long-values-remain-column-aligned ()
+  (let ((gptel-runner-dashboard-columns '(workflow run node state)))
+    (with-temp-buffer
+      (gptel-runner-dashboard-mode)
+      (setq tabulated-list-entries
+            (list
+             (list '(workflow long)
+                   (gptel-runner-ui--row-vector
+                    '((workflow . "this-is-a-very-long-workflow-name")
+                      (state . "1 run"))))
+             (list '(run "run-1")
+                   (gptel-runner-ui--row-vector
+                    '((run . "  run-1") (state . "succeeded"))))
+             (list '(call "call-2")
+                   (gptel-runner-ui--row-vector
+                    '((node . "    this-is-a-very-long-node-name")
+                      (state . "running"))))))
+      (tabulated-list-print t)
+      (let* ((lines (split-string (buffer-string) "\n" t))
+             (workflow-column (string-match "1 run" (nth 0 lines)))
+             (run-column (string-match "succeeded" (nth 1 lines)))
+             (node-column (string-match "running" (nth 2 lines)))
+             (workflow-cell (aref (cadr (nth 0 tabulated-list-entries)) 0)))
+        (should (= workflow-column run-column node-column))
+        (should (<= (string-width workflow-cell) 22))
+        (should (string-suffix-p "…" workflow-cell))
+        (should (equal (get-text-property 0 'help-echo workflow-cell)
+                       "this-is-a-very-long-workflow-name"))))))
+
 (ert-deftest gptel-runner-forget-run-and-workflow-clean-session-noise ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)

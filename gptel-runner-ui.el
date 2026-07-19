@@ -77,11 +77,24 @@ List order is ignored; columns always use the canonical dashboard order."
              (list (nth 1 spec) (nth 2 spec) nil))
            (gptel-runner-ui--selected-column-specs))))
 
+(defun gptel-runner-ui--truncate-cell (value width)
+  "Return VALUE constrained to display WIDTH, preserving its properties.
+An elided value retains its complete unpropertized text as hover help."
+  (let ((text (if (stringp value) value (format "%s" value))))
+    (if (<= (string-width text) width)
+        text
+      (let ((short (truncate-string-to-width text width 0 nil "…")))
+        (add-text-properties
+         0 (length short)
+         (list 'help-echo (substring-no-properties text)) short)
+        short))))
+
 (defun gptel-runner-ui--row-vector (values)
   "Build a dashboard row vector from column alist VALUES."
   (vconcat
    (mapcar (lambda (spec)
-             (or (alist-get (car spec) values) ""))
+             (gptel-runner-ui--truncate-cell
+              (or (alist-get (car spec) values) "") (nth 2 spec)))
            (gptel-runner-ui--selected-column-specs))))
 
 (defun gptel-runner-ui--state (state)
