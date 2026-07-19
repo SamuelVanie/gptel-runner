@@ -30,6 +30,23 @@
   "Make a simple step with ID, AGENT, and SAVE key."
   (gptel-runner-agent-step :id id :agent agent :prompt "work" :save-as save))
 
+(ert-deftest gptel-runner-review-schema-is-json-serializable ()
+  (let* ((encoded (json-serialize gptel-runner-review-schema))
+         (decoded (json-parse-string encoded :object-type 'plist)))
+    (should (equal (plist-get decoded :type) "object"))
+    (should (equal
+             (plist-get
+              (plist-get
+               (plist-get
+                (plist-get decoded :properties) :issues)
+               :items)
+              :properties)
+             '(:severity (:type "string")
+               :file (:type ["string" "null"])
+               :line (:type ["integer" "null"])
+               :message (:type "string")
+               :suggested_fix (:type ["string" "null"]))))))
+
 (ert-deftest gptel-runner-registry-and-blackboard ()
   (gptel-runner-test--isolated
     (let ((agent (gptel-runner-register-agent 'reader :preset 'p)))

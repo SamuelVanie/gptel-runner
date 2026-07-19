@@ -15,20 +15,20 @@
 (require 'gptel-runner-core)
 
 (defconst gptel-runner-review-schema
-  '(:type object
+  '(:type "object"
     :required ["verdict" "summary" "issues"]
     :properties
-    (:verdict (:type string :enum ["pass" "revise" "blocked"])
-     :summary (:type string)
-     :issues (:type array
-              :items (:type object
+    (:verdict (:type "string" :enum ["pass" "revise" "blocked"])
+     :summary (:type "string")
+     :issues (:type "array"
+              :items (:type "object"
                       :required ["severity" "message"]
                       :properties
-                      (:severity (:type string)
-                       :file (:type [string null])
-                       :line (:type [integer null])
-                       :message (:type string)
-                       :suggested_fix (:type [string null]))))))
+                      (:severity (:type "string")
+                       :file (:type ["string" "null"])
+                       :line (:type ["integer" "null"])
+                       :message (:type "string")
+                       :suggested_fix (:type ["string" "null"]))))))
   "JSON schema hint for review agents.")
 
 (defun gptel-runner--plist-symbolize-verdict (review)
