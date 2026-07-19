@@ -540,12 +540,18 @@
       (gptel-runner-fake-queue driver 'worker '(:value "done"))
       (let* ((run (gptel-runner-start 'alpha-workflow :driver driver))
              (call (car (gptel-runner-run-calls run)))
-             (ids (mapcar #'car (gptel-runner-ui--entries))))
+             (entries (gptel-runner-ui--entries))
+             (ids (mapcar #'car entries)))
         (should (equal ids
                        (list '(workflow alpha-workflow)
                              (list 'run (gptel-runner-run-id run))
                              (list 'call (gptel-runner-call-id call))
                              '(workflow empty-workflow))))
+        ;; Cell contents start at their column edge; tabulated-list itself
+        ;; supplies all spacing between columns.
+        (should (equal (aref (cadr (nth 1 entries)) 1)
+                       (gptel-runner-run-id run)))
+        (should (equal (aref (cadr (nth 2 entries)) 2) "alpha-step"))
         (with-temp-buffer
           (gptel-runner-dashboard-mode)
           (tabulated-list-print t)

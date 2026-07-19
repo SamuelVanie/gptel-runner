@@ -159,7 +159,7 @@ An elided value retains its complete unpropertized text as hover help."
   (list
    (list 'run (gptel-runner-run-id run))
    (gptel-runner-ui--row-vector
-    `((run . ,(concat "  " (gptel-runner-run-id run)))
+    `((run . ,(gptel-runner-run-id run))
       (state . ,(gptel-runner-ui--state (gptel-runner-run-state run)))
       (elapsed . ,(gptel-runner-ui--elapsed run))
       (attempts . "-")
@@ -177,9 +177,8 @@ An elided value retains its complete unpropertized text as hover help."
     (list
      (list 'call (gptel-runner-call-id call))
      (gptel-runner-ui--row-vector
-      `((node . ,(concat "    " (format "%s"
-                                     (gptel-runner-node-id node))))
-        (call . ,(concat "  " (gptel-runner-call-id call)))
+      `((node . ,(format "%s" (gptel-runner-node-id node)))
+        (call . ,(gptel-runner-call-id call))
         (state . ,(gptel-runner-ui--state
                    (gptel-runner-call-state call)))
         (elapsed . ,(gptel-runner-ui--elapsed run call))
