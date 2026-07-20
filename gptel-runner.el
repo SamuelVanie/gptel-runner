@@ -20,6 +20,7 @@
 (require 'gptel-runner-gptel)
 (require 'gptel-runner-ui)
 (require 'gptel-runner-store)
+(require 'gptel-runner-review)
 
 (provide 'gptel-runner)
 ;;; gptel-runner.el ends here
