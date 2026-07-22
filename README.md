@@ -70,12 +70,22 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
-The dashboard uses `g` to refresh, `RET` to inspect a run journal, `v` to
-visit an agent transcript, `p` to pause a call for feedback, `x` to accept its
-latest response, `P` to pause and snapshot a run, `r` to resume it, `s` to
-save a snapshot, `l` to load one, `c` to abort a call, and `a` to abort a run.
+The dashboard refreshes automatically every two seconds by default.  Set the
+interval in seconds, or use `nil` to disable automatic refresh:
+
+```elisp
+(setq gptel-runner-dashboard-refresh-interval 5.0)
+```
+
+Changes take effect on the next refresh; press `g` to apply one immediately.
+The dashboard also uses `RET` to inspect a run journal, `v` to visit an agent
+transcript, `p` to pause a call for feedback, `x` to accept its latest
+response, `P` to pause and snapshot a run, `r` to resume it, `s` to save a
+snapshot, `l` to load one, `c` to abort a call, and `a` to abort a run.
 Workflow headers contain their run summary rows, and each run contains its
-agent-call rows; registered workflows with no runs remain visible.
+agent-call rows; registered workflows with no runs remain visible.  The
+automatic refresh timer is stopped when the dashboard buffer is closed or
+changes to another major mode.
 
 Dashboard columns are a configurable set.  Their order in the value is
 ignored so the table keeps a stable canonical layout:

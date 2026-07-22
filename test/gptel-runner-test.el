@@ -862,6 +862,49 @@
         (should (equal (get-text-property 0 'help-echo workflow-cell)
                        "this-is-a-very-long-workflow-name"))))))
 
+(ert-deftest gptel-runner-dashboard-configures-auto-refresh-timer ()
+  (let ((gptel-runner-dashboard-refresh-interval 3.5)
+        (timer (timer-create)) scheduled cancelled (refreshes 0))
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (delay repeat function buffer)
+                 (setq scheduled (list delay repeat function buffer))
+                 timer))
+              ((symbol-function 'cancel-timer)
+               (lambda (candidate) (setq cancelled candidate))))
+      (with-temp-buffer
+        (gptel-runner-dashboard-mode)
+        (should (equal (seq-take scheduled 3)
+                       '(3.5 3.5
+                         gptel-runner-dashboard--refresh-buffer)))
+        (should (eq (nth 3 scheduled) (current-buffer)))
+        (should (eq gptel-runner-dashboard--refresh-timer timer))
+        (cl-letf (((symbol-function 'gptel-runner-dashboard-refresh)
+                   (lambda () (cl-incf refreshes))))
+          (funcall (nth 2 scheduled) (nth 3 scheduled))
+          (should (= refreshes 1)))
+        (fundamental-mode)
+        (should (eq cancelled timer))
+        (cl-letf (((symbol-function 'gptel-runner-dashboard-refresh)
+                   (lambda () (cl-incf refreshes))))
+          (funcall (nth 2 scheduled) (nth 3 scheduled))
+          (should (= refreshes 1)))))))
+
+(ert-deftest gptel-runner-dashboard-auto-refresh-can-be-disabled ()
+  (let ((gptel-runner-dashboard-refresh-interval nil)
+        scheduled)
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (&rest arguments) (setq scheduled arguments))))
+      (with-temp-buffer
+        (gptel-runner-dashboard-mode)
+        (should-not scheduled)
+        (should-not gptel-runner-dashboard--refresh-timer)))))
+
+(ert-deftest gptel-runner-dashboard-rejects-invalid-refresh-interval ()
+  (dolist (interval '(0 -1 invalid))
+    (let ((gptel-runner-dashboard-refresh-interval interval))
+      (with-temp-buffer
+        (should-error (gptel-runner-dashboard-mode) :type 'user-error)))))
+
 (ert-deftest gptel-runner-forget-run-and-workflow-clean-session-noise ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)

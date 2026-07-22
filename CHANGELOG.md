@@ -18,6 +18,8 @@
   state faces, row highlighting, and an interactive column toggle.
 - Keep dashboard columns aligned by ellipsizing long workflow and node values
   while exposing their complete text as hover help.
+- Refresh open dashboards automatically at a user-configurable interval and
+  clean up their timers when the dashboard is closed.
 - Fix the built-in reviewer schema so nullable issue fields serialize as valid
   JSON instead of failing reviewer calls with `json-value-p`.
 - Reject empty final agent responses, attempt one stateless repair, and fail

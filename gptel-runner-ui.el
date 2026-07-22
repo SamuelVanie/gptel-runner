@@ -52,8 +52,23 @@ List order is ignored; columns always use the canonical dashboard order."
           (const :tag "Calls remaining" calls))
   :group 'gptel-runner)
 
+(defcustom gptel-runner-dashboard-refresh-interval 2.0
+  "Seconds between automatic dashboard refreshes.
+Set this to nil to disable automatic refresh.  Changes take effect the next
+time the dashboard refreshes or its mode is activated."
+  :type '(choice
+          (const :tag "Disable automatic refresh" nil)
+          (number :tag "Refresh interval in seconds"))
+  :group 'gptel-runner)
+
 (defvar gptel-runner-dashboard-buffer "*gptel-runner*"
   "Name of the session dashboard buffer.")
+
+(defvar-local gptel-runner-dashboard--refresh-timer nil
+  "Timer responsible for refreshing the current dashboard buffer.")
+
+(defvar-local gptel-runner-dashboard--timer-interval nil
+  "Refresh interval used by the current dashboard timer.")
 
 (defun gptel-runner-ui--selected-column-specs ()
   "Return selected column specifications in canonical display order."
@@ -216,6 +231,44 @@ An elided value retains its complete unpropertized text as hover help."
                                  (gptel-runner-ui--call-entry run call))
                                (gptel-runner-run-calls run)))))))))
 
+(defun gptel-runner-dashboard--configured-refresh-interval ()
+  "Return the configured dashboard refresh interval after validation."
+  (unless (or (null gptel-runner-dashboard-refresh-interval)
+              (and (numberp gptel-runner-dashboard-refresh-interval)
+                   (> gptel-runner-dashboard-refresh-interval 0)))
+    (user-error
+     "Dashboard refresh interval must be a positive number or nil: %S"
+     gptel-runner-dashboard-refresh-interval))
+  gptel-runner-dashboard-refresh-interval)
+
+(defun gptel-runner-dashboard--cancel-refresh-timer ()
+  "Cancel the automatic refresh timer for the current buffer."
+  (when (timerp gptel-runner-dashboard--refresh-timer)
+    (cancel-timer gptel-runner-dashboard--refresh-timer))
+  (setq gptel-runner-dashboard--refresh-timer nil
+        gptel-runner-dashboard--timer-interval nil))
+
+(defun gptel-runner-dashboard--refresh-buffer (buffer)
+  "Refresh dashboard BUFFER when it is still live and in dashboard mode."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'gptel-runner-dashboard-mode)
+        (gptel-runner-dashboard-refresh)))))
+
+(defun gptel-runner-dashboard--configure-refresh-timer ()
+  "Make the current buffer's refresh timer match the configured interval."
+  (let ((interval (gptel-runner-dashboard--configured-refresh-interval)))
+    (unless (and (timerp gptel-runner-dashboard--refresh-timer)
+                 (equal interval
+                        gptel-runner-dashboard--timer-interval))
+      (gptel-runner-dashboard--cancel-refresh-timer)
+      (when interval
+        (setq gptel-runner-dashboard--timer-interval interval
+              gptel-runner-dashboard--refresh-timer
+              (run-with-timer
+               interval interval #'gptel-runner-dashboard--refresh-buffer
+               (current-buffer)))))))
+
 (define-derived-mode gptel-runner-dashboard-mode tabulated-list-mode
   "Runner-Dashboard"
   "Major mode for inspecting session-local gptel-runner state."
@@ -223,12 +276,18 @@ An elided value retains its complete unpropertized text as hover help."
         tabulated-list-padding 2
         tabulated-list-entries #'gptel-runner-ui--entries)
   (setq-local truncate-lines t)
+  (add-hook 'change-major-mode-hook
+            #'gptel-runner-dashboard--cancel-refresh-timer nil t)
+  (add-hook 'kill-buffer-hook
+            #'gptel-runner-dashboard--cancel-refresh-timer nil t)
   (hl-line-mode 1)
-  (tabulated-list-init-header))
+  (tabulated-list-init-header)
+  (gptel-runner-dashboard--configure-refresh-timer))
 
 (defun gptel-runner-dashboard-refresh ()
   "Refresh dashboard data and apply the current column selection."
   (interactive)
+  (gptel-runner-dashboard--configure-refresh-timer)
   (setq tabulated-list-format (gptel-runner-ui--format))
   (tabulated-list-init-header)
   (tabulated-list-print t))
