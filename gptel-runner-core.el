@@ -15,6 +15,8 @@
 (require 'subr-x)
 
 (declare-function gptel-runner-save-run "gptel-runner-store")
+(declare-function gptel-runner-schedule-save "gptel-runner-store")
+(declare-function gptel-runner-store-cancel-save "gptel-runner-store")
 
 (defgroup gptel-runner nil
   "Deterministic workflows over stateless agent calls."
@@ -235,6 +237,8 @@ When DELETE-SNAPSHOT is non-nil, also delete its durable snapshot file."
   (unless (gptel-runner--forgettable-run-p run)
     (user-error "Run %s is active; abort or pause it before removing it"
                 (gptel-runner-run-id run)))
+  (when (fboundp 'gptel-runner-store-cancel-save)
+    (gptel-runner-store-cancel-save run))
   (dolist (call (gptel-runner-run-calls run))
     (when (buffer-live-p (gptel-runner-call-buffer call))
       (kill-buffer (gptel-runner-call-buffer call))
@@ -286,12 +290,15 @@ non-nil, also delete snapshot files belonging to the removed runs."
   "Return non-nil when RUN has durable snapshotting enabled."
   (plist-get (gptel-runner-run-options run) :persist))
 
-(defun gptel-runner--checkpoint (run)
-  "Persist RUN at a safe checkpoint when persistence is enabled."
+(defun gptel-runner--checkpoint (run &optional immediate)
+  "Persist RUN at a safe checkpoint when persistence is enabled.
+When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
   (when (and (gptel-runner--persistent-p run)
              (fboundp 'gptel-runner-save-run))
     (condition-case err
-        (gptel-runner-save-run run)
+        (if (fboundp 'gptel-runner-schedule-save)
+            (gptel-runner-schedule-save run immediate)
+          (gptel-runner-save-run run))
       (error
        (gptel-runner--emit run 'snapshot-error nil nil err)
        nil))))
@@ -335,7 +342,7 @@ non-nil, also delete snapshot files belonging to the removed runs."
       (setf (gptel-runner-run-callback-called run) t)
       (when-let ((callback (gptel-runner-run-callback run)))
         (funcall callback run)))
-    (gptel-runner--checkpoint run)
+    (gptel-runner--checkpoint run t)
     t))
 
 (defun gptel-runner--budget-failure (run kind limit)
@@ -643,13 +650,14 @@ latest response to the workflow."
            call 'waiting-feedback (or reason 'user) t)
     (user-error "Call %s cannot be paused from state %s"
                 (gptel-runner-call-id call) (gptel-runner-call-state call)))
-  (gptel-runner--checkpoint (gptel-runner-call-run call))
+  (gptel-runner--checkpoint (gptel-runner-call-run call) t)
   call)
 
 (defun gptel-runner-pause-run (run &optional reason)
-  "Pause RUN for REASON and save a durable snapshot.
+  "Pause RUN for REASON and queue a durable snapshot.
 Active provider work is stopped.  Completed nodes and blackboard values are
-preserved; unfinished nodes restart from their last safe checkpoint."
+preserved; unfinished nodes restart from their last safe checkpoint.  The
+snapshot is committed asynchronously after this function returns."
   (interactive
    (list (and (boundp 'gptel-runner--call)
               (gptel-runner-call-p gptel-runner--call)

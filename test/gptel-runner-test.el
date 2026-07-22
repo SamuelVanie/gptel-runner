@@ -10,8 +10,13 @@
   `(let ((gptel-runner--agents (make-hash-table :test #'eq))
          (gptel-runner--workflows (make-hash-table :test #'eq))
          (gptel-runner--runs (make-hash-table :test #'equal))
+         (gptel-runner-store--coordinators (make-hash-table :test #'eq))
          (gptel-runner--next-id 0))
-     ,@body))
+     (unwind-protect
+         (progn ,@body)
+       (maphash (lambda (run _coordinator)
+                  (gptel-runner-store-cancel-save run))
+                gptel-runner-store--coordinators))))
 
 (defun gptel-runner-test--wait (run &optional seconds)
   "Wait up to SECONDS for RUN and return its state."
@@ -25,6 +30,15 @@
   "Count TYPE events in RUN."
   (cl-count type (gptel-runner-run-events run)
             :key #'gptel-runner-event-type))
+
+(defun gptel-runner-test--wait-for-snapshot (run &optional seconds)
+  "Wait up to SECONDS for RUN's queued snapshot and return its status."
+  (let ((deadline (+ (float-time) (or seconds 1.0))))
+    (while (and (memq (gptel-runner-store-save-status run)
+                      '(pending writing))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01))
+    (gptel-runner-store-save-status run)))
 
 (defun gptel-runner-test--step (id agent &optional save)
   "Make a simple step with ID, AGENT, and SAVE key."
@@ -517,6 +531,7 @@
                    (file (progn (gptel-runner-pause-run run 'overnight)
                                 (gptel-runner-run-snapshot-file run))))
               (should (eq (gptel-runner-run-state run) 'paused))
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
               (should (file-exists-p file))
               (should (= (file-modes file) #o600))
               (should (= callbacks 0))
@@ -535,6 +550,11 @@
                   (should (eq (gptel-runner-run-state restored) 'paused))
                   (should (equal (gptel-runner-get restored 'first-result)
                                  "kept result"))
+                  (should-not (gptel-runner-run-calls restored))
+                  (should (equal
+                           (mapcar #'gptel-runner-event-type
+                                   (gptel-runner-run-events restored))
+                           '(snapshot-loaded)))
                   (gptel-runner-resume-run restored "Use the smaller API")
                   (should (eq (gptel-runner-run-state restored) 'succeeded))
                   (should (string-match-p "Use the smaller API"
@@ -546,10 +566,10 @@
                               (gptel-runner-run-budget restored)) 3))
                   (should (= (gptel-runner-budget-requests
                               (gptel-runner-run-budget restored)) 3))
-                  (should (= (length (gptel-runner-run-calls restored)) 3))
+                  (should (= (length (gptel-runner-run-calls restored)) 1))
                   (should (eq (gptel-runner-call-state
-                               (nth 1 (gptel-runner-run-calls restored)))
-                              'skipped))))))
+                               (car (gptel-runner-run-calls restored)))
+                              'succeeded))))))
         (delete-directory snapshot-directory t)))))
 
 (ert-deftest gptel-runner-persistence-requires-named-workflow ()
@@ -561,7 +581,7 @@
      :driver (gptel-runner-fake-driver-create) :persist t)
      :type 'user-error)))
 
-(ert-deftest gptel-runner-restored-feedback-buffer-completes-node ()
+(ert-deftest gptel-runner-restored-unfinished-call-restarts-statelessly ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
     (let* ((snapshot-directory (make-temp-file "gptel-runner-feedback-" t))
@@ -578,19 +598,193 @@
                    (call (car (gptel-runner-run-calls run))))
               (gptel-runner-pause-call call 'feedback)
               (gptel-runner-pause-run run 'overnight)
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
               (setq gptel-runner--runs (make-hash-table :test #'equal))
-              (let* ((restored (gptel-runner-load-run
-                                (gptel-runner-run-snapshot-file run)
-                                nil (gptel-runner-fake-driver-create)))
-                     (restored-call (car (gptel-runner-run-calls restored))))
-                (should (eq (gptel-runner-call-state restored-call)
-                            'waiting-feedback))
-                (gptel-runner-complete-call-from-buffer
-                 "human-guided result" restored-call)
-                (should (eq (gptel-runner-run-state restored) 'succeeded))
-                (should (equal (gptel-runner-get restored 'report)
-                               "human-guided result"))
-                (should (= (length (gptel-runner-run-calls restored)) 1)))))
+              (let ((resume-driver (gptel-runner-fake-driver-create)))
+                (gptel-runner-fake-queue
+                 resume-driver 'worker '(:value "restarted result"))
+                (let ((restored
+                       (gptel-runner-load-run
+                        (gptel-runner-run-snapshot-file run)
+                        nil resume-driver)))
+                  (should-not (gptel-runner-run-calls restored))
+                  (gptel-runner-resume-run restored)
+                  (should (eq (gptel-runner-run-state restored) 'succeeded))
+                  (should (equal (gptel-runner-get restored 'report)
+                                 "restarted result"))
+                  (should (= (length (gptel-runner-run-calls restored)) 1))))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-checkpoints-are-coalesced-and-save-latest-state ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-coalesce-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (gptel-runner-checkpoint-delay 0.02)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow coalesced-save (:persist t)
+              (gptel-runner-agent-step
+               :id 'work :agent 'worker :prompt "work" :save-as 'report))
+            (gptel-runner-fake-queue driver 'worker '(:manual t))
+            (let ((run (gptel-runner-start 'coalesced-save :driver driver)))
+              (gptel-runner-put run 'progress "one")
+              (gptel-runner-put run 'progress "two")
+              (should (eq (gptel-runner-store-save-status run) 'pending))
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (let* ((snapshot
+                      (gptel-runner-store--read-file
+                       (gptel-runner-run-snapshot-file run)))
+                     (blackboard
+                      (plist-get (plist-get snapshot :run) :blackboard)))
+                (should (equal (cdr (assq 'progress blackboard)) "two")))
+              (should (= (gptel-runner-test--event-count
+                          run 'snapshot-saved)
+                         1))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-explicit-save-does-not-write-synchronously ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-queued-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow queued-save ()
+              (gptel-runner-agent-step
+               :id 'work :agent 'worker :prompt "work"))
+            (gptel-runner-fake-queue driver 'worker '(:value "done"))
+            (let* ((run (gptel-runner-start 'queued-save :driver driver))
+                   (file
+                    (cl-letf (((symbol-function
+                                'gptel-runner-store--begin)
+                               (lambda (_coordinator)
+                                 (ert-fail "save began synchronously"))))
+                      (gptel-runner-save-run run))))
+              (should (stringp file))
+              (should-not (file-exists-p file))
+              (should (eq (gptel-runner-store-save-status run) 'pending))
+              (gptel-runner-store-flush-pending)
+              (should (eq (gptel-runner-store-save-status run) 'clean))
+              (should (file-exists-p file))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-v1-snapshot-is-rejected ()
+  (let ((file (make-temp-file "gptel-runner-v1-")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (prin1 '(:format gptel-runner-snapshot :version 1 :run nil)
+                   (current-buffer)))
+          (should-error (gptel-runner-store--read-file file)
+                        :type 'user-error))
+      (delete-file file))))
+
+(ert-deftest gptel-runner-save-error-preserves-snapshot-and-can-retry ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-error-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow retry-save ()
+              (gptel-runner-agent-step
+               :id 'work :agent 'worker :prompt "work"))
+            (gptel-runner-fake-queue driver 'worker '(:value "done"))
+            (let ((run (gptel-runner-start 'retry-save :driver driver)))
+              (gptel-runner-put run 'progress "old")
+              (gptel-runner-save-run run)
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (with-temp-buffer
+                (gptel-runner-put run 'unreadable (current-buffer))
+                (gptel-runner-save-run run)
+                (should (eq (gptel-runner-test--wait-for-snapshot run)
+                            'error)))
+              (let* ((old-snapshot
+                      (gptel-runner-store--read-file
+                       (gptel-runner-run-snapshot-file run)))
+                     (old-board
+                      (plist-get (plist-get old-snapshot :run) :blackboard)))
+                (should (equal (cdr (assq 'progress old-board)) "old"))
+                (should-not (assq 'unreadable old-board)))
+              (remhash 'unreadable (gptel-runner-run-blackboard run))
+              (gptel-runner-put run 'progress "new")
+              (gptel-runner-save-run run)
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (let* ((new-snapshot
+                      (gptel-runner-store--read-file
+                       (gptel-runner-run-snapshot-file run)))
+                     (new-board
+                      (plist-get (plist-get new-snapshot :run) :blackboard)))
+                (should (equal (cdr (assq 'progress new-board)) "new")))
+              (should (= (gptel-runner-test--event-count
+                          run 'snapshot-error)
+                         1))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-state-changing-during-save-queues-new-generation ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-generation-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow generation-save ()
+              (gptel-runner-agent-step
+               :id 'work :agent 'worker :prompt "work"))
+            (gptel-runner-fake-queue driver 'worker '(:value "done"))
+            (let* ((run (gptel-runner-start 'generation-save :driver driver))
+                   (_old (gptel-runner-put run 'progress "old"))
+                   (_file (gptel-runner-save-run run))
+                   (coordinator
+                    (gethash run gptel-runner-store--coordinators)))
+              ;; Begin generation one, then change state before it commits.
+              (gptel-runner-store--cancel-timer coordinator)
+              (gptel-runner-store--begin coordinator)
+              (gptel-runner-store--cancel-timer coordinator)
+              (gptel-runner-put run 'progress "new")
+              (gptel-runner-store--write-slice coordinator t)
+              (should (eq (gptel-runner-store-save-status run) 'pending))
+              (gptel-runner-store--cancel-timer coordinator)
+              (gptel-runner-store--begin coordinator)
+              (gptel-runner-store--cancel-timer coordinator)
+              (gptel-runner-store--write-slice coordinator t)
+              (should (eq (gptel-runner-store-save-status run) 'clean))
+              (let* ((snapshot
+                      (gptel-runner-store--read-file
+                       (gptel-runner-run-snapshot-file run)))
+                     (blackboard
+                      (plist-get (plist-get snapshot :run) :blackboard)))
+                (should (equal (cdr (assq 'progress blackboard)) "new")))
+              (should (= (gptel-runner-test--event-count
+                          run 'snapshot-saved)
+                         2))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-forget-cancels-a-queued-save ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-cancel-save-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow cancelled-save ()
+              (gptel-runner-agent-step
+               :id 'work :agent 'worker :prompt "work"))
+            (gptel-runner-fake-queue driver 'worker '(:value "done"))
+            (let* ((run (gptel-runner-start 'cancelled-save :driver driver))
+                   (file (gptel-runner-save-run run)))
+              (should (eq (gptel-runner-store-save-status run) 'pending))
+              (gptel-runner-forget-run run t)
+              (accept-process-output nil 0.02)
+              (should-not (file-exists-p file))
+              (should-not
+               (gethash run gptel-runner-store--coordinators))))
         (delete-directory snapshot-directory t)))))
 
 (ert-deftest gptel-runner-dashboard-groups-workflows-runs-and-calls ()

@@ -7,6 +7,8 @@
 - Add structured review cycles, stall detection, and parallel joins.
 - Add a session dashboard, examples, and ERT coverage.
 - Add atomic persistent snapshots and cross-session workflow resume.
+- Replace synchronous full-history snapshots with debounced, time-sliced v2
+  execution checkpoints that keep Emacs responsive while saving.
 - Add pausable agent calls that can be guided and completed from their normal
   gptel transcript buffers.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM

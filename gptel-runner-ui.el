@@ -353,7 +353,7 @@ An elided value retains its complete unpropertized text as hover help."
          (file (progn (gptel-runner-pause-run run 'dashboard)
                       (gptel-runner-run-snapshot-file run))))
     (revert-buffer)
-    (message "Paused %s; snapshot saved to %s"
+    (message "Paused %s; snapshot queued for %s"
              (gptel-runner-run-id run) file)))
 
 (defun gptel-runner-dashboard-save-run ()
@@ -362,7 +362,7 @@ An elided value retains its complete unpropertized text as hover help."
   (let* ((run (or (gptel-runner-ui--run-at-point)
                   (user-error "No run on this row")))
          (file (gptel-runner-save-run run)))
-    (message "Snapshot saved to %s" file)))
+    (message "Snapshot queued for %s" file)))
 
 (defun gptel-runner-dashboard-resume-run ()
   "Resume the paused run at point with optional human feedback."

@@ -154,9 +154,19 @@ Persistent runs must use a named workflow and stable explicit node IDs.  Add
 
 Safe checkpoints are written atomically beneath
 `gptel-runner-snapshot-directory` (by default
-`~/.emacs.d/gptel-runner/snapshots/`).  Pause the entire process with
-`M-x gptel-runner-pause-run` from a worker or `P` in the dashboard.  The
-active-duration clock stops while paused.
+`~/.emacs.d/gptel-runner/snapshots/`).  Automatic checkpoints are coalesced
+until the run has been quiet for `gptel-runner-checkpoint-delay` seconds
+(five by default), then serialized and written in short event-loop slices.
+Manual saves, pauses, and terminal transitions bypass that delay, but still
+return after queueing the write.  A `snapshot-saved` or `snapshot-error` event
+reports its eventual result; `gptel-runner-store-save-status` returns `clean`,
+`pending`, `writing`, or `error` for programmatic status checks.  Pending
+writes are flushed during normal Emacs shutdown; an abnormal exit can lose the
+latest queued progress.
+
+Pause the entire process with `M-x gptel-runner-pause-run` from a worker or
+`P` in the dashboard.  The active-duration clock stops immediately while the
+snapshot finishes asynchronously.
 
 After restarting Emacs, load the same workflow and agent definitions, then:
 
@@ -170,21 +180,21 @@ After restarting Emacs, load the same workflow and agent definitions, then:
 (gptel-runner-resume-run my-run "Please prefer the smaller public API")
 ```
 
-Alternatively, use `l` and `r` in the dashboard.  If the snapshot contains a
-call paused for feedback, visit its restored transcript with `v`, continue it
-as a normal gptel conversation, and accept it with
-`gptel-runner-complete-call-from-buffer`; the reconstructed workflow resumes
-after that node.
+Alternatively, use `l` and `r` in the dashboard.
 
-Snapshots preserve the goal, canonical workspace, blackboard, completed node
-states, repeat iterations, budgets, event journal, calls, and retained
-transcripts.  Completion callbacks and live provider processes are not
-serializable: supply a new callback to `gptel-runner-load-run`, and expect an
-unfinished call to restart statelessly unless you complete its restored
-feedback buffer.  Calls consumed before pausing remain charged to call and
-request budgets.  Snapshot files have mode `0600`, but they contain prompts,
-outputs, tool results, and possibly secrets; protect and delete them as you
-would other sensitive local state.
+Version 2 snapshots preserve only execution state: the goal, canonical
+workspace, blackboard, completed node states, repeat iterations, budgets, and
+timing/options data.  Historical calls, event journals, and transcripts remain
+available for inspection in the original Emacs session but are not restored.
+An unfinished call therefore restarts statelessly from its workflow node.
+Store every downstream result needed after restoration on the blackboard,
+normally with `:save-as`.
+
+Completion callbacks and live provider processes are not serializable; supply
+a new callback to `gptel-runner-load-run`.  Calls consumed before pausing remain
+charged to call and request budgets.  Version 1 snapshots are not accepted.
+Snapshot files have mode `0600`, but blackboard values can contain prompts,
+outputs, tool results, and secrets; protect and delete them as sensitive data.
 
 Run options include `:driver`, `:max-requests`, `:max-calls`,
 `:max-concurrency`, `:max-duration`, `:allow-writes`, and
@@ -214,9 +224,10 @@ an option is not provided.
   call), the runner marks that call failed, asks the same agent once for a
   stateless repaired answer, and fails the node immediately if that answer is
   also empty.  Downstream nodes never receive the empty value.
-- Events and runtime state are authoritative.  Snapshots are versioned
-  projections written at safe checkpoints; they do not serialize Lisp
-  continuations, provider connections, timers, or external tool processes.
+- Runtime state is authoritative.  Compact snapshots are versioned execution
+  projections written at safe checkpoints; they do not preserve session audit
+  history, Lisp continuations, provider connections, timers, or external tool
+  processes.
 
 ## Extension points
 
