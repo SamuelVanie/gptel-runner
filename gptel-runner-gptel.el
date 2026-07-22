@@ -24,6 +24,10 @@
 (declare-function gptel--handle-post "gptel-request")
 (declare-function gptel--apply-preset "gptel")
 (declare-function gptel--insert-response "gptel")
+(declare-function gptel--update-tool-ask "gptel")
+(declare-function gptel--update-tool-call "gptel")
+(declare-function gptel--update-status "gptel")
+(declare-function gptel--update-wait "gptel")
 (declare-function gptel-mode "gptel")
 (declare-function gptel-runner--complete-restored-call "gptel-runner-flow")
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
@@ -54,7 +58,9 @@
     (gptel-runner-gptel--compatibility-error 'gptel-request-library))
   (dolist (function '(gptel-request gptel-abort gptel-make-fsm
                       gptel--fsm-transition gptel--handle-post
-                      gptel--apply-preset gptel--insert-response))
+                      gptel--apply-preset gptel--insert-response
+                      gptel--update-tool-ask gptel--update-tool-call
+                      gptel--update-status gptel--update-wait))
     (unless (fboundp function)
       (gptel-runner-gptel--compatibility-error function)))
   t)
@@ -178,12 +184,20 @@ RAW is gptel's internal flag for already formatted transcript content."
   "Return the current scheduler completion closure for CALL."
   (plist-get (gptel-runner-call-driver-data call) :complete))
 
+(defun gptel-runner-gptel--update-status (info message face)
+  "Show MESSAGE with FACE in the worker buffer described by INFO."
+  (when-let* ((buffer (plist-get info :buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (gptel--update-status message face))))
+
 (defun gptel-runner-gptel--done (fsm)
   "Handle successful terminal state for runner FSM."
   (let* ((info (gptel-fsm-info fsm))
          (call (plist-get info :context))
          (value (mapconcat #'identity
                            (nreverse (gptel-runner-call-response-parts call)) "")))
+    (gptel-runner-gptel--update-status info " Ready" 'success)
     (gptel-runner-gptel--post-once call fsm)
     (funcall (gptel-runner-gptel--complete-function call) 'success value nil)))
 
@@ -194,6 +208,8 @@ RAW is gptel's internal flag for already formatted transcript content."
          (metadata (gptel-runner-gptel--status-metadata info))
          (status (plist-get metadata :http-status))
          (retryable (gptel-runner--retryable-p call status metadata)))
+    (gptel-runner-gptel--update-status
+     info (format " Error: %s" (or status "request failed")) 'error)
     (unless retryable (gptel-runner-gptel--post-once call fsm))
     (funcall (gptel-runner-gptel--complete-function call)
              (if (or retryable (null status)
@@ -206,6 +222,7 @@ RAW is gptel's internal flag for already formatted transcript content."
   "Handle aborted terminal state for runner FSM."
   (let* ((info (gptel-fsm-info fsm))
          (call (plist-get info :context)))
+    (gptel-runner-gptel--update-status info " Abort" 'error)
     (gptel-runner-gptel--post-once call fsm)
     (if (plist-get (gptel-runner-call-driver-data call) :pausing)
         (setf (gptel-runner-call-driver-data call)
@@ -214,9 +231,20 @@ RAW is gptel's internal flag for already formatted transcript content."
                'cancelled nil nil))))
 
 (defun gptel-runner-gptel--make-fsm ()
-  "Create a per-call FSM with only runner terminal handlers replaced."
+  "Create a per-call FSM with runner terminals and gptel status handlers."
   (let ((handlers (copy-tree gptel-request--handlers)))
-    (setf (alist-get 'DONE handlers) (list #'gptel-runner-gptel--done)
+    ;; `gptel-request--handlers' drive the transport but intentionally omit
+    ;; the status handlers used by interactive gptel buffers.  Runner worker
+    ;; buffers enable `gptel-mode', so compose those handlers back in.  The
+    ;; TOOL status must run before tool execution because a synchronous tool
+    ;; can transition the FSM recursively before its handler returns.
+    (setf (alist-get 'WAIT handlers)
+          (append (alist-get 'WAIT handlers) (list #'gptel--update-wait))
+          (alist-get 'TOOL handlers)
+          (append (list #'gptel--update-tool-call)
+                  (alist-get 'TOOL handlers)
+                  (list #'gptel--update-tool-ask))
+          (alist-get 'DONE handlers) (list #'gptel-runner-gptel--done)
           (alist-get 'ERRS handlers) (list #'gptel-runner-gptel--error)
           (alist-get 'ABRT handlers) (list #'gptel-runner-gptel--aborted))
     (gptel-make-fsm :table (copy-tree gptel-request--transitions)

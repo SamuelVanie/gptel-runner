@@ -13,19 +13,68 @@
   (should (boundp 'gptel-request--transitions))
   (should (boundp 'gptel-request--handlers)))
 
-(ert-deftest gptel-runner-gptel-fsm-replaces-only-terminal-handlers ()
+(ert-deftest gptel-runner-gptel-fsm-adds-status-and-replaces-terminals ()
   (let* ((fsm (gptel-runner-gptel--make-fsm))
          (handlers (gptel-fsm-handlers fsm)))
     (should (equal (alist-get 'WAIT handlers)
-                   (alist-get 'WAIT gptel-request--handlers)))
+                   (append (alist-get 'WAIT gptel-request--handlers)
+                           (list #'gptel--update-wait))))
     (should (equal (alist-get 'TOOL handlers)
-                   (alist-get 'TOOL gptel-request--handlers)))
+                   (append (list #'gptel--update-tool-call)
+                           (alist-get 'TOOL gptel-request--handlers)
+                           (list #'gptel--update-tool-ask))))
     (should (equal (alist-get 'DONE handlers)
                    (list #'gptel-runner-gptel--done)))
     (should (equal (alist-get 'ERRS handlers)
                    (list #'gptel-runner-gptel--error)))
     (should (equal (alist-get 'ABRT handlers)
                    (list #'gptel-runner-gptel--aborted)))))
+
+(ert-deftest gptel-runner-gptel-fsm-reflects-active-request-status ()
+  (let* ((buffer (generate-new-buffer " *gptel-runner-status-test*"))
+         (fsm (gptel-runner-gptel--make-fsm))
+         (info (list :buffer buffer
+                     :tool-use (list '(:name "AskUserQuestion" :args nil)))))
+    (setf (gptel-fsm-info fsm) info)
+    (unwind-protect
+        (with-current-buffer buffer
+          (text-mode)
+          (gptel-mode 1)
+          (cl-letf (((symbol-function 'gptel--handle-tool-use) #'ignore)
+                    ((symbol-function 'gptel--handle-wait) #'ignore))
+            (gptel--fsm-transition fsm 'TOOL)
+            (should (string-match-p
+                     "Calling tool.*AskUserQuestion"
+                     (substring-no-properties (nth 1 header-line-format))))
+            (gptel--fsm-transition fsm 'WAIT)
+            (should (equal
+                     (substring-no-properties (nth 1 header-line-format))
+                     " Waiting..."))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gptel-runner-gptel-terminal-status-is-ready ()
+  (let* ((agent (gptel-runner-agent-create :name 'a :preset nil))
+         (run (gptel-runner-run-create :id "run"))
+         (node (gptel-runner-node-create :id 'node))
+         (call (gptel-runner-call-create
+                :id "call" :agent agent :run run :node node
+                :response-parts '("done")
+                :workspace default-directory))
+         (buffer (gptel-runner-gptel--worker-buffer call))
+         (fsm (gptel-runner-gptel--make-fsm))
+         completed)
+    (setf (gptel-runner-call-driver-data call)
+          (list :complete (lambda (&rest result) (setq completed result)))
+          (gptel-fsm-info fsm) (list :buffer buffer :context call))
+    (unwind-protect
+        (progn
+          (gptel-runner-gptel--done fsm)
+          (should (equal completed '(success "done" nil)))
+          (should
+           (equal (with-current-buffer buffer
+                    (substring-no-properties (nth 1 header-line-format)))
+                  " Ready")))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gptel-runner-gptel-worker-is-private-and-local ()
   (let* ((agent (gptel-runner-agent-create :name 'a :preset nil))
