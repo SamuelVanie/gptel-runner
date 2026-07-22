@@ -214,19 +214,21 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
 (defun gptel-runner--parse-agent-result (agent node value)
   "Parse and validate VALUE for AGENT and NODE.
 Return (t . VALUE) on success or (nil . ERROR) on invalid output."
-  (condition-case err
-      (let* ((props (gptel-runner-node-properties node))
-             (parser (or (plist-get props :parser)
-                         (gptel-runner-agent-parser agent)))
-             (validator (or (plist-get props :validator)
-                            (gptel-runner-agent-validator agent)))
-             (parsed (if parser (funcall parser value) value)))
-        (if (and parser (null parsed))
-            (cons nil (list :type 'invalid-output :reason 'empty-parse))
-          (if (and validator (not (funcall validator parsed)))
-              (cons nil (list :type 'invalid-output :reason 'validation))
-            (cons t parsed))))
-    (error (cons nil (list :type 'invalid-output :error err)))))
+  (if (gptel-runner--empty-output-p value)
+      (cons nil (gptel-runner--empty-output-error))
+    (condition-case err
+        (let* ((props (gptel-runner-node-properties node))
+               (parser (or (plist-get props :parser)
+                           (gptel-runner-agent-parser agent)))
+               (validator (or (plist-get props :validator)
+                              (gptel-runner-agent-validator agent)))
+               (parsed (if parser (funcall parser value) value)))
+          (if (and parser (null parsed))
+              (cons nil (list :type 'invalid-output :reason 'empty-parse))
+            (if (and validator (not (funcall validator parsed)))
+                (cons nil (list :type 'invalid-output :reason 'validation))
+              (cons t parsed))))
+      (error (cons nil (list :type 'invalid-output :error err))))))
 
 (defun gptel-runner--repair-prompt (run node value error-data)
   "Build a stateless output repair prompt for RUN, NODE, VALUE, ERROR-DATA."
@@ -237,6 +239,20 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
            "Do not perform the task again; repair only the output format.")
    (gptel-runner-run-goal run) (gptel-runner-run-workspace run)
    (gptel-runner-node-id node) value error-data))
+
+(defun gptel-runner--empty-output-repair-prompt (run node original-prompt)
+  "Build a one-shot repair prompt for an empty result from NODE in RUN.
+ORIGINAL-PROMPT is included because each repair call is stateless."
+  (format
+   (concat "The previous call completed without a non-empty final answer, "
+           "possibly after a tool call.\n"
+           "Complete the original task now and return its full final answer.\n"
+           "Do not end on a tool call: after using tools, always provide a "
+           "non-empty final response for the next workflow step.\n"
+           "Original goal: %s\nWorkspace: %s\nNode: %S\n"
+           "Original task:\n%s")
+   (gptel-runner-run-goal run) (gptel-runner-run-workspace run)
+   (gptel-runner-node-id node) original-prompt))
 
 (defun gptel-runner--execute-agent (run node done)
   "Execute agent NODE in RUN and invoke DONE with state and result."
@@ -250,12 +266,26 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
         ((finish (state value)
            (gptel-runner--set-node-state run node state value)
            (funcall done state value))
+         (repair-empty
+          (call error-data)
+          (setq repaired t)
+          (gptel-runner--emit run 'output-repair-started
+                              node nil error-data)
+          (launch (gptel-runner--empty-output-repair-prompt
+                   run node (gptel-runner-call-prompt call)) t))
+         (repair-invalid
+          (value error-data)
+          (setq repaired t)
+          (gptel-runner--emit run 'output-repair-started
+                              node nil error-data)
+          (launch (gptel-runner--repair-prompt
+                   run node value error-data) t))
          (launch
           (prompt repair-p)
           (unless (gptel-runner--run-terminal-p run)
             (gptel-runner--submit-call
              run node agent prompt
-             (lambda (_call state value)
+             (lambda (call state value)
                (pcase state
                  ('succeeded
                   (let ((parsed (gptel-runner--parse-agent-result
@@ -265,25 +295,28 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
                           (when-let ((key (plist-get props :save-as)))
                             (gptel-runner-put run key (cdr parsed)))
                           (finish 'succeeded (cdr parsed)))
-                      (if (and repair-allowed (not repaired))
-                          (progn
-                            (setq repaired t)
-                            (gptel-runner--emit run 'output-repair-started
-                                                node nil (cdr parsed))
-                            (launch (gptel-runner--repair-prompt
-                                     run node value (cdr parsed)) t))
-                        (finish 'failed (cdr parsed))))))
+                      (cond
+                       ((and (gptel-runner--empty-output-error-p (cdr parsed))
+                             (not repaired))
+                        (repair-empty call (cdr parsed)))
+                       ((and repair-allowed (not repaired))
+                        (repair-invalid value (cdr parsed)))
+                       (t (finish 'failed (cdr parsed)))))))
                  ('blocked (finish 'blocked value))
                  ('cancelled (finish 'cancelled value))
                  (_
-                  (if (and (> semantic-left 0)
-                           (not (gptel-runner--run-terminal-p run)))
-                      (progn
-                        (cl-decf semantic-left)
-                        (gptel-runner--emit run 'agent-step-retry
-                                            node nil value)
-                        (launch (gptel-runner--prompt run node) nil))
-                    (finish 'failed value)))))
+                  (cond
+                   ((gptel-runner--empty-output-error-p value)
+                    (if repaired
+                        (finish 'failed value)
+                      (repair-empty call value)))
+                   ((and (> semantic-left 0)
+                         (not (gptel-runner--run-terminal-p run)))
+                    (cl-decf semantic-left)
+                    (gptel-runner--emit run 'agent-step-retry
+                                        node nil value)
+                    (launch (gptel-runner--prompt run node) nil))
+                   (t (finish 'failed value))))))
              repair-p))))
       (gptel-runner--set-node-state run node 'running)
       (launch (gptel-runner--prompt run node) nil))))

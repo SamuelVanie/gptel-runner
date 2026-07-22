@@ -133,6 +133,21 @@ defensive against duplicate and late calls.")
   "Return non-nil when RUN is terminal."
   (gptel-runner--terminal-p (gptel-runner-run-state run)))
 
+(defun gptel-runner--empty-output-p (value)
+  "Return non-nil when VALUE is not a usable agent output."
+  (or (null value)
+      (and (stringp value) (string-blank-p value))))
+
+(defun gptel-runner--empty-output-error ()
+  "Return the structured failure used for an empty agent output."
+  (list :type 'invalid-output :reason 'empty-response))
+
+(defun gptel-runner--empty-output-error-p (value)
+  "Return non-nil when VALUE describes an empty agent output failure."
+  (and (listp value)
+       (eq (plist-get value :type) 'invalid-output)
+       (eq (plist-get value :reason) 'empty-response)))
+
 (defun gptel-runner--emit (run type &optional node call data)
   "Append a TYPE event for RUN, NODE, and CALL containing DATA."
   (let ((event (gptel-runner-event-create
@@ -442,7 +457,11 @@ non-nil, also delete snapshot files belonging to the removed runs."
   (when (and (= generation (gptel-runner-call-generation call))
              (not (gptel-runner--call-terminal-p call)))
     (pcase status
-      ('success (gptel-runner--finish-call call 'succeeded value))
+      ('success
+       (if (gptel-runner--empty-output-p value)
+           (gptel-runner--finish-call
+            call 'failed (gptel-runner--empty-output-error))
+         (gptel-runner--finish-call call 'succeeded value)))
       ('cancelled (gptel-runner--finish-call call 'cancelled value))
       ('blocked (gptel-runner--finish-call call 'blocked value))
       ('transient

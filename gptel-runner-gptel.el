@@ -342,7 +342,7 @@ node result and reconstructs the continuation from the workflow AST."
             (and (buffer-live-p (gptel-runner-call-buffer call))
                  (gptel-runner-gptel--last-response
                   (gptel-runner-call-buffer call)))))
-  (unless (and (stringp result) (not (string-empty-p result)))
+  (unless (and (stringp result) (not (string-blank-p result)))
     (user-error "Select a response or continue the gptel conversation first"))
   (let* ((run (gptel-runner-call-run call))
          (resume-afterward (eq (gptel-runner-run-state run) 'paused)))

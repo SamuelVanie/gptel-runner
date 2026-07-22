@@ -79,6 +79,72 @@
         (should (= (length (gptel-runner-run-calls run)) 1))
         (should (= (gptel-runner-test--event-count run 'run-completed) 1))))))
 
+(ert-deftest gptel-runner-empty-output-is-repaired-before-handoff ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'planner :preset 'p)
+    (gptel-runner-register-agent 'implementer :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'planner '(:value " \n\t") '(:value "repaired plan"))
+      (gptel-runner-fake-queue
+       driver 'implementer
+       (lambda (call)
+         (should (string-match-p "repaired plan"
+                                 (gptel-runner-call-prompt call)))
+         '(:value "implemented")))
+      (let* ((root
+              (gptel-runner-sequence
+               (gptel-runner-agent-step
+                :id 'plan :agent 'planner :prompt "Create the plan"
+                :save-as 'plan)
+               (gptel-runner-agent-step
+                :id 'implement :agent 'implementer
+                :prompt (lambda (run _node)
+                          (format "Implement this: %s"
+                                  (gptel-runner-get run 'plan))))))
+             (run (gptel-runner-start root :goal "ship" :driver driver))
+             (calls (gptel-runner-run-calls run)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'plan) "repaired plan"))
+        (should (= (length calls) 3))
+        (should (eq (gptel-runner-call-state (nth 0 calls)) 'failed))
+        (should (gptel-runner--empty-output-error-p
+                 (gptel-runner-call-error (nth 0 calls))))
+        (should (gptel-runner-call-repair-p (nth 1 calls)))
+        (should (string-match-p "Original task:\nCreate the plan"
+                                (gptel-runner-call-prompt (nth 1 calls))))
+        (should (= (gptel-runner-test--event-count
+                    run 'output-repair-started) 1))))))
+
+(ert-deftest gptel-runner-second-empty-output-fails-before-next-node ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'planner :preset 'p)
+    (gptel-runner-register-agent 'implementer :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'planner '(:value nil) '(:value "  "))
+      (gptel-runner-fake-queue driver 'implementer '(:value "must not run"))
+      (let* ((root
+              (gptel-runner-sequence
+               (gptel-runner-agent-step
+                :id 'plan :agent 'planner :prompt "Create the plan"
+                :save-as 'plan :retries 3)
+               (gptel-runner-test--step 'implement 'implementer)))
+             (run (gptel-runner-start root :driver driver))
+             (calls (gptel-runner-run-calls run)))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should-not (gptel-runner-get run 'plan))
+        (should (= (length calls) 2))
+        (should (cl-every (lambda (call)
+                            (eq (gptel-runner-call-state call) 'failed))
+                          calls))
+        (should (eq (gethash 'implement
+                             (gptel-runner-run-node-states run))
+                    'skipped))
+        (should (= (gptel-runner-test--event-count
+                    run 'output-repair-started) 1))
+        (should (= (gptel-runner-test--event-count
+                    run 'agent-step-retry) 0))))))
+
 (ert-deftest gptel-runner-preflight-validation ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'writer :preset 'p :workspace-mode 'write)

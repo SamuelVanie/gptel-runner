@@ -18,3 +18,5 @@
   while exposing their complete text as hover help.
 - Fix the built-in reviewer schema so nullable issue fields serialize as valid
   JSON instead of failing reviewer calls with `json-value-p`.
+- Reject empty final agent responses, attempt one stateless repair, and fail
+  the node before handing an empty value to downstream workflow steps.

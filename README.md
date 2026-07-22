@@ -209,6 +209,11 @@ an option is not provided.
 - Request retries reuse one logical call and consume request attempts.  An
   agent-step retry creates a new call.  An implementation revision is a new
   workflow iteration.  These are intentionally separate counters.
+- A successful provider request must still return a non-empty final response.
+  If it returns only `nil` or whitespace (for example, after ending on a tool
+  call), the runner marks that call failed, asks the same agent once for a
+  stateless repaired answer, and fails the node immediately if that answer is
+  also empty.  Downstream nodes never receive the empty value.
 - Events and runtime state are authoritative.  Snapshots are versioned
   projections written at safe checkpoints; they do not serialize Lisp
   continuations, provider connections, timers, or external tool processes.
@@ -237,6 +242,7 @@ can change; CI checks v0.9.9.4 and uses current master as an early-warning job.
 | `compatibility` before a call | Install supported gptel or inspect adapter/API changes. |
 | Writable workflow rejected | Pass `:allow-writes t` after reviewing its tools. |
 | Run is `stalled` | Inspect repeated review issues/diff and adjust the workflow or agent prompt. |
+| `empty-response` | The original call and its automatic one-shot repair both returned no final answer. |
 | `invalid-output` | The original and one repair response both failed validation. |
 | Cancellation cannot undo a tool | Stop/undo the external tool action separately. |
 | Snapshot cannot find a node | Reload the same named workflow with stable explicit node IDs. |
