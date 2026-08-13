@@ -51,7 +51,8 @@ Use `:predicate' (or `:if'), `:then', `:else', and optional `:id'."
 (defun gptel-runner-repeat-until (&rest properties)
   "Return a bounded repeat node described by PROPERTIES.
 The node requires `:body' and a positive `:max'.  `:until', `:stop-when', and
-`:progress-key' are functions accepting the current run."
+`:progress-key' are functions accepting the current run.  `:collect-keys' and
+`:save-history-as' retain ordered per-iteration blackboard snapshots."
   (gptel-runner-node-create
    :id (gptel-runner--node-id properties 'repeat)
    :kind 'repeat :properties properties
@@ -80,10 +81,17 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
              :name ',name :options ',options :root ,(car body))
             gptel-runner--workflows))
 
+(defun gptel-runner--node-save-key (node)
+  "Return NODE's own blackboard destination key, if any."
+  (let* ((kind (gptel-runner-node-kind node))
+         (props (gptel-runner-node-properties node)))
+    (pcase kind
+      ((or 'agent 'parallel) (plist-get props :save-as))
+      ('repeat (plist-get props :save-history-as)))))
+
 (defun gptel-runner--node-save-keys (node)
-  "Return all blackboard keys written below NODE."
-  (let ((own (and (memq (gptel-runner-node-kind node) '(agent parallel))
-                  (plist-get (gptel-runner-node-properties node) :save-as))))
+  "Return all blackboard keys written by NODE and its descendants."
+  (let ((own (gptel-runner--node-save-key node)))
     (append (and own (list own))
             (apply #'append
                    (mapcar #'gptel-runner--node-save-keys
@@ -127,7 +135,46 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
                  (unless (and (integerp max) (> max 0))
                    (user-error "Repeat node %S needs a positive :max" id)))
                (unless (gptel-runner-node-p (plist-get props :body))
-                 (user-error "Repeat node %S needs a :body" id)))
+                 (user-error "Repeat node %S needs a :body" id))
+               (let ((collect-present (plist-member props :collect-keys))
+                     (history-present (plist-member props :save-history-as))
+                     (collect-keys (plist-get props :collect-keys))
+                     (history-key (plist-get props :save-history-as)))
+                 (unless (eq (not (null collect-present))
+                             (not (null history-present)))
+                   (user-error
+                    (concat "Repeat node %S must use :collect-keys and "
+                            ":save-history-as together")
+                    id))
+                 (when collect-present
+                   (unless (and (proper-list-p collect-keys) collect-keys)
+                     (user-error
+                      "Repeat node %S needs non-empty :collect-keys" id))
+                   (unless history-key
+                     (user-error
+                      "Repeat node %S needs non-nil :save-history-as" id))
+                   (when (cl-some #'null collect-keys)
+                     (user-error
+                      "Repeat node %S has nil in :collect-keys" id))
+                   (unless (= (length collect-keys)
+                              (length (delete-dups
+                                       (copy-sequence collect-keys))))
+                     (user-error
+                      "Repeat node %S has duplicate :collect-keys" id))
+                   (let ((body-keys
+                          (gptel-runner--node-save-keys
+                           (plist-get props :body))))
+                     (when (member history-key body-keys)
+                       (user-error
+                        (concat "Repeat node %S history key %S is also "
+                                "written by its body")
+                        id history-key))
+                     (dolist (key collect-keys)
+                       (unless (member key body-keys)
+                         (user-error
+                          (concat "Repeat node %S collects key %S, which is "
+                                  "not written by its body")
+                          id key)))))))
               ('branch
                (unless (functionp (or (plist-get props :predicate)
                                       (plist-get props :if)))
@@ -367,6 +414,38 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
       (gptel-runner--set-node-state run node 'succeeded)
       (funcall done 'succeeded nil))))
 
+(defun gptel-runner--node-key-succeeded-p (run node key)
+  "Return non-nil when NODE or a descendant wrote KEY successfully in RUN."
+  (or (and (equal (gptel-runner--node-save-key node) key)
+           (eq (gethash (gptel-runner-node-id node)
+                        (gptel-runner-run-node-states run) 'pending)
+               'succeeded))
+      (cl-some (lambda (child)
+                 (gptel-runner--node-key-succeeded-p run child key))
+               (gptel-runner-node-children node))))
+
+(defun gptel-runner--collect-repeat-history (run node iteration)
+  "Append NODE's configured blackboard snapshot for ITERATION in RUN.
+Return the new history entry, or nil when NODE does not collect history."
+  (let* ((props (gptel-runner-node-properties node))
+         (keys (plist-get props :collect-keys))
+         (history-key (plist-get props :save-history-as))
+         (body (plist-get props :body)))
+    (when keys
+      (let ((missing (make-symbol "missing"))
+            values)
+        (dolist (key keys)
+          (let ((value (gethash key (gptel-runner-run-blackboard run)
+                                missing)))
+            (when (and (not (eq value missing))
+                       (gptel-runner--node-key-succeeded-p run body key))
+              (push (cons key (copy-tree value t)) values))))
+        (let ((entry (list :iteration iteration :values (nreverse values))))
+          (gptel-runner-put
+           run history-key
+           (append (gptel-runner-get run history-key) (list entry)))
+          entry)))))
+
 (defun gptel-runner--execute-repeat (run node done)
   "Execute bounded repeat NODE in RUN and invoke DONE."
   (let* ((props (gptel-runner-node-properties node))
@@ -400,8 +479,10 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
                         (iteration (1+ (gptel-runner-iteration run id)))
                         (key (and progress-fn (funcall progress-fn run))))
                    (puthash id iteration (gptel-runner-run-iterations run))
+                   (gptel-runner--collect-repeat-history run node iteration)
                    (gptel-runner--emit run 'iteration-completed node nil
-                                       (list :iteration iteration :progress key))
+                                       (list :iteration iteration
+                                             :progress key))
                    (cond
                     ((and stop (funcall stop run))
                      (gptel-runner--set-node-state run node 'blocked value)

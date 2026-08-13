@@ -464,6 +464,130 @@
         (should (= (gptel-runner-budget-calls
                     (gptel-runner-run-budget run)) 2))))))
 
+(ert-deftest gptel-runner-repeat-collects-history-for-downstream-node ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(writer reviewer summarizer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let* ((driver (gptel-runner-fake-driver-create))
+           (expected
+            '((:iteration 1
+               :values ((implementation . "first draft")
+                        (review . "revise")))
+              (:iteration 2
+               :values ((implementation . "revised draft")
+                        (review . "pass")))))
+           observed-history)
+      (gptel-runner-fake-queue
+       driver 'writer '(:value "first draft") '(:value "revised draft"))
+      (gptel-runner-fake-queue
+       driver 'reviewer '(:value "revise") '(:value "pass"))
+      (gptel-runner-fake-queue driver 'summarizer '(:value "final document"))
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-sequence
+               (gptel-runner-repeat-until
+                :id 'revision-cycle
+                :max 3
+                :until (lambda (current-run)
+                         (equal (gptel-runner-get current-run 'review)
+                                "pass"))
+                :collect-keys '(implementation review)
+                :save-history-as 'revision-history
+                :body
+                (gptel-runner-sequence
+                 (gptel-runner-test--step
+                  'write 'writer 'implementation)
+                 (gptel-runner-test--step 'review 'reviewer 'review)))
+               (gptel-runner-agent-step
+                :id 'summarize
+                :agent 'summarizer
+                :prompt (lambda (current-run _node)
+                          (setq observed-history
+                                (gptel-runner-get
+                                 current-run 'revision-history))
+                          (format "Summarize: %S" observed-history))
+                :save-as 'final-document))
+              :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal observed-history expected))
+        (should (equal (gptel-runner-get run 'revision-history) expected))
+        (should (equal (gptel-runner-get run 'implementation)
+                       "revised draft"))
+        (should (equal (gptel-runner-get run 'review) "pass"))
+        (should (equal (gptel-runner-get run 'final-document)
+                       "final document"))))))
+
+(ert-deftest gptel-runner-repeat-history-omits-stale-skipped-values ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(optional reviewer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'optional '(:value "first only"))
+      (gptel-runner-fake-queue
+       driver 'reviewer '(:value "revise") '(:value "pass"))
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-repeat-until
+               :id 'conditional-cycle
+               :max 3
+               :until (lambda (current-run)
+                        (equal (gptel-runner-get current-run 'review)
+                               "pass"))
+               :collect-keys '(optional-result review)
+               :save-history-as 'conditional-history
+               :body
+               (gptel-runner-sequence
+                (gptel-runner-branch
+                 :id 'optional-branch
+                 :predicate
+                 (lambda (current-run)
+                   (zerop (gptel-runner-iteration
+                           current-run 'conditional-cycle)))
+                 :then
+                 (gptel-runner-test--step
+                  'optional-step 'optional 'optional-result))
+                (gptel-runner-test--step 'review-step 'reviewer 'review)))
+              :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should
+         (equal
+          (gptel-runner-get run 'conditional-history)
+          '((:iteration 1
+             :values ((optional-result . "first only")
+                      (review . "revise")))
+            (:iteration 2 :values ((review . "pass"))))))))))
+
+(ert-deftest gptel-runner-repeat-history-options-are-validated ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create))
+          (body (gptel-runner-test--step 'work 'worker 'result)))
+      (dolist
+          (node
+           (list
+            (gptel-runner-repeat-until
+             :id 'missing-history-key :max 1
+             :collect-keys '(result) :body body)
+            (gptel-runner-repeat-until
+             :id 'missing-collected-keys :max 1
+             :save-history-as 'history :body body)
+            (gptel-runner-repeat-until
+             :id 'empty-collected-keys :max 1
+             :collect-keys nil :save-history-as 'history :body body)
+            (gptel-runner-repeat-until
+             :id 'duplicate-collected-keys :max 1
+             :collect-keys '(result result)
+             :save-history-as 'history :body body)
+            (gptel-runner-repeat-until
+             :id 'history-key-collision :max 1
+             :collect-keys '(result)
+             :save-history-as 'result :body body)
+            (gptel-runner-repeat-until
+             :id 'unknown-body-key :max 1
+             :collect-keys '(unknown)
+             :save-history-as 'history :body body)))
+        (should-error (gptel-runner-start node :driver driver))))))
+
 (ert-deftest gptel-runner-branch-selects-one-child ()
   (gptel-runner-test--isolated
     (dolist (agent '(yes no)) (gptel-runner-register-agent agent :preset 'p))

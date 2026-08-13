@@ -13,6 +13,8 @@
   gptel transcript buffers.
 - Add `:pause-after t` agent-step approval points that hold successful output
   for human refinement before saving it or dispatching downstream nodes.
+- Add repeat `:collect-keys` and `:save-history-as` options for preserving
+  ordered per-iteration blackboard values for downstream summary nodes.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
 - Group dashboard rows by workflow and add safe run/workflow cleanup commands.

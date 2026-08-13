@@ -169,6 +169,70 @@ completing the retained call in the same Emacs session resumes the run.  A
 snapshot loaded in a later session has no retained transcript or continuation,
 so the unfinished gated node restarts statelessly on resume.
 
+### Collecting loop history for a final summary
+
+Agent `:save-as` values normally describe the latest iteration because each
+iteration writes the same blackboard keys.  A repeat node can retain ordered
+snapshots of selected keys with `:collect-keys` and `:save-history-as`:
+
+```elisp
+(gptel-runner-sequence
+ :id 'review-and-summarize
+
+ (gptel-runner-repeat-until
+  :id 'review-cycle
+  :max 5
+  :until #'review-passed-p
+  :collect-keys '(implementation-report review-result)
+  :save-history-as 'review-history
+  :body
+  (gptel-runner-sequence
+   (gptel-runner-agent-step
+    :id 'implement
+    :agent 'implementer
+    :prompt #'implementation-prompt
+    :save-as 'implementation-report)
+   (gptel-runner-agent-step
+    :id 'review
+    :agent 'reviewer
+    :prompt #'review-prompt
+    :save-as 'review-result)))
+
+ (gptel-runner-agent-step
+  :id 'summarize
+  :agent 'summarizer
+  :prompt
+  (lambda (run _node)
+    (format
+     (concat "Create the final report from this ordered revision history. "
+             "Write the requested document and return its path.\n\n%S")
+     (gptel-runner-get run 'review-history)))
+  :save-as 'final-report))
+```
+
+Both repeat options are required together.  Every collected key must be a
+declared blackboard destination written somewhere in the repeat body, while
+the history destination must not be written by the body.  After every
+successful body iteration, before `:until` or `:stop-when` is evaluated, the
+runner appends an entry to `review-history`:
+
+```elisp
+((:iteration 1
+  :values ((implementation-report . "first attempt")
+           (review-result . "needs revision")))
+ (:iteration 2
+  :values ((implementation-report . "revised attempt")
+           (review-result . "approved"))))
+```
+
+Entries and collected keys retain declaration order, including the final
+successful iteration.  A key is omitted when its producing node was skipped
+in that iteration, even if an older value for the key remains on the
+blackboard.  Collected structured values are copied when captured so later
+iterations cannot mutate earlier list or vector data.  Because the history is
+an ordinary blackboard value, durable snapshots preserve it and downstream
+prompt functions read it with `gptel-runner-get`.
+
 ### Durable snapshots and overnight resume
 
 Persistent runs must use a named workflow and stable explicit node IDs.  Add
