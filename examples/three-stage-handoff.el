@@ -4,11 +4,13 @@
 
 ;; This example demonstrates an explicit, stateless handoff:
 ;;
-;;   researcher -> planner -> implementer
+;;   researcher -> planner -> human approval -> implementer
 ;;
 ;; Each step stores its result on the run blackboard with `:save-as'.  The
 ;; next step receives that result because its prompt function reads it with
 ;; `gptel-runner-get'.  No conversational transcript is shared implicitly.
+;; The planner uses `:pause-after t', so its first response remains provisional
+;; until a human accepts or replaces it from the retained worker transcript.
 ;;
 ;; Define the gptel presets `handoff-researcher', `handoff-planner', and
 ;; `handoff-implementer' before running this workflow.  Their tool lists are
@@ -80,7 +82,8 @@
     :id 'plan
     :agent 'handoff-planner
     :prompt #'example/handoff-plan-prompt
-    :save-as 'implementation-plan)
+    :save-as 'implementation-plan
+    :pause-after t)
 
    (gptel-runner-agent-step
     :id 'implement

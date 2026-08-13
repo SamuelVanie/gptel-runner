@@ -21,7 +21,9 @@
 (defun gptel-runner-agent-step (&rest properties)
   "Return an agent node described by PROPERTIES.
 Required keys are `:id', `:agent', and `:prompt'.  `:save-as', `:retries',
-`:parser', `:validator', and `:repair-invalid' customize result handling."
+`:parser', `:validator', `:repair-invalid', and `:pause-after' customize result
+handling.  A non-nil `:pause-after' holds a successful response for human
+feedback before completing the node."
   (gptel-runner-node-create
    :id (gptel-runner--node-id properties 'agent)
    :kind 'agent :properties properties))

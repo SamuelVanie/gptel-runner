@@ -11,6 +11,8 @@
   execution checkpoints that keep Emacs responsive while saving.
 - Add pausable agent calls that can be guided and completed from their normal
   gptel transcript buffers.
+- Add `:pause-after t` agent-step approval points that hold successful output
+  for human refinement before saving it or dispatching downstream nodes.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
 - Group dashboard rows by workflow and add safe run/workflow cleanup commands.

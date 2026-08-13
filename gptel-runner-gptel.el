@@ -326,17 +326,27 @@ RAW is gptel's internal flag for already formatted transcript content."
                (not (eq (gptel-fsm-state (gptel-runner-call-fsm call))
                         'ABRT)))
       (gptel--fsm-transition (gptel-runner-call-fsm call) 'ABRT))
+    (gptel-runner-gptel--insert-feedback-instructions call)))
+
+(defun gptel-runner-gptel--insert-feedback-instructions (call)
+  "Append human-feedback instructions to CALL's retained worker buffer."
+  (when (buffer-live-p (gptel-runner-call-buffer call))
     (with-current-buffer (gptel-runner-call-buffer call)
       (goto-char (point-max))
       (let ((inhibit-read-only t))
         (insert
          (concat
           "\n\nRunner intervention\n===================\n\n"
-          "This workflow call is paused.  Add feedback and continue with "
-          "ordinary gptel commands in this buffer.  When the response should "
-          "be returned to the workflow, select it or leave point after the "
-          "latest response and run M-x "
+          "This workflow call is waiting for your feedback.  Add feedback "
+          "and continue with ordinary gptel commands in this buffer.  When "
+          "the response should be returned to the workflow, select it or "
+          "leave point after the latest response and run M-x "
           "gptel-runner-complete-call-from-buffer.\n"))))))
+
+(cl-defmethod gptel-runner-driver-await-feedback
+  ((_driver gptel-runner-gptel-driver) call)
+  "Make completed CALL's transcript available for human feedback."
+  (gptel-runner-gptel--insert-feedback-instructions call))
 
 (defun gptel-runner-gptel--last-response (buffer)
   "Return the last gptel response text found in BUFFER."

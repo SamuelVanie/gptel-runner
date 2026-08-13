@@ -506,6 +506,91 @@
                        "second result"))
         (should (= (length (gptel-runner-run-calls run)) 2))))))
 
+(ert-deftest gptel-runner-pause-after-holds-result-before-next-node ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(planner implementer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create))
+          (callbacks 0))
+      (gptel-runner-fake-queue
+       driver 'planner '(:value "draft plan" :duplicate t))
+      (gptel-runner-fake-queue
+       driver 'implementer
+       (lambda (call)
+         (should (string-match-p
+                  "approved plan" (gptel-runner-call-prompt call)))
+         '(:value "implemented")))
+      (let* ((run
+              (gptel-runner-start
+               (gptel-runner-sequence
+                (gptel-runner-agent-step
+                 :id 'plan :agent 'planner :prompt "Create the plan"
+                 :save-as 'plan :pause-after t)
+                (gptel-runner-agent-step
+                 :id 'implement :agent 'implementer
+                 :prompt (lambda (current-run _node)
+                           (format "Implement: %s"
+                                   (gptel-runner-get current-run 'plan)))
+                 :save-as 'report))
+               :driver driver
+               :callback (lambda (_run) (cl-incf callbacks))))
+             (call (car (gptel-runner-run-calls run))))
+        (should (eq (gptel-runner-run-state run) 'running))
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (should (eq (gethash 'plan (gptel-runner-run-node-states run))
+                    'running))
+        (should-not (gptel-runner-get run 'plan))
+        (should (= (length (gptel-runner-run-calls run)) 1))
+        (should (= (gptel-runner-test--event-count
+                    run 'call-waiting-feedback) 1))
+        (should (zerop callbacks))
+        (gptel-runner-complete-call-from-buffer "approved plan" call)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'plan) "approved plan"))
+        (should (equal (gptel-runner-get run 'report) "implemented"))
+        (should (= (length (gptel-runner-run-calls run)) 2))
+        (should (= callbacks 1))))))
+
+(ert-deftest gptel-runner-pause-after-survives-whole-run-pause ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(planner implementer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let* ((snapshot-directory
+            (make-temp-file "gptel-runner-pause-after-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow gated-handoff (:persist t)
+              (gptel-runner-sequence
+               :id 'handoff
+               (gptel-runner-agent-step
+                :id 'plan :agent 'planner :prompt "Create the plan"
+                :save-as 'plan :pause-after t)
+               (gptel-runner-agent-step
+                :id 'implement :agent 'implementer
+                :prompt (lambda (run _node)
+                          (format "Implement: %s"
+                                  (gptel-runner-get run 'plan)))
+                :save-as 'report)))
+            (gptel-runner-fake-queue driver 'planner '(:value "draft plan"))
+            (gptel-runner-fake-queue
+             driver 'implementer
+             (lambda (call)
+               (should (string-match-p
+                        "final plan" (gptel-runner-call-prompt call)))
+               '(:value "implemented")))
+            (let* ((run (gptel-runner-start 'gated-handoff :driver driver))
+                   (call (car (gptel-runner-run-calls run))))
+              (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+              (gptel-runner-pause-run run 'test-approval)
+              (should (eq (gptel-runner-run-state run) 'paused))
+              (gptel-runner-complete-call-from-buffer "final plan" call)
+              (should (eq (gptel-runner-run-state run) 'succeeded))
+              (should (equal (gptel-runner-get run 'plan) "final plan"))
+              (should (equal (gptel-runner-get run 'report) "implemented"))))
+        (delete-directory snapshot-directory t)))))
+
 (ert-deftest gptel-runner-snapshot-load-resume-next-session ()
   (gptel-runner-test--isolated
     (dolist (agent '(first second))

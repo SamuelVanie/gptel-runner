@@ -25,11 +25,13 @@
 (defcustom gptel-runner-retain-worker-buffers t
   "When non-nil, gptel worker transcripts survive terminal calls.
 Set this to nil to kill a worker buffer as soon as its call terminalizes."
-  :type 'boolean)
+  :type 'boolean
+  :group 'gptel-runner)
 
 (defcustom gptel-runner-default-driver nil
   "Driver used by `gptel-runner-start' when none is supplied."
-  :type 'sexp)
+  :type 'sexp
+  :group 'gptel-runner)
 
 (defvar gptel-runner-event-hook nil
   "Hook run with one argument, the newly appended runner event.")
@@ -118,6 +120,13 @@ defensive against duplicate and late calls.")
 (cl-defmethod gptel-runner-driver-pause (driver call)
   "Default pause behavior asks DRIVER to cancel CALL's external work."
   (gptel-runner-driver-cancel driver call))
+
+(cl-defgeneric gptel-runner-driver-await-feedback (driver call)
+  "Prepare completed CALL through DRIVER for human feedback.")
+
+(cl-defmethod gptel-runner-driver-await-feedback (_driver _call)
+  "Default completed-call feedback behavior requires no driver action."
+  nil)
 
 (defun gptel-runner--id (prefix)
   "Return a new identifier beginning with PREFIX."
@@ -468,7 +477,12 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
        (if (gptel-runner--empty-output-p value)
            (gptel-runner--finish-call
             call 'failed (gptel-runner--empty-output-error))
-         (gptel-runner--finish-call call 'succeeded value)))
+         (if (plist-get
+              (gptel-runner-node-properties (gptel-runner-call-node call))
+              :pause-after)
+             (gptel-runner--suspend-call
+              call 'waiting-feedback 'pause-after t t)
+           (gptel-runner--finish-call call 'succeeded value))))
       ('cancelled (gptel-runner--finish-call call 'cancelled value))
       ('blocked (gptel-runner--finish-call call 'blocked value))
       ('transient
@@ -611,10 +625,13 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
           (gptel-runner-driver-cancel (gptel-runner-run-driver run) call)))
       (gptel-runner--finish-call call 'cancelled (or reason 'user)))))
 
-(defun gptel-runner--suspend-call (call state reason keep-continuation)
+(defun gptel-runner--suspend-call
+    (call state reason keep-continuation &optional external-work-finished)
   "Suspend CALL in STATE for REASON.
 When KEEP-CONTINUATION is nil, discard the in-memory workflow continuation so
-the workflow can later be reconstructed from a snapshot."
+the workflow can later be reconstructed from a snapshot.  When
+EXTERNAL-WORK-FINISHED is non-nil, prepare the completed transcript for human
+feedback without asking the driver to stop external work."
   (unless (or (gptel-runner--call-terminal-p call)
               (memq (gptel-runner-call-state call) '(paused waiting-feedback)))
     (let ((run (gptel-runner-call-run call)))
@@ -624,10 +641,15 @@ the workflow can later be reconstructed from a snapshot."
       (setf (gptel-runner-call-retry-timer call) nil
             (gptel-runner-run-queue run)
             (delq call (gptel-runner-run-queue run)))
-      (when (memq (gptel-runner-call-state call)
-                  '(running retry-wait waiting-confirmation))
-        (ignore-errors
-          (gptel-runner-driver-pause (gptel-runner-run-driver run) call)))
+      (if external-work-finished
+          (ignore-errors
+            (gptel-runner-driver-await-feedback
+             (gptel-runner-run-driver run) call))
+        (when (memq (gptel-runner-call-state call)
+                    '(running retry-wait waiting-confirmation))
+          (ignore-errors
+            (gptel-runner-driver-pause
+             (gptel-runner-run-driver run) call))))
       (gptel-runner--deactivate-call call)
       (unless keep-continuation
         (setf (gptel-runner-call-on-complete call) nil))

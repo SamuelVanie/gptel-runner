@@ -190,6 +190,27 @@
           (should (equal returned '(succeeded . "guided answer"))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
+(ert-deftest gptel-runner-gptel-completed-call-can-await-feedback ()
+  (let* ((agent (gptel-runner-agent-create :name 'a :preset nil))
+         (node (gptel-runner-node-create :id 'node :kind 'agent))
+         (driver (gptel-runner-gptel-driver-create))
+         (run (gptel-runner-run-create :id "run"))
+         (call (gptel-runner-call-create
+                :id "call" :agent agent :run run :node node
+                :state 'running :workspace default-directory))
+         (buffer (gptel-runner-gptel--worker-buffer call))
+         (aborts 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gptel-abort)
+                   (lambda (&rest _arguments) (cl-incf aborts))))
+          (gptel-runner-driver-await-feedback driver call)
+          (should (zerop aborts))
+          (with-current-buffer buffer
+            (should (string-match-p "Runner intervention" (buffer-string)))
+            (should (string-match-p
+                     "waiting for your feedback" (buffer-string)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 (ert-deftest gptel-runner-gptel-confirmed-tool-resumes-call-and-fsm ()
   (let* ((tool-runs 0)
          (backend (gptel-make-openai "runner-test" :models '(runner-test)))

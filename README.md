@@ -70,6 +70,18 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
+Add `:pause-after t` to an agent step when its successful response must be
+reviewed before the node completes and the next pipeline node starts:
+
+```elisp
+(gptel-runner-agent-step
+ :id 'plan
+ :agent 'planner
+ :prompt #'plan-prompt
+ :save-as 'implementation-plan
+ :pause-after t)
+```
+
 The dashboard refreshes automatically every two seconds by default.  Set the
 interval in seconds, or use `nil` to disable automatic refresh:
 
@@ -139,6 +151,23 @@ The workflow then continues from that node's original continuation.
 
 This is deliberately different from `gptel-runner-abort-call`: aborting is a
 terminal cancellation, while pausing enters the `waiting-feedback` state.
+
+For a planned approval point, put `:pause-after t` on the agent step instead
+of racing to pause it manually.  After the provider returns a non-empty
+response, the call automatically enters `waiting-feedback`; the response has
+not yet completed the node, been stored under `:save-as`, or reached the next
+node.  Visit the transcript with `v`, give the agent feedback with ordinary
+gptel commands, then press `x` on its dashboard row or run
+`M-x gptel-runner-complete-call-from-buffer`.  The active region, or otherwise
+the latest gptel response, becomes the actual node result and releases the
+original workflow continuation.  Parsers and validators still apply to that
+accepted result.
+
+The call-level gate keeps the in-memory continuation alive.  For a named
+workflow, you can additionally press `P` to pause and snapshot the whole run;
+completing the retained call in the same Emacs session resumes the run.  A
+snapshot loaded in a later session has no retained transcript or continuation,
+so the unfinished gated node restarts statelessly on resume.
 
 ### Durable snapshots and overnight resume
 
@@ -245,7 +274,8 @@ Custom agents combine any gptel preset with a runner parser, validator,
 schema, retry policy, and metadata.  Custom drivers implement
 `gptel-runner-driver-start`, `gptel-runner-driver-cancel`, and optionally
 `gptel-runner-driver-pause` (which defaults to stopping external work without
-terminalizing the runner call).  Prompt,
+terminalizing the runner call) and `gptel-runner-driver-await-feedback` (which
+prepares an already-completed provider transcript for human editing).  Prompt,
 branch, repeat-stop, and progress-key functions receive the live run and can
 read explicit blackboard values.  Parsers and validators remain runner-owned,
 so provider schema support is a reliability hint rather than an approval
