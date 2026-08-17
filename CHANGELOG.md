@@ -17,6 +17,8 @@
   ordered per-iteration blackboard values for downstream summary nodes.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
+- Show active tool calls in the dashboard as `Calling TOOL-NAME...` using a
+  distinct `waiting-tool` call state.
 - Group dashboard rows by workflow and add safe run/workflow cleanup commands.
 - Add configurable dashboard column visibility, a compact non-wrapping layout,
   state faces, row highlighting, and an interactive column toggle.

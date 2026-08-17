@@ -20,7 +20,8 @@
                    (append (alist-get 'WAIT gptel-request--handlers)
                            (list #'gptel--update-wait))))
     (should (equal (alist-get 'TOOL handlers)
-                   (append (list #'gptel--update-tool-call)
+                   (append (list #'gptel-runner-gptel--tool-started
+                                 #'gptel--update-tool-call)
                            (alist-get 'TOOL gptel-request--handlers)
                            (list #'gptel--update-tool-ask))))
     (should (equal (alist-get 'DONE handlers)
@@ -50,6 +51,47 @@
             (should (equal
                      (substring-no-properties (nth 1 header-line-format))
                      " Waiting..."))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gptel-runner-gptel-tool-state-includes-name ()
+  (let* ((run (gptel-runner-run-create :id "run" :events nil))
+         (node (gptel-runner-node-create :id 'work))
+         (call (gptel-runner-call-create
+                :id "call" :run run :node node :state 'running))
+         (fsm (gptel-runner-gptel--make-fsm)))
+    (setf (gptel-runner-call-driver-data call)
+          (list :observe
+                (lambda (type data)
+                  (gptel-runner--call-observe call 0 type data)))
+          (gptel-fsm-info fsm)
+          (list :context call
+                :tool-use (list '(:name "AskUserQuestion" :args nil))))
+    (gptel-runner-gptel--tool-started fsm)
+    (should (eq (gptel-runner-call-state call) 'waiting-tool))
+    (should (equal (gptel-runner-call-tool-names call)
+                   '("AskUserQuestion")))))
+
+(ert-deftest gptel-runner-gptel-confirmed-tool-enters-waiting-tool-state ()
+  (let* ((buffer (generate-new-buffer " *gptel-runner-tool-accept-test*"))
+         (run (gptel-runner-run-create :id "run" :events nil))
+         (node (gptel-runner-node-create :id 'work))
+         (call (gptel-runner-call-create
+                :id "call" :run run :node node
+                :state 'waiting-confirmation
+                :tool-names '("AskUserQuestion")))
+         state-during-call)
+    (setf (gptel-runner-call-driver-data call)
+          (list :observe
+                (lambda (type data)
+                  (gptel-runner--call-observe call 0 type data))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq-local gptel-runner--call call)
+          (gptel-runner-gptel--around-accept-tool-calls
+           (lambda (&rest _arguments)
+             (setq state-during-call (gptel-runner-call-state call)))
+           nil nil)
+          (should (eq state-during-call 'waiting-tool)))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gptel-runner-gptel-terminal-status-is-ready ()

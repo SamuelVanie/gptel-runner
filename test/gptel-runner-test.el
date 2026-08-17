@@ -76,6 +76,27 @@
       (should (eq (gptel-runner-get run 'missing 'none) 'none))
       (should (zerop (gptel-runner-iteration run 'loop))))))
 
+(ert-deftest gptel-runner-tool-observations-update-call-state ()
+  (let* ((run (gptel-runner-run-create :id "run" :events nil))
+         (node (gptel-runner-node-create :id 'work))
+         (call (gptel-runner-call-create
+                :id "call" :run run :node node :state 'running)))
+    (gptel-runner--call-observe
+     call 0 'waiting-tool '("AskUserQuestion"))
+    (should (eq (gptel-runner-call-state call) 'waiting-tool))
+    (should (equal (gptel-runner-call-tool-names call)
+                   '("AskUserQuestion")))
+    (gptel-runner--call-observe call 0 'waiting-confirmation nil)
+    (should (eq (gptel-runner-call-state call) 'waiting-confirmation))
+    (gptel-runner--call-observe call 0 'waiting-tool '("AskUserQuestion"))
+    (gptel-runner--call-observe call 0 'tool-results nil)
+    (should (eq (gptel-runner-call-state call) 'running))
+    (should-not (gptel-runner-call-tool-names call))
+    (should (equal (mapcar #'gptel-runner-event-type
+                           (gptel-runner-run-events run))
+                   '(waiting-tool waiting-confirmation waiting-tool
+                     tool-results)))))
+
 (ert-deftest gptel-runner-simple-stateless-success-and-callback-once ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
@@ -1041,6 +1062,20 @@
     (should-error (gptel-runner-ui--format) :type 'user-error))
   (let ((gptel-runner-dashboard-columns nil))
     (should-error (gptel-runner-ui--format) :type 'user-error)))
+
+(ert-deftest gptel-runner-dashboard-shows-active-tool-name ()
+  (let* ((gptel-runner-dashboard-columns '(state))
+         (run (gptel-runner-run-create
+               :id "run" :iterations (make-hash-table :test #'equal)
+               :budget (gptel-runner-budget-create)))
+         (node (gptel-runner-node-create :id 'work))
+         (call (gptel-runner-call-create
+                :id "call" :run run :node node :state 'waiting-tool
+                :tool-names '("AskUserQuestion")))
+         (state-cell (aref (cadr (gptel-runner-ui--call-entry run call)) 0)))
+    (should (equal (substring-no-properties state-cell)
+                   "Calling AskUserQuestion..."))
+    (should (eq (get-text-property 0 'face state-cell) 'warning))))
 
 (ert-deftest gptel-runner-dashboard-long-values-remain-column-aligned ()
   (let ((gptel-runner-dashboard-columns '(workflow run node state)))

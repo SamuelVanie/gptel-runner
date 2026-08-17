@@ -94,7 +94,7 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
   id run node agent prompt workspace buffer fsm
   (state 'pending) (request-attempt 0) retry-timer (generation 0)
   response-parts result error started-at finished-at on-complete
-  driver-data repair-p)
+  driver-data repair-p tool-names)
 
 (cl-defstruct (gptel-runner-run
                (:constructor gptel-runner-run-create))
@@ -400,11 +400,16 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
              (not (gptel-runner--call-terminal-p call)))
     (let ((run (gptel-runner-call-run call)))
       (cond
+       ((eq type 'waiting-tool)
+        (setf (gptel-runner-call-state call) 'waiting-tool
+              (gptel-runner-call-tool-names call) data))
        ((eq type 'waiting-confirmation)
         (setf (gptel-runner-call-state call) 'waiting-confirmation))
        ((and (eq type 'tool-results)
-             (eq (gptel-runner-call-state call) 'waiting-confirmation))
-        (setf (gptel-runner-call-state call) 'running)))
+             (memq (gptel-runner-call-state call)
+                   '(waiting-tool waiting-confirmation)))
+        (setf (gptel-runner-call-state call) 'running
+              (gptel-runner-call-tool-names call) nil)))
       (gptel-runner--emit run type (gptel-runner-call-node call) call data))))
 
 (defun gptel-runner--retryable-p (call status metadata)
@@ -448,7 +453,8 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
   (let* ((run (gptel-runner-call-run call))
          (delay (gptel-runner--retry-delay call metadata))
          (generation (gptel-runner-call-generation call)))
-    (setf (gptel-runner-call-state call) 'retry-wait)
+    (setf (gptel-runner-call-state call) 'retry-wait
+          (gptel-runner-call-tool-names call) nil)
     (gptel-runner--deactivate-call call)
     (gptel-runner--emit
      run 'request-retry-scheduled (gptel-runner-call-node call) call
@@ -515,7 +521,8 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
           run 'requests
           (gptel-runner-budget-max-requests (gptel-runner-run-budget run))))
       (cl-incf (gptel-runner-call-request-attempt call))
-      (setf (gptel-runner-call-state call) 'running)
+      (setf (gptel-runner-call-state call) 'running
+            (gptel-runner-call-tool-names call) nil)
       (let ((generation (gptel-runner-call-generation call)))
         (gptel-runner--emit
          run 'request-started (gptel-runner-call-node call) call
@@ -540,6 +547,7 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
         (cancel-timer (gptel-runner-call-retry-timer call)))
       (setf (gptel-runner-call-retry-timer call) nil
             (gptel-runner-call-state call) state
+            (gptel-runner-call-tool-names call) nil
             (gptel-runner-call-finished-at call) (float-time))
       (if (eq state 'succeeded)
           (setf (gptel-runner-call-result call) value)
@@ -620,7 +628,8 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
             (gptel-runner-run-queue run)
             (delq call (gptel-runner-run-queue run)))
       (when (memq (gptel-runner-call-state call)
-                  '(running retry-wait waiting-confirmation waiting-feedback))
+                  '(running retry-wait waiting-tool waiting-confirmation
+                    waiting-feedback))
         (ignore-errors
           (gptel-runner-driver-cancel (gptel-runner-run-driver run) call)))
       (gptel-runner--finish-call call 'cancelled (or reason 'user)))))
@@ -646,14 +655,15 @@ feedback without asking the driver to stop external work."
             (gptel-runner-driver-await-feedback
              (gptel-runner-run-driver run) call))
         (when (memq (gptel-runner-call-state call)
-                    '(running retry-wait waiting-confirmation))
+                    '(running retry-wait waiting-tool waiting-confirmation))
           (ignore-errors
             (gptel-runner-driver-pause
              (gptel-runner-run-driver run) call))))
       (gptel-runner--deactivate-call call)
       (unless keep-continuation
         (setf (gptel-runner-call-on-complete call) nil))
-      (setf (gptel-runner-call-state call) state)
+      (setf (gptel-runner-call-state call) state
+            (gptel-runner-call-tool-names call) nil)
       (gptel-runner--emit run (intern (format "call-%s" state))
                           (gptel-runner-call-node call) call reason)
       (gptel-runner--drain-queue run)

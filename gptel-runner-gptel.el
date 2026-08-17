@@ -60,7 +60,8 @@
                       gptel--fsm-transition gptel--handle-post
                       gptel--apply-preset gptel--insert-response
                       gptel--update-tool-ask gptel--update-tool-call
-                      gptel--update-status gptel--update-wait))
+                      gptel--update-status gptel--update-wait
+                      gptel--accept-tool-calls))
     (unless (fboundp function)
       (gptel-runner-gptel--compatibility-error function)))
   t)
@@ -184,6 +185,32 @@ RAW is gptel's internal flag for already formatted transcript content."
   "Return the current scheduler completion closure for CALL."
   (plist-get (gptel-runner-call-driver-data call) :complete))
 
+(defun gptel-runner-gptel--observe (call type &optional data)
+  "Report a TYPE observation with DATA for CALL's current attempt."
+  (when-let ((observe
+              (plist-get (gptel-runner-call-driver-data call) :observe)))
+    (funcall observe type data)))
+
+(defun gptel-runner-gptel--tool-names (info)
+  "Return the tool names from gptel request INFO."
+  (delq nil
+        (mapcar
+         (lambda (tool-use)
+           (let ((name (and (listp tool-use)
+                            (plist-get tool-use :name))))
+             (cond
+              ((stringp name) name)
+              ((symbolp name) (symbol-name name)))))
+         (plist-get info :tool-use))))
+
+(defun gptel-runner-gptel--tool-started (fsm)
+  "Mark the runner call for FSM as waiting for its tool results."
+  (let* ((info (gptel-fsm-info fsm))
+         (call (plist-get info :context))
+         (names (gptel-runner-gptel--tool-names info)))
+    (when (and (gptel-runner-call-p call) names)
+      (gptel-runner-gptel--observe call 'waiting-tool names))))
+
 (defun gptel-runner-gptel--update-status (info message face)
   "Show MESSAGE with FACE in the worker buffer described by INFO."
   (when-let* ((buffer (plist-get info :buffer))
@@ -236,12 +263,14 @@ RAW is gptel's internal flag for already formatted transcript content."
     ;; `gptel-request--handlers' drive the transport but intentionally omit
     ;; the status handlers used by interactive gptel buffers.  Runner worker
     ;; buffers enable `gptel-mode', so compose those handlers back in.  The
-    ;; TOOL status must run before tool execution because a synchronous tool
-    ;; can transition the FSM recursively before its handler returns.
+    ;; TOOL state tracking and status must run before tool execution because a
+    ;; synchronous tool can transition the FSM recursively before its handler
+    ;; returns.
     (setf (alist-get 'WAIT handlers)
           (append (alist-get 'WAIT handlers) (list #'gptel--update-wait))
           (alist-get 'TOOL handlers)
-          (append (list #'gptel--update-tool-call)
+          (append (list #'gptel-runner-gptel--tool-started
+                        #'gptel--update-tool-call)
                   (alist-get 'TOOL handlers)
                   (list #'gptel--update-tool-ask))
           (alist-get 'DONE handlers) (list #'gptel-runner-gptel--done)
@@ -275,6 +304,9 @@ RAW is gptel's internal flag for already formatted transcript content."
     (setf (gptel-runner-call-driver-data call)
           (plist-put (gptel-runner-call-driver-data call)
                      :complete wrapped))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call)
+                     :observe observe))
     (with-current-buffer buffer
       (if (and (gptel-runner-call-fsm call)
                (eq (gptel-fsm-state (gptel-runner-call-fsm call)) 'ERRS))
@@ -399,17 +431,36 @@ node result and reconstructs the continuation from the workflow AST."
                     (buffer-local-value 'gptel-runner--call target))))
     (when (and call (not gptel-runner-gptel--cancelling)
                (memq (gptel-runner-call-state call)
-                     '(running retry-wait waiting-confirmation))
+                     '(running retry-wait waiting-tool waiting-confirmation))
                (not (gptel-runner--call-terminal-p call)))
       (gptel-runner-abort-call call 'gptel-abort))
     (funcall original target)))
 
+(defun gptel-runner-gptel--around-accept-tool-calls
+    (original &optional response overlay)
+  "Mark a confirmed runner tool active before calling ORIGINAL.
+RESPONSE and OVERLAY are the arguments accepted by
+`gptel--accept-tool-calls'."
+  (let* ((target (or (and (overlayp overlay) (overlay-buffer overlay))
+                     (current-buffer)))
+         (call (and (buffer-live-p target)
+                    (buffer-local-value 'gptel-runner--call target))))
+    (when (and (gptel-runner-call-p call)
+               (eq (gptel-runner-call-state call) 'waiting-confirmation))
+      (gptel-runner-gptel--observe
+       call 'waiting-tool (gptel-runner-call-tool-names call)))
+    (funcall original response overlay)))
+
 (defun gptel-runner-gptel-install-abort-advice ()
-  "Install conditional runner integration around `gptel-abort'."
+  "Install conditional runner integration around gptel commands."
   (interactive)
   (gptel-runner-gptel--check-api)
   (unless (advice-member-p #'gptel-runner-gptel--around-abort 'gptel-abort)
-    (advice-add 'gptel-abort :around #'gptel-runner-gptel--around-abort)))
+    (advice-add 'gptel-abort :around #'gptel-runner-gptel--around-abort))
+  (unless (advice-member-p #'gptel-runner-gptel--around-accept-tool-calls
+                           'gptel--accept-tool-calls)
+    (advice-add 'gptel--accept-tool-calls :around
+                #'gptel-runner-gptel--around-accept-tool-calls)))
 
 (with-eval-after-load 'gptel
   (gptel-runner-gptel-install-abort-advice))

@@ -99,6 +99,12 @@ agent-call rows; registered workflows with no runs remain visible.  The
 automatic refresh timer is stopped when the dashboard buffer is closed or
 changes to another major mode.
 
+While a tool call is in progress, its agent-call row enters the
+`waiting-tool` state and displays `Calling TOOL-NAME...`.  This makes tools
+that wait for user input, such as `AskUserQuestion`, visible without opening
+the agent transcript.  Calls that still need approval continue to display the
+separate `waiting-confirmation` state until they are accepted.
+
 Dashboard columns are a configurable set.  Their order in the value is
 ignored so the table keeps a stable canonical layout:
 

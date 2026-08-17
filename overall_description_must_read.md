@@ -180,6 +180,7 @@ pending
 ready
 running
 retry-wait
+waiting-tool
 waiting-confirmation
 succeeded
 failed

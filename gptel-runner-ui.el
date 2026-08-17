@@ -23,7 +23,7 @@
     (run "Run" 16)
     (node "Node" 20)
     (call "Call" 16)
-    (state "State" 20)
+    (state "State" 28)
     (elapsed "Elapsed" 9)
     (attempts "Attempts" 9)
     (iteration "Iteration" 9)
@@ -120,10 +120,24 @@ An elided value retains its complete unpropertized text as hover help."
    (pcase state
      ('succeeded 'success)
      ((or 'failed 'blocked 'stalled 'cancelled) 'error)
-     ((or 'waiting-confirmation 'waiting-feedback 'paused 'retry-wait)
+     ((or 'waiting-tool 'waiting-confirmation 'waiting-feedback 'paused
+          'retry-wait)
       'warning)
      ((or 'running 'ready) 'font-lock-keyword-face)
      (_ 'shadow))))
+
+(defun gptel-runner-ui--call-state (call)
+  "Return CALL's dashboard state, including an active tool name."
+  (let ((state (gptel-runner-call-state call)))
+    (if (eq state 'waiting-tool)
+        (propertize
+         (format "Calling %s..."
+                 (if-let ((names (gptel-runner-call-tool-names call)))
+                     (mapconcat (lambda (name) (format "%s" name))
+                                (ensure-list names) ", ")
+                   "tool"))
+         'face 'warning)
+      (gptel-runner-ui--state state))))
 
 (defun gptel-runner-ui--elapsed (run &optional call)
   "Return elapsed seconds for RUN or CALL as a compact string."
@@ -194,8 +208,7 @@ An elided value retains its complete unpropertized text as hover help."
      (gptel-runner-ui--row-vector
       `((node . ,(format "%s" (gptel-runner-node-id node)))
         (call . ,(gptel-runner-call-id call))
-        (state . ,(gptel-runner-ui--state
-                   (gptel-runner-call-state call)))
+        (state . ,(gptel-runner-ui--call-state call))
         (elapsed . ,(gptel-runner-ui--elapsed run call))
         (attempts . ,(number-to-string
                       (gptel-runner-call-request-attempt call)))
