@@ -97,6 +97,15 @@ terminal run transitions bypass it, but their writes are still asynchronous."
                      (gptel-runner-run-active-started-at run))))
       remaining)))
 
+(defun gptel-runner-store--terminal-data (run)
+  "Return a durable classification of RUN's terminal failure."
+  (when (eq (gptel-runner-run-state run) 'failed)
+    (let ((data (gptel-runner-run-terminal-data run)))
+      (if (and (listp data)
+               (memq (plist-get data :type) '(budget iteration-budget)))
+          (copy-tree data t)
+        '(:type other)))))
+
 (defun gptel-runner-store--snapshot-tokens (run)
   "Return incremental serialization tokens for a compact snapshot of RUN."
   (let ((budget (gptel-runner-run-budget run)) tokens)
@@ -146,6 +155,8 @@ terminal run transitions bypass it, but their writes are still asynchronous."
       (value (gptel-runner-run-started-at run) "start time")
       (literal "\n  :finished-at ")
       (value (gptel-runner-run-finished-at run) "finish time")
+      (literal "\n  :terminal-data ")
+      (value (gptel-runner-store--terminal-data run) "terminal result")
       (literal "\n  :paused-at ")
       (value (gptel-runner-run-paused-at run) "pause time")
       (literal "\n  :duration-remaining ")
@@ -439,7 +450,7 @@ asynchronous."
       data)))
 
 (defun gptel-runner-load-run (file &optional callback driver)
-  "Load paused run from v2 snapshot FILE using CALLBACK and DRIVER.
+  "Load a run from v2 snapshot FILE using CALLBACK and DRIVER.
 The workflow and all referenced agents must already be registered.  Historical
 calls, events, and transcripts are deliberately not restored."
   (setq file (expand-file-name file))
@@ -450,6 +461,11 @@ calls, events, and transcripts are deliberately not restored."
          (workflow (or (gethash workflow-name gptel-runner--workflows)
                        (user-error "Define workflow %S before loading snapshot"
                                    workflow-name)))
+         (root (gptel-runner-workflow-root workflow))
+         (repeat-limits
+          (let ((limits (gptel-runner--workflow-repeat-limits root)))
+            (dolist (entry (plist-get data :repeat-limits) limits)
+              (puthash (car entry) (cdr entry) limits))))
          (budget-data (plist-get data :budget))
          (budget
           (gptel-runner-budget-create
@@ -471,13 +487,13 @@ calls, events, and transcripts are deliberately not restored."
                          (plist-get data :node-states))
            :iterations (gptel-runner-store--alist-hash
                         (plist-get data :iterations))
-           :repeat-limits (gptel-runner-store--alist-hash
-                           (plist-get data :repeat-limits))
+           :repeat-limits repeat-limits
            :events nil :budget budget
            :driver (or driver gptel-runner-default-driver)
            :queue nil :active-calls nil :calls nil
            :started-at (plist-get data :started-at)
            :finished-at (plist-get data :finished-at)
+           :terminal-data (plist-get data :terminal-data)
            :paused-at (or (plist-get data :paused-at) (float-time))
            :duration-remaining (plist-get data :duration-remaining)
            :generation (or (plist-get data :generation) 0)
@@ -488,25 +504,24 @@ calls, events, and transcripts are deliberately not restored."
       (user-error "Run %s is already loaded in this Emacs session" run-id))
     (unless (gptel-runner-run-driver run)
       (user-error "No driver configured for restored run"))
-    (let ((root (gptel-runner-workflow-root workflow)))
-      (gptel-runner--validate-workflow
-       root (plist-get (gptel-runner-run-options run) :allow-writes))
-      (dolist (entry (plist-get data :node-states))
-        (unless (gptel-runner-store--node root (car entry))
-          (user-error "Snapshot node %S is absent from workflow %S"
-                      (car entry) workflow-name)))
-      (dolist (entry (plist-get data :iterations))
-        (unless (gptel-runner-store--node root (car entry))
-          (user-error "Snapshot iteration node %S is absent from workflow %S"
-                      (car entry) workflow-name)))
-      (dolist (entry (plist-get data :repeat-limits))
-        (let ((node (gptel-runner-store--node root (car entry))))
-          (unless (and node
-                       (eq (gptel-runner-node-kind node) 'repeat)
-                       (integerp (cdr entry))
-                       (> (cdr entry) 0))
-            (user-error "Snapshot repeat limit %S is invalid for workflow %S"
-                        entry workflow-name)))))
+    (gptel-runner--validate-workflow
+     root (plist-get (gptel-runner-run-options run) :allow-writes))
+    (dolist (entry (plist-get data :node-states))
+      (unless (gptel-runner-store--node root (car entry))
+        (user-error "Snapshot node %S is absent from workflow %S"
+                    (car entry) workflow-name)))
+    (dolist (entry (plist-get data :iterations))
+      (unless (gptel-runner-store--node root (car entry))
+        (user-error "Snapshot iteration node %S is absent from workflow %S"
+                    (car entry) workflow-name)))
+    (dolist (entry (plist-get data :repeat-limits))
+      (let ((node (gptel-runner-store--node root (car entry))))
+        (unless (and node
+                     (eq (gptel-runner-node-kind node) 'repeat)
+                     (integerp (cdr entry))
+                     (> (cdr entry) 0))
+          (user-error "Snapshot repeat limit %S is invalid for workflow %S"
+                      entry workflow-name))))
     (gptel-runner-store--notice-id (gptel-runner-run-id run))
     (puthash (gptel-runner-run-id run) run gptel-runner--runs)
     (gptel-runner--emit run 'snapshot-loaded nil nil file)

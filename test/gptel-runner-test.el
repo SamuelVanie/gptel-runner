@@ -630,6 +630,8 @@
                       :type 'user-error)
         (should-error (gptel-runner-extend-repeat run 'workflow 1)
                       :type 'user-error)
+        (should-error (gptel-runner-extend run :additional-calls 1)
+                      :type 'user-error)
         (should (= (gptel-runner-iteration run 'cycle) 1))
         (should (= (gptel-runner--repeat-limit
                     run (gptel-runner--find-node root 'cycle)) 1))))))
@@ -939,6 +941,62 @@
                       '((:iteration 1 :values ((result . "first")))
                         (:iteration 2 :values ((result . "second")))
                         (:iteration 3 :values ((result . "third"))))))
+                    (should
+                     (eq (gptel-runner-test--wait-for-snapshot restored)
+                         'clean)))))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-run-budget-extension-survives-snapshot-load ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-budget-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow persisted-budget (:persist t)
+              (gptel-runner-repeat-until
+               :id 'review-cycle :max 5
+               :until (lambda (run)
+                        (equal (gptel-runner-get run 'result) "pass"))
+               :collect-keys '(result) :save-history-as 'history
+               :body (gptel-runner-test--step 'work 'worker 'result)))
+            (gptel-runner-fake-queue driver 'worker '(:value "revise"))
+            (let ((run (gptel-runner-start
+                        'persisted-budget :driver driver :max-calls 1)))
+              (should (eq (gptel-runner-run-state run) 'failed))
+              (should (= (gptel-runner-iteration run 'review-cycle) 1))
+              (should (equal (gptel-runner-run-terminal-data run)
+                             '(:type budget :kind calls :limit 1
+                               :requests 1 :calls 1)))
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (let ((file (gptel-runner-run-snapshot-file run)))
+                (setq gptel-runner--runs (make-hash-table :test #'equal))
+                (let ((restored-driver (gptel-runner-fake-driver-create)))
+                  (gptel-runner-fake-queue
+                   restored-driver 'worker '(:value "pass"))
+                  (let ((restored
+                         (gptel-runner-load-run file nil restored-driver)))
+                    (should-not (gptel-runner-run-calls restored))
+                    (should (equal (gptel-runner-run-terminal-data restored)
+                                   '(:type budget :kind calls :limit 1
+                                     :requests 1 :calls 1)))
+                    ;; Snapshots written before terminal-data was added have
+                    ;; to infer the exhausted finite budget from accounting.
+                    (setf (gptel-runner-run-terminal-data restored) nil)
+                    (gptel-runner-extend
+                     (gptel-runner-run-id restored) :additional-calls 1)
+                    (should (eq (gptel-runner-run-state restored) 'succeeded))
+                    (should (= (gptel-runner-iteration
+                                restored 'review-cycle) 2))
+                    (should (= (length (gptel-runner-run-calls restored)) 1))
+                    (should
+                     (equal
+                      (gptel-runner-get restored 'history)
+                      '((:iteration 1 :values ((result . "revise")))
+                        (:iteration 2 :values ((result . "pass"))))))
+                    (should (= (gptel-runner-test--event-count
+                                restored 'run-extended) 1))
                     (should
                      (eq (gptel-runner-test--wait-for-snapshot restored)
                          'clean)))))))

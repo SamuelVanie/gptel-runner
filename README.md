@@ -239,9 +239,22 @@ iterations cannot mutate earlier list or vector data.  Because the history is
 an ordinary blackboard value, durable snapshots preserve it and downstream
 prompt functions read it with `gptel-runner-get`.
 
-When a repeat reaches `:max`, its run fails with an `iteration-budget` result.
-It can be reopened for more iterations without losing its blackboard or saved
-history:
+When a run fails because `:max-requests`, `:max-calls`, or `:max-duration` was
+exhausted, increase the exhausted finite budget and continue from its safe
+checkpoint with `gptel-runner-extend`:
+
+```elisp
+(gptel-runner-extend "run-5"
+ :additional-calls 6
+ :additional-requests 8)
+```
+
+This preserves completed nodes and blackboard values.  Each exhausted budget
+must be increased; the runner reports which keyword is missing rather than
+restarting only to fail at the same limit.
+
+When the repeat node's own `:max` is exhausted instead, use the repeat-specific
+operation to add more iterations without losing its saved history:
 
 ```elisp
 (setq my-run
@@ -256,7 +269,8 @@ history:
 ```
 
 `gptel-runner-start` returns the run object, so keeping it in a variable is the
-most direct option.  You can also pass the string ID shown in the dashboard:
+most direct option.  Both extension functions also accept the string ID shown
+in the dashboard:
 
 ```elisp
 (gptel-runner-extend-repeat "run-5" 'review-cycle 3)
@@ -332,7 +346,9 @@ Version 2 snapshots preserve only execution state: the goal, canonical
 workspace, blackboard, completed node states, repeat iterations, budgets, and
 timing/options data.  Historical calls, event journals, and transcripts remain
 available for inspection in the original Emacs session but are not restored.
-An unfinished call therefore restarts statelessly from its workflow node.
+The dashboard therefore has no historical call rows immediately after loading;
+new rows appear when an extended or resumed run dispatches calls.  An
+unfinished call restarts statelessly from its workflow node.
 Store every downstream result needed after restoration on the blackboard,
 normally with `:save-as`.
 

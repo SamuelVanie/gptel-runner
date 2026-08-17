@@ -17,6 +17,8 @@
   ordered per-iteration blackboard values for downstream summary nodes.
 - Add `gptel-runner-extend-repeat` to continue iteration-budget failures while
   preserving saved history and using a run-local, durable repeat limit.
+- Add `gptel-runner-extend` for continuing persisted request, call, or duration
+  budget failures, and retain terminal failure details in snapshots.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
 - Show active tool calls in the dashboard as `Calling TOOL-NAME...` using a

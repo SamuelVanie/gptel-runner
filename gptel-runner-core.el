@@ -102,7 +102,8 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
   id workflow goal workspace (state 'pending) blackboard node-states
   iterations repeat-limits active-calls calls events budget driver queue
   (active-count 0)
-  (writer-active 0) started-at finished-at callback callback-called
+  (writer-active 0) started-at finished-at terminal-data
+  callback callback-called
   duration-timer duration-remaining active-started-at
   paused-at snapshot-file (generation 0) options)
 
@@ -345,7 +346,8 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
   "Terminalize RUN as STATE once, recording DATA."
   (unless (gptel-runner--run-terminal-p run)
     (setf (gptel-runner-run-state run) state
-          (gptel-runner-run-finished-at run) (float-time))
+          (gptel-runner-run-finished-at run) (float-time)
+          (gptel-runner-run-terminal-data run) data)
     (gptel-runner--stop-duration-clock run)
     (gptel-runner--emit run
                         (if (eq state 'succeeded)
