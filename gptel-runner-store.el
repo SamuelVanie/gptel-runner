@@ -133,6 +133,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
       (table "blackboard" (gptel-runner-run-blackboard run) t)
       (table "node-states" (gptel-runner-run-node-states run) nil)
       (table "iterations" (gptel-runner-run-iterations run) nil)
+      (table "repeat-limits" (gptel-runner-run-repeat-limits run) nil)
       (literal "\n  :budget ")
       (value
        (list :max-requests (gptel-runner-budget-max-requests budget)
@@ -470,6 +471,8 @@ calls, events, and transcripts are deliberately not restored."
                          (plist-get data :node-states))
            :iterations (gptel-runner-store--alist-hash
                         (plist-get data :iterations))
+           :repeat-limits (gptel-runner-store--alist-hash
+                           (plist-get data :repeat-limits))
            :events nil :budget budget
            :driver (or driver gptel-runner-default-driver)
            :queue nil :active-calls nil :calls nil
@@ -495,7 +498,15 @@ calls, events, and transcripts are deliberately not restored."
       (dolist (entry (plist-get data :iterations))
         (unless (gptel-runner-store--node root (car entry))
           (user-error "Snapshot iteration node %S is absent from workflow %S"
-                      (car entry) workflow-name))))
+                      (car entry) workflow-name)))
+      (dolist (entry (plist-get data :repeat-limits))
+        (let ((node (gptel-runner-store--node root (car entry))))
+          (unless (and node
+                       (eq (gptel-runner-node-kind node) 'repeat)
+                       (integerp (cdr entry))
+                       (> (cdr entry) 0))
+            (user-error "Snapshot repeat limit %S is invalid for workflow %S"
+                        entry workflow-name)))))
     (gptel-runner-store--notice-id (gptel-runner-run-id run))
     (puthash (gptel-runner-run-id run) run gptel-runner--runs)
     (gptel-runner--emit run 'snapshot-loaded nil nil file)

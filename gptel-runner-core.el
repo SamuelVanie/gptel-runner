@@ -100,7 +100,8 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
                (:constructor gptel-runner-run-create))
   "Runtime state for one workflow execution."
   id workflow goal workspace (state 'pending) blackboard node-states
-  iterations active-calls calls events budget driver queue (active-count 0)
+  iterations repeat-limits active-calls calls events budget driver queue
+  (active-count 0)
   (writer-active 0) started-at finished-at callback callback-called
   duration-timer duration-remaining active-started-at
   paused-at snapshot-file (generation 0) options)
@@ -229,6 +230,10 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
     (sort runs (lambda (a b)
                  (> (gptel-runner-run-started-at a)
                     (gptel-runner-run-started-at b))))))
+
+(defun gptel-runner-find-run (id)
+  "Return the session-local run identified by string ID, or nil."
+  (and (stringp id) (gethash id gptel-runner--runs)))
 
 (defun gptel-runner--forgettable-run-p (run)
   "Return non-nil when RUN can be safely removed from session state."

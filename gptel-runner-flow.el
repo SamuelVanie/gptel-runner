@@ -89,6 +89,13 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
       ((or 'agent 'parallel) (plist-get props :save-as))
       ('repeat (plist-get props :save-history-as)))))
 
+(defun gptel-runner--find-node (root id)
+  "Return the node named ID below ROOT, or nil when it is absent."
+  (if (equal (gptel-runner-node-id root) id)
+      root
+    (cl-loop for child in (gptel-runner-node-children root)
+             thereis (gptel-runner--find-node child id))))
+
 (defun gptel-runner--node-save-keys (node)
   "Return all blackboard keys written by NODE and its descendants."
   (let ((own (gptel-runner--node-save-key node)))
@@ -446,11 +453,18 @@ Return the new history entry, or nil when NODE does not collect history."
            (append (gptel-runner-get run history-key) (list entry)))
           entry)))))
 
+(defun gptel-runner--repeat-limit (run node)
+  "Return RUN's effective iteration limit for repeat NODE."
+  (or (and (hash-table-p (gptel-runner-run-repeat-limits run))
+           (gethash (gptel-runner-node-id node)
+                    (gptel-runner-run-repeat-limits run)))
+      (plist-get (gptel-runner-node-properties node) :max)))
+
 (defun gptel-runner--execute-repeat (run node done)
   "Execute bounded repeat NODE in RUN and invoke DONE."
   (let* ((props (gptel-runner-node-properties node))
          (body (plist-get props :body))
-         (maximum (plist-get props :max))
+         (maximum (gptel-runner--repeat-limit run node))
          (until (plist-get props :until))
          (stop (plist-get props :stop-when))
          (progress-fn (plist-get props :progress-key))
@@ -664,6 +678,7 @@ CALLBACK runs exactly once with the terminal run."
                  :blackboard (make-hash-table :test #'equal)
                  :node-states (make-hash-table :test #'equal)
                  :iterations (make-hash-table :test #'equal)
+                 :repeat-limits (make-hash-table :test #'equal)
                  :events nil :budget budget :driver selected-driver
                  :queue nil :active-calls nil :calls nil
                  :started-at (float-time) :callback callback :options options
@@ -703,15 +718,9 @@ CALLBACK runs exactly once with the terminal run."
                           (gptel-runner-call-node call) call
                           'superseded-by-resume))))
 
-(defun gptel-runner-resume-run (run &optional feedback callback)
-  "Resume paused RUN with optional human FEEDBACK and CALLBACK.
-Completed nodes remain complete.  The first unfinished agent prompt receives
-FEEDBACK, and execution restarts from the workflow AST's safe checkpoint."
-  (unless (eq (gptel-runner-run-state run) 'paused)
-    (user-error "Run %s is not paused" (gptel-runner-run-id run)))
-  (when feedback
-    (puthash 'gptel-runner-resume-feedback feedback
-             (gptel-runner-run-blackboard run)))
+(defun gptel-runner--restart-run (run event data &optional callback)
+  "Restart RUN from a safe checkpoint and emit EVENT containing DATA.
+When CALLBACK is non-nil, replace the previous terminal callback with it."
   (when callback
     (setf (gptel-runner-run-callback run) callback
           (gptel-runner-run-callback-called run) nil))
@@ -725,8 +734,7 @@ FEEDBACK, and execution restarts from the workflow AST's safe checkpoint."
         (gptel-runner-run-queue run) nil
         (gptel-runner-run-active-count run) 0
         (gptel-runner-run-writer-active run) 0)
-  (gptel-runner--emit run 'run-resumed nil nil
-                      (and feedback (list :feedback feedback)))
+  (gptel-runner--emit run event nil nil data)
   (gptel-runner--start-duration-clock run)
   (when (eq (gptel-runner-run-state run) 'running)
     (gptel-runner--execute-node
@@ -736,6 +744,112 @@ FEEDBACK, and execution restarts from the workflow AST's safe checkpoint."
          (gptel-runner--finish-run run state value)))))
   (gptel-runner--checkpoint run)
   run)
+
+(defun gptel-runner-resume-run (run &optional feedback callback)
+  "Resume paused RUN with optional human FEEDBACK and CALLBACK.
+Completed nodes remain complete.  The first unfinished agent prompt receives
+FEEDBACK, and execution restarts from the workflow AST's safe checkpoint."
+  (unless (eq (gptel-runner-run-state run) 'paused)
+    (user-error "Run %s is not paused" (gptel-runner-run-id run)))
+  (when feedback
+    (puthash 'gptel-runner-resume-feedback feedback
+             (gptel-runner-run-blackboard run)))
+  (gptel-runner--restart-run
+   run 'run-resumed (and feedback (list :feedback feedback)) callback))
+
+(defun gptel-runner--validate-extension-amount (value name integer-only)
+  "Validate extension VALUE named NAME.
+Require an integer when INTEGER-ONLY is non-nil."
+  (when (and value
+             (not (and (numberp value) (> value 0)
+                       (or (not integer-only) (integerp value)))))
+    (user-error "%s must be %s"
+                name (if integer-only "a positive integer" "positive"))))
+
+(defun gptel-runner--extend-budget (run slot amount)
+  "Increase RUN's finite budget SLOT by AMOUNT when AMOUNT is non-nil."
+  (when amount
+    (let* ((budget (gptel-runner-run-budget run))
+           (current
+            (pcase slot
+              ('requests (gptel-runner-budget-max-requests budget))
+              ('calls (gptel-runner-budget-max-calls budget))
+              ('duration (gptel-runner-budget-max-duration budget))))
+           (new (and current (+ current amount))))
+      (when new
+        (pcase slot
+          ('requests
+           (setf (gptel-runner-budget-max-requests budget) new))
+          ('calls
+           (setf (gptel-runner-budget-max-calls budget) new))
+          ('duration
+           (setf (gptel-runner-budget-max-duration budget) new
+                 (gptel-runner-run-duration-remaining run)
+                 (+ (or (gptel-runner-run-duration-remaining run) 0)
+                    amount))))
+        (setf (gptel-runner-run-options run)
+              (plist-put (gptel-runner-run-options run)
+                         (intern (format ":max-%s" slot)) new))))))
+
+(cl-defun gptel-runner-extend-repeat
+    (run node-id additional-iterations
+         &key additional-requests additional-calls additional-duration callback)
+  "Continue a repeat in failed RUN for ADDITIONAL-ITERATIONS.
+RUN may be a run object or its displayed string identifier.  NODE-ID must name
+a repeat that exhausted its effective iteration limit.  The run-local
+blackboard, saved repeat history, completed iteration count, calls, and events
+are retained.  The repeat body is reset before execution so the last
+successful iteration is not collected twice.
+
+The registered workflow is not modified.  ADDITIONAL-REQUESTS,
+ADDITIONAL-CALLS, and ADDITIONAL-DURATION increase corresponding finite run
+budgets; unlimited budgets remain unlimited.  When CALLBACK is non-nil, use it
+for the extended run's next terminal transition."
+  (when (stringp run)
+    (setq run (gptel-runner-find-run run)))
+  (unless (gptel-runner-run-p run)
+    (user-error "Unknown gptel-runner run"))
+  (unless additional-iterations
+    (user-error "ADDITIONAL-ITERATIONS must be a positive integer"))
+  (gptel-runner--validate-extension-amount
+   additional-iterations "ADDITIONAL-ITERATIONS" t)
+  (gptel-runner--validate-extension-amount
+   additional-requests "ADDITIONAL-REQUESTS" t)
+  (gptel-runner--validate-extension-amount
+   additional-calls "ADDITIONAL-CALLS" t)
+  (gptel-runner--validate-extension-amount
+   additional-duration "ADDITIONAL-DURATION" nil)
+  (unless (eq (gptel-runner-run-state run) 'failed)
+    (user-error "Run %s did not fail at a repeat limit"
+                (gptel-runner-run-id run)))
+  (let* ((root (gptel-runner-workflow-root
+                (gptel-runner-run-workflow run)))
+         (node (gptel-runner--find-node root node-id)))
+    (unless node
+      (user-error "Workflow has no node %S" node-id))
+    (unless (eq (gptel-runner-node-kind node) 'repeat)
+      (user-error "Node %S is not a repeat" node-id))
+    (let* ((old-limit (gptel-runner--repeat-limit run node))
+           (iterations (gptel-runner-iteration run node-id))
+           (state (gethash node-id (gptel-runner-run-node-states run)
+                           'pending))
+           (new-limit (+ old-limit additional-iterations))
+           (limits (or (gptel-runner-run-repeat-limits run)
+                       (setf (gptel-runner-run-repeat-limits run)
+                             (make-hash-table :test #'equal)))))
+      (unless (and (eq state 'failed) (>= iterations old-limit))
+        (user-error "Repeat %S did not exhaust its iteration limit" node-id))
+      (puthash node-id new-limit limits)
+      (gptel-runner--extend-budget run 'requests additional-requests)
+      (gptel-runner--extend-budget run 'calls additional-calls)
+      (gptel-runner--extend-budget run 'duration additional-duration)
+      (gptel-runner--reset-subtree
+       run (plist-get (gptel-runner-node-properties node) :body))
+      (gptel-runner--restart-run
+       run 'repeat-extended
+       (list :node-id node-id :additional additional-iterations
+             :old-limit old-limit :new-limit new-limit)
+       callback))))
 
 (defun gptel-runner--complete-restored-call (call value)
   "Complete restored CALL with VALUE and resume its reconstructed workflow."

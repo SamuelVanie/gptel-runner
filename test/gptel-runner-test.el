@@ -74,7 +74,12 @@
       (should (eq (gptel-runner-put run 'answer 42) 42))
       (should (= (gptel-runner-get run 'answer) 42))
       (should (eq (gptel-runner-get run 'missing 'none) 'none))
-      (should (zerop (gptel-runner-iteration run 'loop))))))
+      (should (zerop (gptel-runner-iteration run 'loop))))
+    (let ((run (gptel-runner-run-create :id "run-42")))
+      (puthash "run-42" run gptel-runner--runs)
+      (should (eq (gptel-runner-find-run "run-42") run))
+      (should-not (gptel-runner-find-run "missing"))
+      (should-not (gptel-runner-find-run 'run-42)))))
 
 (ert-deftest gptel-runner-tool-observations-update-call-state ()
   (let* ((run (gptel-runner-run-create :id "run" :events nil))
@@ -538,6 +543,97 @@
         (should (equal (gptel-runner-get run 'final-document)
                        "final document"))))))
 
+(ert-deftest gptel-runner-extend-repeat-preserves-and-appends-history ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(worker summarizer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create))
+          (initial-callbacks 0)
+          (extension-callbacks 0)
+          observed-history)
+      (gptel-runner-fake-queue
+       driver 'worker
+       '(:value "first") '(:value "second")
+       '(:value "third") '(:value "pass"))
+      (gptel-runner-fake-queue driver 'summarizer '(:value "summary"))
+      (let* ((repeat
+              (gptel-runner-repeat-until
+               :id 'review-cycle :max 2
+               :until (lambda (run)
+                        (equal (gptel-runner-get run 'result) "pass"))
+               :collect-keys '(result) :save-history-as 'review-history
+               :body (gptel-runner-test--step 'work 'worker 'result)))
+             (root
+              (gptel-runner-sequence
+               :id 'workflow
+               repeat
+               (gptel-runner-agent-step
+                :id 'summarize :agent 'summarizer
+                :prompt (lambda (run _node)
+                          (setq observed-history
+                                (gptel-runner-get run 'review-history))
+                          "summarize")
+                :save-as 'summary)))
+             (run
+              (gptel-runner-start
+               root :driver driver :max-calls 2 :max-requests 2
+               :callback (lambda (_run) (cl-incf initial-callbacks)))))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should (= (gptel-runner-iteration run 'review-cycle) 2))
+        (should (= initial-callbacks 1))
+        (gptel-runner-extend-repeat
+         (gptel-runner-run-id run) 'review-cycle 2
+         :additional-calls 3 :additional-requests 3
+         :callback (lambda (_run) (cl-incf extension-callbacks)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (gptel-runner-iteration run 'review-cycle) 4))
+        (should (= (gptel-runner--repeat-limit run repeat) 4))
+        (should (= (plist-get (gptel-runner-node-properties repeat) :max) 2))
+        (should
+         (equal
+          (gptel-runner-get run 'review-history)
+          '((:iteration 1 :values ((result . "first")))
+            (:iteration 2 :values ((result . "second")))
+            (:iteration 3 :values ((result . "third")))
+            (:iteration 4 :values ((result . "pass"))))))
+        (should (equal observed-history
+                       (gptel-runner-get run 'review-history)))
+        (should (equal (gptel-runner-get run 'summary) "summary"))
+        (should (= (length (gptel-runner-run-calls run)) 5))
+        (should (= (gptel-runner-budget-calls
+                    (gptel-runner-run-budget run)) 5))
+        (should (= (gptel-runner-budget-requests
+                    (gptel-runner-run-budget run)) 5))
+        (should (= initial-callbacks 1))
+        (should (= extension-callbacks 1))
+        (should (= (gptel-runner-test--event-count
+                    run 'repeat-extended) 1))))))
+
+(ert-deftest gptel-runner-extend-repeat-rejects-ineligible-runs ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'worker '(:value "only"))
+      (let* ((root
+              (gptel-runner-sequence
+               :id 'workflow
+               (gptel-runner-repeat-until
+                :id 'cycle :max 1 :until (lambda (_run) nil)
+                :body (gptel-runner-test--step 'work 'worker))))
+             (run (gptel-runner-start root :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should-error (gptel-runner-extend-repeat run 'cycle 0)
+                      :type 'user-error)
+        (should-error (gptel-runner-extend-repeat run 'cycle nil)
+                      :type 'user-error)
+        (should-error (gptel-runner-extend-repeat run 'missing 1)
+                      :type 'user-error)
+        (should-error (gptel-runner-extend-repeat run 'workflow 1)
+                      :type 'user-error)
+        (should (= (gptel-runner-iteration run 'cycle) 1))
+        (should (= (gptel-runner--repeat-limit
+                    run (gptel-runner--find-node root 'cycle)) 1))))))
+
 (ert-deftest gptel-runner-repeat-history-omits-stale-skipped-values ()
   (gptel-runner-test--isolated
     (dolist (agent '(optional reviewer))
@@ -800,6 +896,52 @@
                   (should (eq (gptel-runner-call-state
                                (car (gptel-runner-run-calls restored)))
                               'succeeded))))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-extended-repeat-limit-survives-snapshot-load ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-extend-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow persisted-extension (:persist t)
+              (gptel-runner-repeat-until
+               :id 'cycle :max 1 :until (lambda (_run) nil)
+               :collect-keys '(result) :save-history-as 'history
+               :body (gptel-runner-test--step 'work 'worker 'result)))
+            (gptel-runner-fake-queue
+             driver 'worker '(:value "first") '(:value "second"))
+            (let ((run (gptel-runner-start
+                        'persisted-extension :driver driver)))
+              (gptel-runner-extend-repeat run 'cycle 1)
+              (should (eq (gptel-runner-run-state run) 'failed))
+              (should (= (gptel-runner-iteration run 'cycle) 2))
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (let ((file (gptel-runner-run-snapshot-file run)))
+                (setq gptel-runner--runs (make-hash-table :test #'equal))
+                (let ((restored-driver (gptel-runner-fake-driver-create)))
+                  (gptel-runner-fake-queue
+                   restored-driver 'worker '(:value "third"))
+                  (let ((restored
+                         (gptel-runner-load-run file nil restored-driver)))
+                    (should (eq (gptel-runner-run-state restored) 'failed))
+                    (should (= (gethash
+                                'cycle
+                                (gptel-runner-run-repeat-limits restored))
+                               2))
+                    (gptel-runner-extend-repeat restored 'cycle 1)
+                    (should (= (gptel-runner-iteration restored 'cycle) 3))
+                    (should
+                     (equal
+                      (gptel-runner-get restored 'history)
+                      '((:iteration 1 :values ((result . "first")))
+                        (:iteration 2 :values ((result . "second")))
+                        (:iteration 3 :values ((result . "third"))))))
+                    (should
+                     (eq (gptel-runner-test--wait-for-snapshot restored)
+                         'clean)))))))
         (delete-directory snapshot-directory t)))))
 
 (ert-deftest gptel-runner-persistence-requires-named-workflow ()

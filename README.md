@@ -239,6 +239,43 @@ iterations cannot mutate earlier list or vector data.  Because the history is
 an ordinary blackboard value, durable snapshots preserve it and downstream
 prompt functions read it with `gptel-runner-get`.
 
+When a repeat reaches `:max`, its run fails with an `iteration-budget` result.
+It can be reopened for more iterations without losing its blackboard or saved
+history:
+
+```elisp
+(setq my-run
+      (gptel-runner-start 'implement-review
+                           :goal "Revise the implementation"
+                           :allow-writes t))
+
+(gptel-runner-extend-repeat
+ my-run 'review-cycle 3
+ :additional-calls 6
+ :additional-requests 8)
+```
+
+`gptel-runner-start` returns the run object, so keeping it in a variable is the
+most direct option.  You can also pass the string ID shown in the dashboard:
+
+```elisp
+(gptel-runner-extend-repeat "run-5" 'review-cycle 3)
+```
+
+Use `(gptel-runner-run-id my-run)` to obtain an object's ID,
+`(gptel-runner-find-run "run-5")` to retrieve a session-local run object, or
+`(gptel-runner-list-runs)` to inspect all retained runs.  A snapshot must be
+loaded before its run ID becomes available in a new Emacs session.
+
+The third argument adds to the exhausted repeat limit for this run only; it
+does not modify the registered workflow or other runs.  Iteration numbering
+continues from the previous limit, and new `review-history` entries are
+appended to the existing list.  Existing request and call budgets remain
+charged.  Use `:additional-requests`, `:additional-calls`, or
+`:additional-duration` when a finite run-level budget also needs more room.
+An optional `:callback` is invoked at the extended run's next terminal state;
+the callback already invoked for the original failure is not called again.
+
 ### Durable snapshots and overnight resume
 
 Persistent runs must use a named workflow and stable explicit node IDs.  Add
