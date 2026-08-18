@@ -81,9 +81,10 @@ run-scoped choice from Lisp with:
 ```
 
 `gptel-runner-record-decision` appends an entry with its time and, when called
-from a runner worker, its source call and node.  `gptel-runner-decisions`
-returns the ordered log.  Before each later agent call, the runner adds the
-current decisions to its prompt as workflow constraints.  Set
+from a runner worker, its source call and node.  Its first argument may also be
+the displayed run ID, such as `"run-17"`.  `gptel-runner-decisions` returns the
+ordered log.  Before each later agent call, the runner adds the current
+decisions to its prompt as workflow constraints.  Set
 `:decision-memory nil` in the workflow options or `gptel-runner-start` call to
 disable this automatic prompt propagation.
 

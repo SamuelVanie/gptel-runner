@@ -242,9 +242,13 @@ snapshots created before the option existed."
 
 (defun gptel-runner-record-decision (run text &optional rationale call)
   "Append decision TEXT with optional RATIONALE to RUN and return its entry.
+RUN may be a run object or its displayed string identifier.
 When CALL is supplied, record its call and node as the decision source.  In a
 runner worker buffer, the current call is inferred when it belongs to RUN.
 The entry is written to the blackboard, journaled, and checkpointed."
+  (when (stringp run)
+    (setq run (or (gptel-runner-find-run run)
+                  (user-error "Unknown gptel-runner run: %s" run))))
   (unless (gptel-runner-run-p run)
     (user-error "Not a gptel-runner run: %S" run))
   (unless (stringp text)

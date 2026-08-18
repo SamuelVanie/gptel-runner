@@ -116,9 +116,23 @@
                     :type 'user-error)
       (let* ((other-run (gptel-runner-run-create :id "other"))
              (other-call (gptel-runner-call-create :run other-run)))
-        (should-error
+         (should-error
          (gptel-runner-record-decision run "Wrong source" nil other-call)
          :type 'user-error)))))
+
+(ert-deftest gptel-runner-record-decision-accepts-displayed-run-id ()
+  (gptel-runner-test--isolated
+    (let ((run (gptel-runner-run-create
+                :id "run-17" :state 'running :events nil
+                :blackboard (make-hash-table :test #'equal))))
+      (puthash "run-17" run gptel-runner--runs)
+      (gptel-runner-record-decision
+       "run-17" "Use the dashboard run identifier.")
+      (should (equal (plist-get (car (gptel-runner-decisions run)) :text)
+                     "Use the dashboard run identifier."))
+      (should-error
+       (gptel-runner-record-decision "run-missing" "Cannot be stored")
+       :type 'user-error))))
 
 (ert-deftest gptel-runner-decision-memory-defaults-on-and-propagates ()
   (gptel-runner-test--isolated
