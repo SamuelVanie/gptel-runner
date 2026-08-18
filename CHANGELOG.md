@@ -15,6 +15,9 @@
   for human refinement before saving it or dispatching downstream nodes.
 - Add repeat `:collect-keys` and `:save-history-as` options for preserving
   ordered per-iteration blackboard values for downstream summary nodes.
+- Add default-on, run-scoped decision memory with provenance, automatic
+  downstream prompt propagation, snapshot persistence, and an interactive
+  command for recording decisions from worker buffers or the dashboard.
 - Add `gptel-runner-extend-repeat` to continue iteration-budget failures while
   preserving saved history and using a run-local, durable repeat limit.
 - Add `gptel-runner-extend` for continuing persisted request, call, or duration

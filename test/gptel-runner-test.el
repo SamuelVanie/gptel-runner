@@ -81,6 +81,137 @@
       (should-not (gptel-runner-find-run "missing"))
       (should-not (gptel-runner-find-run 'run-42)))))
 
+(ert-deftest gptel-runner-records-ordered-decisions-with-provenance ()
+  (gptel-runner-test--isolated
+    (let* ((run (gptel-runner-run-create
+                 :id "run-1" :state 'running :events nil :options nil
+                 :blackboard (make-hash-table :test #'equal)))
+           (node (gptel-runner-node-create :id 'implement))
+           (call (gptel-runner-call-create
+                  :id "call-1" :run run :node node :state 'running))
+           (first (gptel-runner-record-decision
+                   run "  Use SQLite for state.  "
+                   "  It provides atomic updates.  " call))
+           (second (gptel-runner-record-decision
+                    run "Keep migrations reversible."))
+           (decisions (gptel-runner-decisions run)))
+      (should (gptel-runner-decision-memory-p run))
+      (should (= (length decisions) 2))
+      (should (equal (mapcar (lambda (entry) (plist-get entry :text))
+                             decisions)
+                     '("Use SQLite for state."
+                       "Keep migrations reversible.")))
+      (should (equal (plist-get first :rationale)
+                     "It provides atomic updates."))
+      (should (eq (plist-get first :node-id) 'implement))
+      (should (equal (plist-get first :call-id) "call-1"))
+      (should-not (plist-get second :node-id))
+      (should (string-match-p "Use SQLite for state"
+                              (gptel-runner-format-decisions run)))
+      (should (string-match-p "Recorded by node: implement"
+                              (gptel-runner-format-decisions run)))
+      (should (= (gptel-runner-test--event-count
+                  run 'decision-recorded) 2))
+      (should-error (gptel-runner-record-decision run "   ")
+                    :type 'user-error)
+      (let* ((other-run (gptel-runner-run-create :id "other"))
+             (other-call (gptel-runner-call-create :run other-run)))
+        (should-error
+         (gptel-runner-record-decision run "Wrong source" nil other-call)
+         :type 'user-error)))))
+
+(ert-deftest gptel-runner-decision-memory-defaults-on-and-propagates ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(planner implementer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (gptel-runner-defworkflow decision-memory-default ()
+      (gptel-runner-sequence
+       (gptel-runner-agent-step
+        :id 'plan :agent 'planner :prompt "Create a plan")
+       (gptel-runner-agent-step
+        :id 'implement :agent 'implementer :prompt "Implement the plan")))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'planner
+       (lambda (call)
+         (gptel-runner-record-decision
+          (gptel-runner-call-run call)
+          "Use an append-only decision log."
+          "It preserves provenance." call)
+         '(:value "planned")))
+      (gptel-runner-fake-queue
+       driver 'implementer
+       (lambda (call)
+         (let ((prompt (gptel-runner-call-prompt call)))
+           (should (string-match-p
+                    "Workflow decisions recorded by earlier stages" prompt))
+           (should (string-match-p
+                    "Use an append-only decision log" prompt))
+           (should (string-match-p "It preserves provenance" prompt)))
+         '(:value "implemented")))
+      (let ((run (gptel-runner-start
+                  'decision-memory-default :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (eq (plist-get (gptel-runner-run-options run)
+                               :decision-memory)
+                    t))
+        (should (gptel-runner-decision-memory-p run))
+        (should (= (length (gptel-runner-decisions run)) 1))))))
+
+(ert-deftest gptel-runner-decision-memory-can-be-disabled ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(planner implementer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (gptel-runner-defworkflow decision-memory-disabled
+        (:decision-memory nil)
+      (gptel-runner-sequence
+       (gptel-runner-agent-step
+        :id 'plan :agent 'planner :prompt "Create a plan")
+       (gptel-runner-agent-step
+        :id 'implement :agent 'implementer :prompt "Implement the plan")))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'planner
+       (lambda (call)
+         (gptel-runner-record-decision
+          (gptel-runner-call-run call) "Do not propagate this." nil call)
+         '(:value "planned")))
+      (gptel-runner-fake-queue
+       driver 'implementer
+       (lambda (call)
+         (should-not (string-match-p
+                      "Do not propagate this"
+                      (gptel-runner-call-prompt call)))
+         '(:value "implemented")))
+      (let ((run (gptel-runner-start
+                  'decision-memory-disabled :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should-not (gptel-runner-decision-memory-p run))
+        (should (= (length (gptel-runner-decisions run)) 1))))))
+
+(ert-deftest gptel-runner-add-decision-uses-current-worker-call ()
+  (gptel-runner-test--isolated
+    (let* ((run (gptel-runner-run-create
+                 :id "run" :state 'running :events nil
+                 :blackboard (make-hash-table :test #'equal)))
+           (node (gptel-runner-node-create :id 'review))
+           (call (gptel-runner-call-create
+                  :id "call" :run run :node node :state 'running))
+           (answers '("Prefer the smaller API" "It is easier to maintain")))
+      (with-temp-buffer
+        (setq-local gptel-runner--call call)
+        (cl-letf (((symbol-function 'read-string)
+                   (lambda (&rest _arguments) (pop answers)))
+                  ((symbol-function 'message) #'ignore))
+          (call-interactively #'gptel-runner-add-decision)))
+      (let ((decision (car (gptel-runner-decisions run))))
+        (should (equal (plist-get decision :text)
+                       "Prefer the smaller API"))
+        (should (equal (plist-get decision :rationale)
+                       "It is easier to maintain"))
+        (should (eq (plist-get decision :node-id) 'review))
+        (should (equal (plist-get decision :call-id) "call"))))))
+
 (ert-deftest gptel-runner-tool-observations-update-call-state ()
   (let* ((run (gptel-runner-run-create :id "run" :events nil))
          (node (gptel-runner-node-create :id 'work))
@@ -856,7 +987,11 @@
                          'persisted-handoff :goal "ship it" :driver driver
                          :max-calls 5 :max-requests 5
                          :callback (lambda (_run) (cl-incf callbacks))))
-                   (file (progn (gptel-runner-pause-run run 'overnight)
+                   (file (progn
+                           (gptel-runner-record-decision
+                            run "Keep the public API small."
+                            "It reduces downstream maintenance.")
+                           (gptel-runner-pause-run run 'overnight)
                                 (gptel-runner-run-snapshot-file run))))
               (should (eq (gptel-runner-run-state run) 'paused))
               (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
@@ -878,6 +1013,10 @@
                   (should (eq (gptel-runner-run-state restored) 'paused))
                   (should (equal (gptel-runner-get restored 'first-result)
                                  "kept result"))
+                  (should (equal
+                           (mapcar (lambda (entry) (plist-get entry :text))
+                                   (gptel-runner-decisions restored))
+                           '("Keep the public API small.")))
                   (should-not (gptel-runner-run-calls restored))
                   (should (equal
                            (mapcar #'gptel-runner-event-type
@@ -886,6 +1025,8 @@
                   (gptel-runner-resume-run restored "Use the smaller API")
                   (should (eq (gptel-runner-run-state restored) 'succeeded))
                   (should (string-match-p "Use the smaller API"
+                                          observed-prompt))
+                  (should (string-match-p "Keep the public API small"
                                           observed-prompt))
                   (should (equal (gptel-runner-get restored 'second-result)
                                  "resumed result"))

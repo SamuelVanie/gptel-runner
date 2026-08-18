@@ -70,6 +70,28 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
+Every workflow has decision memory enabled by default.  Record a workflow-wide,
+run-scoped choice from Lisp with:
+
+```elisp
+(gptel-runner-record-decision
+ run
+ "Use SQLite instead of JSON for concurrent state updates"
+ "The implementation requires atomic writes")
+```
+
+`gptel-runner-record-decision` appends an entry with its time and, when called
+from a runner worker, its source call and node.  `gptel-runner-decisions`
+returns the ordered log.  Before each later agent call, the runner adds the
+current decisions to its prompt as workflow constraints.  Set
+`:decision-memory nil` in the workflow options or `gptel-runner-start` call to
+disable this automatic prompt propagation.
+
+Use `M-x gptel-runner-add-decision` to record a decision manually.  In a
+worker buffer it uses the current call as provenance; in the dashboard it uses
+the run or call row at point; elsewhere it prompts for a session-local run.
+The dashboard binds the same command to `e`.
+
 Add `:pause-after t` to an agent step when its successful response must be
 reviewed before the node completes and the next pipeline node starts:
 
@@ -90,10 +112,11 @@ interval in seconds, or use `nil` to disable automatic refresh:
 ```
 
 Changes take effect on the next refresh; press `g` to apply one immediately.
-The dashboard also uses `RET` to inspect a run journal, `v` to visit an agent
-transcript, `p` to pause a call for feedback, `x` to accept its latest
-response, `P` to pause and snapshot a run, `r` to resume it, `s` to save a
-snapshot, `l` to load one, `c` to abort a call, and `a` to abort a run.
+The dashboard also uses `RET` to inspect a run journal, `e` to record a
+decision, `v` to visit an agent transcript, `p` to pause a call for feedback,
+`x` to accept its latest response, `P` to pause and snapshot a run, `r` to
+resume it, `s` to save a snapshot, `l` to load one, `c` to abort a call, and
+`a` to abort a run.
 Workflow headers contain their run summary rows, and each run contains its
 agent-call rows; registered workflows with no runs remain visible.  The
 automatic refresh timer is stopped when the dashboard buffer is closed or
@@ -350,7 +373,9 @@ The dashboard therefore has no historical call rows immediately after loading;
 new rows appear when an extended or resumed run dispatches calls.  An
 unfinished call restarts statelessly from its workflow node.
 Store every downstream result needed after restoration on the blackboard,
-normally with `:save-as`.
+normally with `:save-as`.  Recorded decisions use the reserved
+`gptel-runner-decisions` blackboard key, so they are preserved by the same
+snapshot mechanism.
 
 Completion callbacks and live provider processes are not serializable; supply
 a new callback to `gptel-runner-load-run`.  Calls consumed before pausing remain
@@ -359,15 +384,20 @@ Snapshot files have mode `0600`, but blackboard values can contain prompts,
 outputs, tool results, and secrets; protect and delete them as sensitive data.
 
 Run options include `:driver`, `:max-requests`, `:max-calls`,
-`:max-concurrency`, `:max-duration`, `:allow-writes`, and
-`:allow-unconfirmed-tools`, and `:persist`.  Workflow defaults are used when
-an option is not provided.
+`:max-concurrency`, `:max-duration`, `:allow-writes`,
+`:allow-unconfirmed-tools`, `:decision-memory`, and `:persist`.  Workflow
+defaults are used when an option is not provided.  `:decision-memory` is the
+exception whose package fallback is `t`; use an explicit nil value to opt out.
 
 ## Semantics and safety
 
 - Calls are stateless.  Prompts must explicitly include the goal, workspace,
   iteration, selected blackboard inputs, and prior findings.  Agents should
   reinspect files instead of trusting earlier reports.
+- Decision memory is run-local and append-only.  A recorded decision is added
+  to prompts resolved after it was saved.  It cannot alter an agent call that
+  is already running; parallel branches should converge before a decision is
+  expected to constrain their downstream work.
 - A writable workflow is rejected unless the start call includes
   `:allow-writes t`.  Writers sharing a canonical workspace are serialized.
 - `workspace-mode` is orchestration metadata, **not a security sandbox**.  Tool

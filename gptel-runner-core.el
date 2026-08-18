@@ -57,6 +57,9 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
 (defconst gptel-runner--retryable-statuses
   '(408 425 429 500 502 503 504 529))
 
+(defconst gptel-runner-decisions-key 'gptel-runner-decisions
+  "Reserved blackboard key containing the run's ordered decision log.")
+
 (cl-defstruct (gptel-runner-agent
                (:constructor gptel-runner-agent-create))
   "Configuration used to invoke an agent."
@@ -219,6 +222,89 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
   (puthash key value (gptel-runner-run-blackboard run))
   (gptel-runner--checkpoint run)
   value)
+
+(defun gptel-runner-decisions (run)
+  "Return a copy of RUN's ordered decision log."
+  (unless (gptel-runner-run-p run)
+    (user-error "Not a gptel-runner run: %S" run))
+  (copy-tree (gptel-runner-get run gptel-runner-decisions-key) t))
+
+(defun gptel-runner-decision-memory-p (run)
+  "Return non-nil when automatic decision propagation is enabled for RUN.
+Decision memory defaults to enabled when the option is absent, including for
+snapshots created before the option existed."
+  (unless (gptel-runner-run-p run)
+    (user-error "Not a gptel-runner run: %S" run))
+  (let ((options (gptel-runner-run-options run)))
+    (if (plist-member options :decision-memory)
+        (plist-get options :decision-memory)
+      t)))
+
+(defun gptel-runner-record-decision (run text &optional rationale call)
+  "Append decision TEXT with optional RATIONALE to RUN and return its entry.
+When CALL is supplied, record its call and node as the decision source.  In a
+runner worker buffer, the current call is inferred when it belongs to RUN.
+The entry is written to the blackboard, journaled, and checkpointed."
+  (unless (gptel-runner-run-p run)
+    (user-error "Not a gptel-runner run: %S" run))
+  (unless (stringp text)
+    (user-error "Decision text must be a string"))
+  (setq text (string-trim text))
+  (when (string-empty-p text)
+    (user-error "Decision text cannot be empty"))
+  (when (and rationale (not (stringp rationale)))
+    (user-error "Decision rationale must be a string or nil"))
+  (when rationale
+    (setq rationale (string-trim rationale))
+    (when (string-empty-p rationale)
+      (setq rationale nil)))
+  (when (and call (not (gptel-runner-call-p call)))
+    (user-error "Decision source is not a runner call: %S" call))
+  (when (and call (not (eq (gptel-runner-call-run call) run)))
+    (user-error "Decision source call belongs to a different run"))
+  (let* ((source-call
+          (or call
+              (and (boundp 'gptel-runner--call)
+                   (gptel-runner-call-p gptel-runner--call)
+                   (eq (gptel-runner-call-run gptel-runner--call) run)
+                   gptel-runner--call)))
+         (node (and source-call (gptel-runner-call-node source-call)))
+         (entry
+          (list :id (gptel-runner--id "decision")
+                :text text
+                :rationale rationale
+                :node-id (and node (gptel-runner-node-id node))
+                :call-id (and source-call
+                              (gptel-runner-call-id source-call))
+                :created-at (float-time)))
+         (blackboard (or (gptel-runner-run-blackboard run)
+                         (setf (gptel-runner-run-blackboard run)
+                               (make-hash-table :test #'equal))))
+         (decisions (gethash gptel-runner-decisions-key blackboard)))
+    (puthash gptel-runner-decisions-key
+             (append decisions (list entry)) blackboard)
+    (gptel-runner--emit run 'decision-recorded node source-call entry)
+    (gptel-runner--checkpoint run)
+    (copy-tree entry t)))
+
+(defun gptel-runner-format-decisions (run)
+  "Format RUN's ordered decisions for inclusion in an agent prompt."
+  (mapconcat
+   (lambda (entry)
+     (let ((id (plist-get entry :id))
+           (text (replace-regexp-in-string
+                  "\n" "\n  " (plist-get entry :text)))
+           (rationale (plist-get entry :rationale))
+           (node-id (plist-get entry :node-id)))
+       (concat
+        (format "[%s] %s" id text)
+        (if rationale
+            (format "\n  Reason: %s"
+                    (replace-regexp-in-string "\n" "\n  " rationale))
+          "")
+        (if node-id (format "\n  Recorded by node: %s" node-id) ""))))
+   (gptel-runner-decisions run)
+   "\n\n"))
 
 (defun gptel-runner-iteration (run node-id)
   "Return RUN's completed iteration count for NODE-ID."

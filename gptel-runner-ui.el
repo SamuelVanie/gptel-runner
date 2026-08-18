@@ -345,6 +345,51 @@ An elided value retains its complete unpropertized text as hover help."
     (`(call ,_) (when-let ((call (gptel-runner-ui--call-at-point)))
                   (gptel-runner-call-run call)))))
 
+(defun gptel-runner-ui--decision-context ()
+  "Return a (RUN . CALL) decision source for the current buffer, if any."
+  (cond
+   ((and (boundp 'gptel-runner--call)
+         (gptel-runner-call-p gptel-runner--call))
+    (cons (gptel-runner-call-run gptel-runner--call) gptel-runner--call))
+   ((derived-mode-p 'gptel-runner-dashboard-mode)
+    (let ((call (gptel-runner-ui--call-at-point)))
+      (when-let ((run (or (and call (gptel-runner-call-run call))
+                          (gptel-runner-ui--run-at-point))))
+        (cons run call))))))
+
+(defun gptel-runner-ui--read-run ()
+  "Read and return a session-local run for an interactive command."
+  (let ((runs (gptel-runner-list-runs)))
+    (unless runs
+      (user-error "There are no gptel-runner runs in this session"))
+    (if (= (length runs) 1)
+        (car runs)
+      (let* ((choices
+              (mapcar (lambda (run)
+                        (cons (gptel-runner-run-id run) run))
+                      runs))
+             (id (completing-read "Run: " choices nil t)))
+        (cdr (assoc id choices))))))
+
+(defun gptel-runner-add-decision (run text &optional rationale call)
+  "Interactively record decision TEXT with optional RATIONALE for RUN.
+From a runner worker, use the current call as provenance.  From the dashboard,
+use the selected run or call row.  Elsewhere, prompt for a session-local run.
+CALL may supply explicit provenance when this function is called from Lisp."
+  (interactive
+   (let* ((context (gptel-runner-ui--decision-context))
+          (run (or (car context) (gptel-runner-ui--read-run)))
+          (text (read-string "Workflow decision: "))
+          (rationale (read-string "Rationale (optional): ")))
+     (list run text (unless (string-empty-p rationale) rationale)
+           (cdr context))))
+  (when (stringp run)
+    (setq run (gptel-runner-find-run run)))
+  (let ((entry (gptel-runner-record-decision run text rationale call)))
+    (message "Recorded workflow decision %s"
+             (plist-get entry :id))
+    entry))
+
 (defun gptel-runner-ui--workflow-name-at-point ()
   "Return the workflow name represented by the current dashboard row."
   (pcase (tabulated-list-get-id)
@@ -500,6 +545,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
 
 (let ((map gptel-runner-dashboard-mode-map))
   (define-key map (kbd "RET") #'gptel-runner-dashboard-inspect-events)
+  (define-key map (kbd "e") #'gptel-runner-add-decision)
   (define-key map (kbd "v") #'gptel-runner-dashboard-visit-worker)
   (define-key map (kbd "p") #'gptel-runner-dashboard-pause-call)
   (define-key map (kbd "x") #'gptel-runner-dashboard-complete-call)

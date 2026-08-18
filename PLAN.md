@@ -40,6 +40,8 @@ normal verification commands where applicable.
 
 - [x] Workflow-grouped session dashboard with inspect, visit, lifecycle,
   cleanup, configurable columns, and abort actions.
+- [x] Default-on, run-scoped decision memory with provenance, automatic
+  downstream prompt propagation, snapshot persistence, and manual entry.
 - [x] Versioned atomic snapshots, pause/resume across Emacs sessions, restored
   transcript buffers, in-buffer human feedback, and active-duration accounting.
 - [x] Implement/review and fan-out/synthesis examples.

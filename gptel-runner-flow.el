@@ -261,8 +261,18 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
   "Resolve NODE's prompt for RUN."
   (let* ((prompt (plist-get (gptel-runner-node-properties node) :prompt))
          (resolved (if (functionp prompt) (funcall prompt run node) prompt))
+         (decisions (and (gptel-runner-decision-memory-p run)
+                         (gptel-runner-decisions run)))
          (feedback (gethash 'gptel-runner-resume-feedback
                             (gptel-runner-run-blackboard run))))
+    (when decisions
+      (setq resolved
+            (concat
+             resolved
+             "\n\nWorkflow decisions recorded by earlier stages\n"
+             "===============================================\n\n"
+             (gptel-runner-format-decisions run)
+             "\n\nTreat these decisions as constraints for this stage.")))
     (if feedback
         (progn
           (remhash 'gptel-runner-resume-feedback
@@ -636,17 +646,20 @@ Return the new history entry, or nil when NODE does not collect history."
     (workflow &rest arguments
               &key goal workspace driver max-requests max-calls
               max-concurrency max-duration allow-writes
-              allow-unconfirmed-tools persist callback &allow-other-keys)
+              allow-unconfirmed-tools decision-memory persist callback
+              &allow-other-keys)
   "Start WORKFLOW with keyword ARGUMENTS and return its run immediately.
 GOAL and WORKSPACE describe the stateless task.  DRIVER defaults to
 `gptel-runner-default-driver'.  MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
 MAX-DURATION override workflow defaults.  ALLOW-WRITES must be explicitly
 non-nil for any workflow containing a write agent.
 ALLOW-UNCONFIRMED-TOOLS disables gptel confirmation only when explicitly set.
+DECISION-MEMORY controls automatic propagation of recorded decisions and
+defaults to non-nil.
 PERSIST enables versioned snapshots at workflow checkpoints.
 CALLBACK runs exactly once with the terminal run."
   (ignore max-requests max-calls max-concurrency max-duration
-          allow-unconfirmed-tools)
+          allow-unconfirmed-tools decision-memory)
   (let* ((definition
           (cond ((gptel-runner-workflow-p workflow) workflow)
                 ((symbolp workflow)
@@ -673,6 +686,8 @@ CALLBACK runs exactly once with the terminal run."
                 (gptel-runner--option :max-duration arguments defaults nil)
                 :allow-writes allow-writes
                 :allow-unconfirmed-tools allow-unconfirmed-tools
+                :decision-memory (gptel-runner--option
+                                  :decision-memory arguments defaults t)
                 :persist (gptel-runner--option
                           :persist arguments defaults persist))))
     (when (and (plist-get options :persist)
