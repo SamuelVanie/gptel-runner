@@ -25,6 +25,9 @@
 - Add `gptel-runner-continue` and dashboard follow-ups for rerunning a finished
   pipeline with a human observation as its new goal, archived prior results,
   and optional budget reset or growth.
+- Make continuation of unsuccessful runs retry the failed or unfinished safe
+  checkpoint before dispatching later nodes, while successful runs still begin
+  a fresh full workflow cycle.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
 - Show active tool calls in the dashboard as `Calling TOOL-NAME...` using a

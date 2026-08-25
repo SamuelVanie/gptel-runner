@@ -290,14 +290,20 @@ pipeline with a human observation as its new goal:
  :additional-requests 4)
 ```
 
-The complete workflow runs again against the same workspace.  The observation
-becomes `gptel-runner-run-goal` and is automatically included, together with
-the preceding goal, in every new agent prompt.  Calls, events, decisions, and
-manually stored blackboard context remain available.  Values owned by workflow
-nodes are archived and then cleared before the new cycle, preventing an old
-branch or review verdict from satisfying the new cycle accidentally.  Read the
-ordered archive with `gptel-runner-continuations`; each entry includes the
-preceding goal, terminal state, observation, and saved workflow results.
+For a succeeded run, the complete workflow runs again against the same
+workspace.  Values owned by workflow nodes are archived and then cleared
+before that new cycle, preventing an old branch or review verdict from
+satisfying it accidentally.  For a failed, blocked, stalled, or cancelled run,
+continuation instead resumes at the safe checkpoint: completed nodes stay
+complete, the failed or unfinished node is retried, and following nodes run
+only after it succeeds.
+
+In either mode, the observation becomes `gptel-runner-run-goal` and is
+automatically included, together with the preceding goal, in every new agent
+prompt.  Calls, events, decisions, and manually stored blackboard context
+remain available.  Read the ordered archive with
+`gptel-runner-continuations`; each entry includes the preceding goal, terminal
+state, restart mode, observation, and saved workflow results.
 
 Budget use is cumulative by default.  Add capacity as above, or reset consumed
 accounting while keeping the configured limits:

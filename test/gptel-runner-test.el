@@ -829,6 +829,98 @@
                     (implementation . "old implementation")))))
         (should (= (gptel-runner-test--event-count run 'run-continued) 1))))))
 
+(ert-deftest gptel-runner-continue-retries-failed-node-before-following-node ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(first failing following))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create))
+          retry-prompts
+          following-prompt)
+      (gptel-runner-fake-queue driver 'first '(:value "kept result"))
+      (gptel-runner-fake-queue
+       driver 'failing
+       '(:status permanent :value "initial failure")
+       (lambda (call)
+         (push (gptel-runner-call-prompt call) retry-prompts)
+         '(:status permanent :value "failed again"))
+       (lambda (call)
+         (push (gptel-runner-call-prompt call) retry-prompts)
+         '(:value "recovered")))
+      (gptel-runner-fake-queue
+       driver 'following
+       (lambda (call)
+         (setq following-prompt (gptel-runner-call-prompt call))
+         '(:value "finished")))
+      (let* ((root
+              (gptel-runner-sequence
+               :id 'pipeline
+               (gptel-runner-test--step 'first-step 'first 'first-result)
+               (gptel-runner-test--step 'failing-step 'failing 'failed-result)
+               (gptel-runner-test--step
+                'following-step 'following 'following-result)))
+             (run
+              (gptel-runner-start
+               root :goal "Original goal" :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should
+         (equal
+          (mapcar
+           (lambda (call)
+             (gptel-runner-agent-name (gptel-runner-call-agent call)))
+           (gptel-runner-fake-driver-starts driver))
+          '(first failing)))
+        (should (eq (gethash 'first-step
+                             (gptel-runner-run-node-states run))
+                    'succeeded))
+        (should (eq (gethash 'failing-step
+                             (gptel-runner-run-node-states run))
+                    'failed))
+        (should (eq (gethash 'following-step
+                             (gptel-runner-run-node-states run))
+                    'skipped))
+
+        ;; The failed node fails once more.  The following node must remain
+        ;; gated and the already successful first node must not run again.
+        (gptel-runner-continue run "First observation")
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should
+         (equal
+          (mapcar
+           (lambda (call)
+             (gptel-runner-agent-name (gptel-runner-call-agent call)))
+           (gptel-runner-fake-driver-starts driver))
+          '(first failing failing)))
+        (should-not following-prompt)
+        (should (equal (gptel-runner-get run 'first-result) "kept result"))
+
+        ;; A second continuation retries the same failed node.  Only after it
+        ;; succeeds may the following node start.
+        (gptel-runner-continue run "Second observation")
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should
+         (equal
+          (mapcar
+           (lambda (call)
+             (gptel-runner-agent-name (gptel-runner-call-agent call)))
+           (gptel-runner-fake-driver-starts driver))
+          '(first failing failing failing following)))
+        (should (equal (gptel-runner-get run 'failed-result) "recovered"))
+        (should (equal (gptel-runner-get run 'following-result) "finished"))
+        (should (= (length retry-prompts) 2))
+        (should (string-match-p "Original goal" (cadr retry-prompts)))
+        (should (string-match-p "First observation" (cadr retry-prompts)))
+        (should (string-match-p "First observation" (car retry-prompts)))
+        (should (string-match-p "Second observation" (car retry-prompts)))
+        (should (string-match-p "Second observation" following-prompt))
+        (let ((history (gptel-runner-continuations run)))
+          (should (= (length history) 2))
+          (dolist (entry history)
+            (should (eq (plist-get entry :previous-state) 'failed))
+            (should (eq (plist-get entry :restart-mode) 'checkpoint)))
+          (should
+           (equal (plist-get (car history) :results)
+                  '((first-result . "kept result")))))))))
+
 (ert-deftest gptel-runner-continue-can-reset-budget-and-repeat-cycle ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
@@ -909,6 +1001,58 @@
                       (plist-get
                        (car (gptel-runner-continuations restored)) :results)
                       '((result . "first result"))))
+                    (should
+                     (eq (gptel-runner-test--wait-for-snapshot restored)
+                         'clean)))))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-failed-snapshot-retries-failed-node-on-continue ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(first failing following))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let* ((snapshot-directory
+            (make-temp-file "gptel-runner-failed-continue-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow persisted-failed-follow-up (:persist t)
+              (gptel-runner-sequence
+               :id 'pipeline
+               (gptel-runner-test--step 'first-step 'first 'first-result)
+               (gptel-runner-test--step 'failing-step 'failing 'failed-result)
+               (gptel-runner-test--step
+                'following-step 'following 'following-result)))
+            (gptel-runner-fake-queue driver 'first '(:value "kept"))
+            (gptel-runner-fake-queue
+             driver 'failing '(:status permanent :value "failure"))
+            (let ((run
+                   (gptel-runner-start
+                    'persisted-failed-follow-up :goal "Original"
+                    :driver driver)))
+              (should (eq (gptel-runner-run-state run) 'failed))
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (let ((file (gptel-runner-run-snapshot-file run)))
+                (setq gptel-runner--runs (make-hash-table :test #'equal))
+                (let ((restored-driver (gptel-runner-fake-driver-create)))
+                  (gptel-runner-fake-queue
+                   restored-driver 'failing '(:value "recovered"))
+                  (gptel-runner-fake-queue
+                   restored-driver 'following '(:value "finished"))
+                  (let ((restored
+                         (gptel-runner-load-run file nil restored-driver)))
+                    (gptel-runner-continue restored "Retry with this detail")
+                    (should (eq (gptel-runner-run-state restored) 'succeeded))
+                    (should
+                     (equal
+                      (mapcar
+                       (lambda (call)
+                         (gptel-runner-agent-name
+                          (gptel-runner-call-agent call)))
+                       (gptel-runner-fake-driver-starts restored-driver))
+                      '(failing following)))
+                    (should (equal (gptel-runner-get restored 'first-result)
+                                   "kept"))
                     (should
                      (eq (gptel-runner-test--wait-for-snapshot restored)
                          'clean)))))))

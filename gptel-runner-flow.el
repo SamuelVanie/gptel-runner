@@ -934,10 +934,13 @@ candidate increments."
   "Continue terminal RUN with OBSERVATION as a new goal.
 RUN may be a run object or its displayed string identifier.  OBSERVATION must
 be a non-empty string.  The workspace, decisions, calls, events, and other
-run-local context are retained.  Results written by workflow nodes are first
-archived in `gptel-runner-continuations', then cleared so stale values cannot
-satisfy a branch or repeat in the new cycle.  All workflow nodes and repeat
-counters restart from the beginning.
+run-local context are retained.  Results written by workflow nodes are
+archived in `gptel-runner-continuations'.  A succeeded run begins a fresh
+cycle: saved workflow results are cleared and all nodes and repeat counters
+restart from the beginning.  An unsuccessful run instead restarts at its safe
+checkpoint: succeeded nodes and their results remain complete, the failed or
+unfinished node is retried, and later skipped nodes cannot run until that retry
+succeeds.
 
 By default, existing budget accounting and limits remain in effect.  When
 RESET-BUDGET is non-nil, consumed request, call, and duration accounting is
@@ -964,25 +967,31 @@ continued run's next terminal transition."
                 (gptel-runner-run-workflow run)))
          (previous-goal (gptel-runner-run-goal run))
          (previous-state (gptel-runner-run-state run))
+         (restart-mode (if (eq previous-state 'succeeded)
+                           'new-cycle
+                         'checkpoint))
          (history (gptel-runner-get run gptel-runner-continuations-key))
          (entry
           (list :cycle (1+ (length history))
                 :continued-at (float-time)
                 :previous-goal (copy-tree previous-goal t)
                 :previous-state previous-state
+                :restart-mode restart-mode
                 :terminal-data
                 (copy-tree (gptel-runner-run-terminal-data run) t)
                 :observation observation
                 :results (gptel-runner--workflow-results run root))))
-    (gptel-runner--clear-workflow-results run root)
+    (when (eq restart-mode 'new-cycle)
+      (gptel-runner--clear-workflow-results run root))
     (puthash gptel-runner-continuations-key
              (append history (list entry))
              (gptel-runner-run-blackboard run))
     (remhash 'gptel-runner-resume-feedback
              (gptel-runner-run-blackboard run))
     (setf (gptel-runner-run-goal run) observation)
-    (gptel-runner--reset-subtree run root)
-    (gptel-runner--clear-repeat-progress run root)
+    (when (eq restart-mode 'new-cycle)
+      (gptel-runner--reset-subtree run root)
+      (gptel-runner--clear-repeat-progress run root))
     (when reset-budget
       (gptel-runner--reset-budget-accounting run))
     (gptel-runner--extend-budget run 'requests additional-requests)
@@ -991,6 +1000,7 @@ continued run's next terminal transition."
     (gptel-runner--restart-run
      run 'run-continued
      (list :cycle (plist-get entry :cycle)
+           :restart-mode restart-mode
            :previous-state previous-state
            :previous-goal previous-goal
            :observation observation
