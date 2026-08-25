@@ -754,6 +754,183 @@
         (should (= (gptel-runner-test--event-count
                     run 'repeat-extended) 1))))))
 
+(ert-deftest gptel-runner-continue-reruns-finished-workflow-with-observation ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(researcher implementer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create))
+          prompts
+          (initial-callbacks 0)
+          (continuation-callbacks 0))
+      (gptel-runner-fake-queue
+       driver 'researcher
+       '(:value "old findings")
+       (lambda (call)
+         (push (gptel-runner-call-prompt call) prompts)
+         '(:value "new findings")))
+      (gptel-runner-fake-queue
+       driver 'implementer
+       '(:value "old implementation")
+       (lambda (call)
+         (push (gptel-runner-call-prompt call) prompts)
+         '(:value "new implementation")))
+      (let* ((root
+              (gptel-runner-sequence
+               :id 'pipeline
+               (gptel-runner-agent-step
+                :id 'research :agent 'researcher :prompt "research"
+                :save-as 'findings)
+               (gptel-runner-agent-step
+                :id 'implement :agent 'implementer :prompt "implement"
+                :save-as 'implementation)))
+             (run
+              (gptel-runner-start
+               root :goal "Build the first version" :driver driver
+               :max-calls 2 :max-requests 2
+               :callback (lambda (_run) (cl-incf initial-callbacks)))))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (gptel-runner-put run 'exploration-note "keep this context")
+        (gptel-runner-continue
+         (gptel-runner-run-id run)
+         "  Improve the behavior I observed  "
+         :additional-calls 2 :additional-requests 2
+         :callback (lambda (_run) (cl-incf continuation-callbacks)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-run-goal run)
+                       "Improve the behavior I observed"))
+        (should (equal (gptel-runner-get run 'findings) "new findings"))
+        (should (equal (gptel-runner-get run 'implementation)
+                       "new implementation"))
+        (should (equal (gptel-runner-get run 'exploration-note)
+                       "keep this context"))
+        (should (= (length (gptel-runner-run-calls run)) 4))
+        (should (= (gptel-runner-budget-calls
+                    (gptel-runner-run-budget run)) 4))
+        (should (= (gptel-runner-budget-max-calls
+                    (gptel-runner-run-budget run)) 4))
+        (should (= initial-callbacks 1))
+        (should (= continuation-callbacks 1))
+        (should (= (length prompts) 2))
+        (dolist (prompt prompts)
+          (should (string-match-p "Build the first version" prompt))
+          (should (string-match-p "Improve the behavior I observed" prompt)))
+        (let* ((history (gptel-runner-continuations run))
+               (entry (car history)))
+          (should (= (length history) 1))
+          (should (= (plist-get entry :cycle) 1))
+          (should (eq (plist-get entry :previous-state) 'succeeded))
+          (should (equal (plist-get entry :previous-goal)
+                         "Build the first version"))
+          (should (equal (plist-get entry :observation)
+                         "Improve the behavior I observed"))
+          (should
+           (equal (plist-get entry :results)
+                  '((findings . "old findings")
+                    (implementation . "old implementation")))))
+        (should (= (gptel-runner-test--event-count run 'run-continued) 1))))))
+
+(ert-deftest gptel-runner-continue-can-reset-budget-and-repeat-cycle ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'worker '(:value "pass") '(:value "pass again"))
+      (let* ((root
+              (gptel-runner-repeat-until
+               :id 'review-cycle :max 1
+               :until (lambda (run)
+                        (string-prefix-p
+                         "pass" (or (gptel-runner-get run 'result) "")))
+               :collect-keys '(result) :save-history-as 'review-history
+               :body (gptel-runner-test--step 'work 'worker 'result)))
+             (run
+              (gptel-runner-start
+               root :goal "Initial goal" :driver driver
+               :max-calls 1 :max-requests 1)))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (gptel-runner-iteration run 'review-cycle) 1))
+        (gptel-runner-continue run "Review my observation" :reset-budget t)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (gptel-runner-iteration run 'review-cycle) 1))
+        (should (= (gptel-runner-budget-calls
+                    (gptel-runner-run-budget run)) 1))
+        (should (= (gptel-runner-budget-requests
+                    (gptel-runner-run-budget run)) 1))
+        (should (= (gptel-runner-budget-max-calls
+                    (gptel-runner-run-budget run)) 1))
+        (should
+         (equal (gptel-runner-get run 'review-history)
+                '((:iteration 1 :values ((result . "pass again"))))))
+        (should
+         (equal
+          (plist-get (car (gptel-runner-continuations run)) :results)
+          '((review-history
+             (:iteration 1 :values ((result . "pass"))))
+            (result . "pass"))))))))
+
+(ert-deftest gptel-runner-finished-snapshot-can-continue-with-observation ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-continue-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow persisted-follow-up (:persist t)
+              (gptel-runner-test--step 'work 'worker 'result))
+            (gptel-runner-fake-queue driver 'worker '(:value "first result"))
+            (let ((run
+                   (gptel-runner-start
+                    'persisted-follow-up :goal "First goal" :driver driver
+                    :max-calls 1 :max-requests 1)))
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (let ((file (gptel-runner-run-snapshot-file run)))
+                (setq gptel-runner--runs (make-hash-table :test #'equal))
+                (let ((restored-driver (gptel-runner-fake-driver-create))
+                      observed-prompt)
+                  (gptel-runner-fake-queue
+                   restored-driver 'worker
+                   (lambda (call)
+                     (setq observed-prompt (gptel-runner-call-prompt call))
+                     '(:value "follow-up result")))
+                  (let ((restored
+                         (gptel-runner-load-run file nil restored-driver)))
+                    (should (eq (gptel-runner-run-state restored) 'succeeded))
+                    (gptel-runner-continue
+                     restored "Apply the observation" :reset-budget t)
+                    (should (eq (gptel-runner-run-state restored) 'succeeded))
+                    (should (equal (gptel-runner-get restored 'result)
+                                   "follow-up result"))
+                    (should (string-match-p "First goal" observed-prompt))
+                    (should (string-match-p "Apply the observation"
+                                            observed-prompt))
+                    (should
+                     (equal
+                      (plist-get
+                       (car (gptel-runner-continuations restored)) :results)
+                      '((result . "first result"))))
+                    (should
+                     (eq (gptel-runner-test--wait-for-snapshot restored)
+                         'clean)))))))
+        (delete-directory snapshot-directory t)))))
+
+(ert-deftest gptel-runner-continue-validates-run-observation-and-budget ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'worker '(:manual t :value "later"))
+      (let ((run (gptel-runner-start
+                  (gptel-runner-test--step 'work 'worker)
+                  :driver driver)))
+        (should-error (gptel-runner-continue run "new goal")
+                      :type 'user-error)
+        (gptel-runner-abort-run run)
+        (should-error (gptel-runner-continue run "   ") :type 'user-error)
+        (should-error (gptel-runner-continue run 42) :type 'user-error)
+        (should-error
+         (gptel-runner-continue run "new goal" :additional-calls 1.5)
+         :type 'user-error)))))
+
 (ert-deftest gptel-runner-extend-repeat-rejects-ineligible-runs ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)

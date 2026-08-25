@@ -15,6 +15,7 @@
 (declare-function gptel-runner-save-run "gptel-runner-store")
 (declare-function gptel-runner-load-run "gptel-runner-store")
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
+(declare-function gptel-runner-continue "gptel-runner-flow")
 (declare-function gptel-runner-complete-call-from-buffer
                   "gptel-runner-gptel")
 
@@ -490,6 +491,48 @@ CALL may supply explicit provenance when this function is called from Lisp."
     (gptel-runner-resume-run run (unless (string-empty-p feedback) feedback))
     (revert-buffer)))
 
+(defun gptel-runner-ui--budget-additions (run)
+  "Read and return finite budget additions for RUN as a keyword plist."
+  (let* ((budget (gptel-runner-run-budget run))
+         (requests
+          (and (gptel-runner-budget-max-requests budget)
+               (read-number "Additional requests (0 for none): " 0)))
+         (calls
+          (and (gptel-runner-budget-max-calls budget)
+               (read-number "Additional calls (0 for none): " 0)))
+         (duration
+          (and (gptel-runner-budget-max-duration budget)
+               (read-number "Additional active seconds (0 for none): " 0)))
+         additions)
+    (when (and requests (> requests 0))
+      (setq additions (plist-put additions :additional-requests requests)))
+    (when (and calls (> calls 0))
+      (setq additions (plist-put additions :additional-calls calls)))
+    (when (and duration (> duration 0))
+      (setq additions (plist-put additions :additional-duration duration)))
+    (unless additions
+      (user-error "No finite budget was increased"))
+    additions))
+
+(defun gptel-runner-dashboard-continue-run ()
+  "Continue the finished run at point with a new human observation."
+  (interactive)
+  (let* ((run (or (gptel-runner-ui--run-at-point)
+                  (user-error "No run on this row")))
+         (observation (read-string "Observation and new goal: "))
+         (budget-action
+          (completing-read
+           "Budget for the new cycle: "
+           '("keep remaining" "reset accounting" "increase limits")
+           nil t nil nil "keep remaining"))
+         (arguments
+          (pcase budget-action
+            ("reset accounting" '(:reset-budget t))
+            ("increase limits" (gptel-runner-ui--budget-additions run))
+            (_ nil))))
+    (apply #'gptel-runner-continue run observation arguments)
+    (revert-buffer)))
+
 (defun gptel-runner-dashboard-load-snapshot (file)
   "Load paused run from snapshot FILE into the dashboard."
   (interactive "fSnapshot file: ")
@@ -552,6 +595,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
   (define-key map (kbd "P") #'gptel-runner-dashboard-pause-run)
   (define-key map (kbd "s") #'gptel-runner-dashboard-save-run)
   (define-key map (kbd "r") #'gptel-runner-dashboard-resume-run)
+  (define-key map (kbd "f") #'gptel-runner-dashboard-continue-run)
   (define-key map (kbd "l") #'gptel-runner-dashboard-load-snapshot)
   (define-key map (kbd "d") #'gptel-runner-dashboard-forget-run)
   (define-key map (kbd "D") #'gptel-runner-dashboard-forget-workflow)

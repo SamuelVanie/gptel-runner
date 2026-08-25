@@ -60,6 +60,9 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
 (defconst gptel-runner-decisions-key 'gptel-runner-decisions
   "Reserved blackboard key containing the run's ordered decision log.")
 
+(defconst gptel-runner-continuations-key 'gptel-runner-continuations
+  "Reserved blackboard key containing completed workflow-cycle history.")
+
 (cl-defstruct (gptel-runner-agent
                (:constructor gptel-runner-agent-create))
   "Configuration used to invoke an agent."
@@ -228,6 +231,18 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
   (unless (gptel-runner-run-p run)
     (user-error "Not a gptel-runner run: %S" run))
   (copy-tree (gptel-runner-get run gptel-runner-decisions-key) t))
+
+(defun gptel-runner-continuations (run)
+  "Return a copy of RUN's ordered continuation history.
+Each entry records the preceding goal and terminal state, the observation that
+became the next goal, and the preceding workflow's saved results."
+  (unless (gptel-runner-run-p run)
+    (user-error "Not a gptel-runner run: %S" run))
+  (copy-tree (gptel-runner-get run gptel-runner-continuations-key) t))
+
+(defun gptel-runner--latest-continuation (run)
+  "Return RUN's latest continuation entry without copying its full history."
+  (car (last (gptel-runner-get run gptel-runner-continuations-key))))
 
 (defun gptel-runner-decision-memory-p (run)
   "Return non-nil when automatic decision propagation is enabled for RUN.

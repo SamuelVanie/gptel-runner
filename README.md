@@ -116,8 +116,8 @@ Changes take effect on the next refresh; press `g` to apply one immediately.
 The dashboard also uses `RET` to inspect a run journal, `e` to record a
 decision, `v` to visit an agent transcript, `p` to pause a call for feedback,
 `x` to accept its latest response, `P` to pause and snapshot a run, `r` to
-resume it, `s` to save a snapshot, `l` to load one, `c` to abort a call, and
-`a` to abort a run.
+resume it, `f` to follow up on a finished run, `s` to save a snapshot, `l` to
+load one, `c` to abort a call, and `a` to abort a run.
 Workflow headers contain their run summary rows, and each run contains its
 agent-call rows; registered workflows with no runs remain visible.  The
 automatic refresh timer is stopped when the dashboard buffer is closed or
@@ -276,6 +276,41 @@ checkpoint with `gptel-runner-extend`:
 This preserves completed nodes and blackboard values.  Each exhausted budget
 must be increased; the runner reports which keyword is missing rather than
 restarting only to fail at the same limit.
+
+### Follow up after a finished pipeline
+
+After inspecting the workspace produced by a finished run, continue the same
+pipeline with a human observation as its new goal:
+
+```elisp
+(gptel-runner-continue
+ my-run
+ "The command works, but its error output needs to name the invalid option."
+ :additional-calls 4
+ :additional-requests 4)
+```
+
+The complete workflow runs again against the same workspace.  The observation
+becomes `gptel-runner-run-goal` and is automatically included, together with
+the preceding goal, in every new agent prompt.  Calls, events, decisions, and
+manually stored blackboard context remain available.  Values owned by workflow
+nodes are archived and then cleared before the new cycle, preventing an old
+branch or review verdict from satisfying the new cycle accidentally.  Read the
+ordered archive with `gptel-runner-continuations`; each entry includes the
+preceding goal, terminal state, observation, and saved workflow results.
+
+Budget use is cumulative by default.  Add capacity as above, or reset consumed
+accounting while keeping the configured limits:
+
+```elisp
+(gptel-runner-continue my-run "Address my follow-up findings"
+                       :reset-budget t)
+```
+
+Resetting and increasing may be combined.  Unlimited limits stay unlimited.
+An optional `:callback` applies to the next terminal transition.  In the
+dashboard, select a finished run and press `f`; the command asks for the
+observation and whether to keep, reset, or increase its budget.
 
 When the repeat node's own `:max` is exhausted instead, use the repeat-specific
 operation to add more iterations without losing its saved history:

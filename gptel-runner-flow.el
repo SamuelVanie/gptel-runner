@@ -263,6 +263,7 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
          (resolved (if (functionp prompt) (funcall prompt run node) prompt))
          (decisions (and (gptel-runner-decision-memory-p run)
                          (gptel-runner-decisions run)))
+         (continuation (gptel-runner--latest-continuation run))
          (feedback (gethash 'gptel-runner-resume-feedback
                             (gptel-runner-run-blackboard run))))
     (when decisions
@@ -273,6 +274,19 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
              "===============================================\n\n"
              (gptel-runner-format-decisions run)
              "\n\nTreat these decisions as constraints for this stage.")))
+    (when continuation
+      (setq resolved
+            (concat
+             resolved
+             "\n\nHuman follow-up after an earlier workflow cycle"
+             "\n================================================\n\n"
+             (format "Previous goal:\n%s\n\n"
+                     (plist-get continuation :previous-goal))
+             (format "Current observation and goal:\n%s\n\n"
+                     (plist-get continuation :observation))
+             "Continue from the current workspace and take this observation "
+             "into account.  Inspect the actual current state before making "
+             "the changes needed for the current goal.")))
     (if feedback
         (progn
           (remhash 'gptel-runner-resume-feedback
@@ -875,6 +889,116 @@ candidate increments."
         (setf (gptel-runner-run-options run)
               (plist-put (gptel-runner-run-options run)
                          (intern (format ":max-%s" slot)) new))))))
+
+(defun gptel-runner--reset-budget-accounting (run)
+  "Reset RUN's consumed budget while retaining its configured limits."
+  (let ((budget (gptel-runner-run-budget run)))
+    (setf (gptel-runner-budget-requests budget) 0
+          (gptel-runner-budget-calls budget) 0
+          (gptel-runner-run-duration-remaining run)
+          (gptel-runner-budget-max-duration budget))))
+
+(defun gptel-runner--workflow-results (run root)
+  "Return an ordered snapshot of saved results below ROOT in RUN."
+  (let ((missing (make-symbol "missing")) results)
+    (dolist (key (delete-dups (gptel-runner--node-save-keys root)))
+      (let ((value (gethash key (gptel-runner-run-blackboard run) missing)))
+        (unless (eq value missing)
+          (push (cons key (copy-tree value t)) results))))
+    (nreverse results)))
+
+(defun gptel-runner--clear-workflow-results (run root)
+  "Clear values written below ROOT before RUN begins a new goal cycle."
+  (dolist (key (delete-dups (gptel-runner--node-save-keys root)))
+    (unless (memq key (list gptel-runner-decisions-key
+                            gptel-runner-continuations-key))
+      (remhash key (gptel-runner-run-blackboard run)))))
+
+(defun gptel-runner--clear-repeat-progress (run root)
+  "Reset repeat counters and internal progress below ROOT in RUN."
+  (clrhash (gptel-runner-run-iterations run))
+  (cl-labels
+      ((walk
+        (node)
+        (when (eq (gptel-runner-node-kind node) 'repeat)
+          (remhash (list 'gptel-runner-progress
+                         (gptel-runner-node-id node))
+                   (gptel-runner-run-blackboard run)))
+        (mapc #'walk (gptel-runner-node-children node))))
+    (walk root)))
+
+(cl-defun gptel-runner-continue
+    (run observation
+         &key reset-budget additional-requests additional-calls
+         additional-duration callback)
+  "Continue terminal RUN with OBSERVATION as a new goal.
+RUN may be a run object or its displayed string identifier.  OBSERVATION must
+be a non-empty string.  The workspace, decisions, calls, events, and other
+run-local context are retained.  Results written by workflow nodes are first
+archived in `gptel-runner-continuations', then cleared so stale values cannot
+satisfy a branch or repeat in the new cycle.  All workflow nodes and repeat
+counters restart from the beginning.
+
+By default, existing budget accounting and limits remain in effect.  When
+RESET-BUDGET is non-nil, consumed request, call, and duration accounting is
+reset while the configured limits are retained.  Positive
+ADDITIONAL-REQUESTS, ADDITIONAL-CALLS, and ADDITIONAL-DURATION values increase
+the corresponding finite limits and may be combined with RESET-BUDGET.
+Unlimited limits remain unlimited.  When CALLBACK is non-nil, use it for the
+continued run's next terminal transition."
+  (setq run (gptel-runner--resolve-run run))
+  (unless (stringp observation)
+    (user-error "OBSERVATION must be a string"))
+  (setq observation (string-trim observation))
+  (when (string-empty-p observation)
+    (user-error "OBSERVATION cannot be empty"))
+  (gptel-runner--validate-extension-amount
+   additional-requests "ADDITIONAL-REQUESTS" t)
+  (gptel-runner--validate-extension-amount
+   additional-calls "ADDITIONAL-CALLS" t)
+  (gptel-runner--validate-extension-amount
+   additional-duration "ADDITIONAL-DURATION" nil)
+  (unless (gptel-runner--run-terminal-p run)
+    (user-error "Run %s is not finished" (gptel-runner-run-id run)))
+  (let* ((root (gptel-runner-workflow-root
+                (gptel-runner-run-workflow run)))
+         (previous-goal (gptel-runner-run-goal run))
+         (previous-state (gptel-runner-run-state run))
+         (history (gptel-runner-get run gptel-runner-continuations-key))
+         (entry
+          (list :cycle (1+ (length history))
+                :continued-at (float-time)
+                :previous-goal (copy-tree previous-goal t)
+                :previous-state previous-state
+                :terminal-data
+                (copy-tree (gptel-runner-run-terminal-data run) t)
+                :observation observation
+                :results (gptel-runner--workflow-results run root))))
+    (gptel-runner--clear-workflow-results run root)
+    (puthash gptel-runner-continuations-key
+             (append history (list entry))
+             (gptel-runner-run-blackboard run))
+    (remhash 'gptel-runner-resume-feedback
+             (gptel-runner-run-blackboard run))
+    (setf (gptel-runner-run-goal run) observation)
+    (gptel-runner--reset-subtree run root)
+    (gptel-runner--clear-repeat-progress run root)
+    (when reset-budget
+      (gptel-runner--reset-budget-accounting run))
+    (gptel-runner--extend-budget run 'requests additional-requests)
+    (gptel-runner--extend-budget run 'calls additional-calls)
+    (gptel-runner--extend-budget run 'duration additional-duration)
+    (gptel-runner--restart-run
+     run 'run-continued
+     (list :cycle (plist-get entry :cycle)
+           :previous-state previous-state
+           :previous-goal previous-goal
+           :observation observation
+           :reset-budget (and reset-budget t)
+           :additional-requests additional-requests
+           :additional-calls additional-calls
+           :additional-duration additional-duration)
+     callback)))
 
 (cl-defun gptel-runner-extend
     (run &key additional-requests additional-calls additional-duration callback)
