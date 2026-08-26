@@ -45,6 +45,9 @@
   clean up their timers when the dashboard is closed.
 - Preserve each dashboard window's cursor and scroll position across automatic
   and manual refreshes.
+- Add a state-aware transient dashboard action menu, make `RET` open the
+  natural inspection target for the selected row, and keep only the menu,
+  refresh, and normal dashboard navigation keys permanently bound.
 - Fix the built-in reviewer schema so nullable issue fields serialize as valid
   JSON instead of failing reviewer calls with `json-value-p`.
 - Reject empty final agent responses, attempt one stateless repair, and fail

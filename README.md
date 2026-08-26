@@ -91,7 +91,7 @@ disable this automatic prompt propagation.
 Use `M-x gptel-runner-add-decision` to record a decision manually.  In a
 worker buffer it uses the current call as provenance; in the dashboard it uses
 the run or call row at point; elsewhere it prompts for a session-local run.
-The dashboard binds the same command to `e`.
+It is also available as `d` inside the dashboard action menu.
 
 Add `:pause-after t` to an agent step when its successful response must be
 reviewed before the node completes and the next pipeline node starts:
@@ -113,12 +113,22 @@ interval in seconds, or use `nil` to disable automatic refresh:
 ```
 
 Changes take effect on the next refresh; press `g` to apply one immediately.
-The dashboard also uses `RET` to inspect a run journal, `e` to record a
-decision, `v` to visit an agent transcript, `p` to pause a call for feedback,
-`x` to accept its latest response, `P` to pause and snapshot a run, `r` to
-resume it, `R` to retry unsuccessful work without changing its goal, `f` to
-follow up on a finished run, `s` to save a snapshot, `l` to load one, `c` to
-abort a call, and `a` to abort a run.
+The dashboard keeps its permanent keymap small:
+
+| Key | Dashboard action |
+| --- | --- |
+| `RET` | Visit a call transcript, or inspect a run journal |
+| `?` | Open the dashboard action menu |
+| `g` | Refresh the dashboard |
+| `q` | Quit the dashboard |
+
+The action menu groups inspection, call, run, persistence, and management
+commands in a transient popup.  Each action has a visible mnemonic suffix, and
+actions that do not apply to the selected row or its current state are greyed
+out.  For example, `a` accepts a call only while it awaits human feedback,
+whereas `r` resumes an entire paused run.  Snapshot loading, column changes,
+and cleanup remain available in the menu without occupying permanent keys;
+all actions can also be invoked by command name through `M-x`.
 Workflow headers contain their run summary rows, and each run contains its
 agent-call rows; registered workflows with no runs remain visible.  The
 automatic refresh timer is stopped when the dashboard buffer is closed or
@@ -140,22 +150,25 @@ ignored so the table keeps a stable canonical layout:
 
 Available symbols are `workflow`, `run`, `node`, `call`, `state`, `elapsed`,
 `attempts`, `iteration`, `requests`, and `calls`.  Press `g` in an open
-dashboard after changing the variable, or press `V` to toggle one column
-interactively.  The default is deliberately compact, rows stay on one line
-instead of wrapping, and the current row is highlighted.  Values longer than
-their column are shortened with an ellipsis so later columns stay aligned;
-hovering the shortened value shows its complete text.  The spelling
+dashboard after changing the variable, or choose `V` from the `?` action menu
+to toggle one column interactively.  The same action is available as
+`M-x gptel-runner-dashboard-toggle-column`.
+The default is deliberately compact, rows stay on one line instead of
+wrapping, and the current row is highlighted.  Values longer than their column
+are shortened with an ellipsis so later columns stay aligned; hovering the
+shortened value shows its complete text.  The spelling
 `gptel-runner-dashboards-column` is accepted as an alias, although
 `gptel-runner-dashboard-columns` is the preferred option name.
 
-Use `d` on a run or call row to forget that run, `D` on any row in a workflow
-group to unregister the workflow and forget its retained runs, and `C` to
-clear all terminal runs.  Cleanup kills retained worker and event buffers but
-preserves durable snapshots by default.  Use `C-u d`, `C-u D`, or `C-u C` to
-delete the corresponding snapshots as well.  Active runs are protected: pause
-or abort them before cleanup.  Paused runs may be forgotten because their
-snapshot remains recoverable unless snapshot deletion was explicitly chosen.
-Programmatically use `gptel-runner-abort-call` and
+The action menu uses `x` to forget the selected run, `X` to unregister the
+selected workflow and forget its retained runs, and `C` to clear all terminal
+runs.  These commands are also available through `M-x` with the
+`gptel-runner-dashboard-` prefix.  With a prefix argument, they delete the
+corresponding snapshots as well.  Cleanup kills retained worker and event
+buffers but preserves durable snapshots by default.  Active runs are
+protected: pause or abort them before cleanup.  Paused runs may be forgotten
+because their snapshot remains recoverable unless snapshot deletion was
+explicitly chosen.  Programmatically use `gptel-runner-abort-call` and
 `gptel-runner-abort-run`; cleanup is available through
 `gptel-runner-forget-run`, `gptel-runner-forget-workflow`, and
 `gptel-runner-unregister-workflow`.  Every appended `gptel-runner-event` is
@@ -172,13 +185,14 @@ transcript does not alter the run.
 
 ### Human feedback in an agent buffer
 
-Use `M-x gptel-runner-pause-call` in an active worker buffer, or press `p` on
-its dashboard row.  The provider request is stopped without failing the
-workflow node and the buffer becomes an ordinary gptel conversation.  Add
-your correction, use the normal gptel commands to obtain a new response, then
-run `M-x gptel-runner-complete-call-from-buffer`.  An active region is used
-when present; otherwise the latest gptel response is returned to the workflow.
-The workflow then continues from that node's original continuation.
+Use `M-x gptel-runner-pause-call` in an active worker buffer, or select its
+dashboard row and choose `p` from the `?` action menu.  The provider request is
+stopped without failing the workflow node and the buffer becomes an ordinary
+gptel conversation.  Add your correction, use the normal gptel commands to
+obtain a new response, then run
+`M-x gptel-runner-complete-call-from-buffer`.  An active region is used when
+present; otherwise the latest gptel response is returned to the workflow.  The
+workflow then continues from that node's original continuation.
 
 This is deliberately different from `gptel-runner-abort-call`: aborting is a
 terminal cancellation, while pausing enters the `waiting-feedback` state.
@@ -187,16 +201,18 @@ For a planned approval point, put `:pause-after t` on the agent step instead
 of racing to pause it manually.  After the provider returns a non-empty
 response, the call automatically enters `waiting-feedback`; the response has
 not yet completed the node, been stored under `:save-as`, or reached the next
-node.  Visit the transcript with `v`, give the agent feedback with ordinary
-gptel commands, then press `x` on its dashboard row or run
+node.  Choose `v` from the dashboard action menu to visit the transcript, give
+the agent feedback with ordinary gptel commands, then choose `a` from the menu
+or run
 `M-x gptel-runner-complete-call-from-buffer`.  The active region, or otherwise
 the latest gptel response, becomes the actual node result and releases the
 original workflow continuation.  Parsers and validators still apply to that
 accepted result.
 
 The call-level gate keeps the in-memory continuation alive.  For a named
-workflow, you can additionally press `P` to pause and snapshot the whole run;
-completing the retained call in the same Emacs session resumes the run.  A
+workflow, you can additionally choose `P` from the dashboard action menu to
+pause and snapshot the whole run; completing the retained call in the same
+Emacs session resumes the run.  A
 snapshot loaded in a later session has no retained transcript or continuation,
 so the unfinished gated node restarts statelessly on resume.
 
@@ -291,8 +307,8 @@ Previously succeeded nodes and their blackboard results remain complete.  The
 failed, blocked, stalled, or cancelled node is retried, and following sequence
 nodes remain gated until it succeeds.  The function accepts either a run
 object or the string ID displayed in the dashboard.  An optional `:callback`
-applies to the retry's next terminal transition.  Press `R` on a dashboard run
-or call row for the same operation.
+applies to the retry's next terminal transition.  Select a dashboard run or
+call row and choose `t` from its action menu for the same operation.
 
 `gptel-runner-retry` deliberately rejects exhausted request, call, duration,
 and repeat limits because retrying without more capacity would immediately
@@ -340,8 +356,9 @@ accounting while keeping the configured limits:
 
 Resetting and increasing may be combined.  Unlimited limits stay unlimited.
 An optional `:callback` applies to the next terminal transition.  In the
-dashboard, select a finished run and press `f`; the command asks for the
-observation and whether to keep, reset, or increase its budget.
+dashboard, select a finished run and choose `c` from the action menu; the
+command asks for the observation and whether to keep, reset, or increase its
+budget.
 
 When the repeat node's own `:max` is exhausted instead, use the repeat-specific
 operation to add more iterations without losing its saved history:
@@ -414,9 +431,9 @@ reports its eventual result; `gptel-runner-store-save-status` returns `clean`,
 writes are flushed during normal Emacs shutdown; an abnormal exit can lose the
 latest queued progress.
 
-Pause the entire process with `M-x gptel-runner-pause-run` from a worker or
-`P` in the dashboard.  The active-duration clock stops immediately while the
-snapshot finishes asynchronously.
+Pause the entire process with `M-x gptel-runner-pause-run` from a worker, or
+choose `P` from the dashboard action menu.  The active-duration clock stops
+immediately while the snapshot finishes asynchronously.
 
 After restarting Emacs, load the same workflow and agent definitions, then:
 
@@ -430,7 +447,7 @@ After restarting Emacs, load the same workflow and agent definitions, then:
 (gptel-runner-resume-run my-run "Please prefer the smaller public API")
 ```
 
-Alternatively, use `l` and `r` in the dashboard.
+Alternatively, choose `l` and then `r` from the dashboard action menu.
 
 Version 2 snapshots preserve only execution state: the goal, canonical
 workspace, blackboard, completed node states, repeat iterations, budgets, and

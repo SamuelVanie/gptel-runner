@@ -10,6 +10,7 @@
 ;;; Code:
 
 (require 'tabulated-list)
+(require 'transient)
 (require 'gptel-runner-core)
 
 (declare-function gptel-runner-save-run "gptel-runner-store")
@@ -471,6 +472,91 @@ CALL may supply explicit provenance when this function is called from Lisp."
     (_ (when-let ((run (gptel-runner-ui--run-at-point)))
          (gptel-runner-ui--workflow-name run)))))
 
+(defun gptel-runner-ui--run-at-point-p ()
+  "Return non-nil when point represents a dashboard run or call."
+  (and (gptel-runner-ui--run-at-point) t))
+
+(defun gptel-runner-ui--worker-at-point-p ()
+  "Return non-nil when point represents a call with a live worker buffer."
+  (let ((call (gptel-runner-ui--call-at-point)))
+    (and call (buffer-live-p (gptel-runner-call-buffer call)))))
+
+(defun gptel-runner-ui--pausable-call-at-point-p ()
+  "Return non-nil when the call at point can be paused for feedback."
+  (let ((call (gptel-runner-ui--call-at-point)))
+    (and call
+         (not (gptel-runner--call-terminal-p call))
+         (not (memq (gptel-runner-call-state call)
+                    '(paused waiting-feedback))))))
+
+(defun gptel-runner-ui--completable-call-at-point-p ()
+  "Return non-nil when the call at point can accept transcript feedback."
+  (let ((call (gptel-runner-ui--call-at-point)))
+    (and call
+         (memq (gptel-runner-call-state call) '(paused waiting-feedback))
+         (buffer-live-p (gptel-runner-call-buffer call)))))
+
+(defun gptel-runner-ui--abortable-call-at-point-p ()
+  "Return non-nil when the call at point can be aborted."
+  (let ((call (gptel-runner-ui--call-at-point)))
+    (and call (not (gptel-runner--call-terminal-p call)))))
+
+(defun gptel-runner-ui--persistable-run-at-point-p ()
+  "Return non-nil when the run at point has a persistent workflow name."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (and run (gptel-runner-workflow-name
+              (gptel-runner-run-workflow run)))))
+
+(defun gptel-runner-ui--pausable-run-at-point-p ()
+  "Return non-nil when the run at point can be paused."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (and run
+         (gptel-runner-workflow-name (gptel-runner-run-workflow run))
+         (not (gptel-runner--run-terminal-p run))
+         (not (eq (gptel-runner-run-state run) 'paused)))))
+
+(defun gptel-runner-ui--resumable-run-at-point-p ()
+  "Return non-nil when the run at point can be resumed."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (and run (eq (gptel-runner-run-state run) 'paused))))
+
+(defun gptel-runner-ui--retryable-run-at-point-p ()
+  "Return non-nil when the run at point is in a retryable state."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (and run (memq (gptel-runner-run-state run)
+                   '(failed blocked stalled cancelled)))))
+
+(defun gptel-runner-ui--continuable-run-at-point-p ()
+  "Return non-nil when the run at point can be continued with a new goal."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (and run (gptel-runner--run-terminal-p run))))
+
+(defun gptel-runner-ui--abortable-run-at-point-p ()
+  "Return non-nil when the run at point can be aborted."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (and run (not (gptel-runner--run-terminal-p run)))))
+
+(defun gptel-runner-ui--forgettable-run-at-point-p ()
+  "Return non-nil when the run at point can be forgotten safely."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (and run (gptel-runner--forgettable-run-p run))))
+
+(defun gptel-runner-ui--forgettable-workflow-at-point-p ()
+  "Return non-nil when the workflow at point can be forgotten safely."
+  (let ((name (gptel-runner-ui--workflow-name-at-point)))
+    (and name
+         (not
+          (cl-find-if
+           (lambda (run)
+             (and (eq name (gptel-runner-workflow-name
+                            (gptel-runner-run-workflow run)))
+                  (not (gptel-runner--forgettable-run-p run))))
+           (gptel-runner-list-runs))))))
+
+(defun gptel-runner-ui--finished-runs-p ()
+  "Return non-nil when the dashboard retains at least one terminal run."
+  (cl-some #'gptel-runner--run-terminal-p (gptel-runner-list-runs)))
+
 (defun gptel-runner-dashboard-inspect-events ()
   "Display the event journal for the run at point."
   (interactive)
@@ -493,6 +579,14 @@ CALL may supply explicit provenance when this function is called from Lisp."
                           (gptel-runner-event-data event)))))
       (goto-char (point-min))
       (display-buffer (current-buffer)))))
+
+(defun gptel-runner-dashboard-open-at-point ()
+  "Open the natural inspection target for the dashboard row at point.
+Visit a call's worker transcript, or inspect a run's event journal."
+  (interactive)
+  (if (gptel-runner-ui--call-at-point)
+      (gptel-runner-dashboard-visit-worker)
+    (gptel-runner-dashboard-inspect-events)))
 
 (defun gptel-runner-dashboard-visit-worker ()
   "Visit the retained or active worker transcript for the call at point."
@@ -667,24 +761,54 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
       (message "Forgot %d completed run%s"
                (length runs) (if (= (length runs) 1) "" "s")))))
 
+(transient-define-prefix gptel-runner-dashboard-menu ()
+  "Show actions for the selected dashboard row."
+  [["Inspect"
+    ("e" "Event journal" gptel-runner-dashboard-inspect-events
+     :inapt-if-not gptel-runner-ui--run-at-point-p)
+    ("v" "Agent transcript" gptel-runner-dashboard-visit-worker
+     :inapt-if-not gptel-runner-ui--worker-at-point-p)]
+   ["Call"
+    ("p" "Pause for feedback" gptel-runner-dashboard-pause-call
+     :inapt-if-not gptel-runner-ui--pausable-call-at-point-p)
+    ("a" "Accept response" gptel-runner-dashboard-complete-call
+     :inapt-if-not gptel-runner-ui--completable-call-at-point-p)
+    ("k" "Abort call" gptel-runner-dashboard-abort-call
+     :inapt-if-not gptel-runner-ui--abortable-call-at-point-p)]
+   ["Run"
+    ("P" "Pause and snapshot" gptel-runner-dashboard-pause-run
+     :inapt-if-not gptel-runner-ui--pausable-run-at-point-p)
+    ("r" "Resume" gptel-runner-dashboard-resume-run
+     :inapt-if-not gptel-runner-ui--resumable-run-at-point-p)
+    ("t" "Retry" gptel-runner-dashboard-retry-run
+     :inapt-if-not gptel-runner-ui--retryable-run-at-point-p)
+    ("c" "Continue with new goal" gptel-runner-dashboard-continue-run
+     :inapt-if-not gptel-runner-ui--continuable-run-at-point-p)
+    ("K" "Abort run" gptel-runner-dashboard-abort-run
+     :inapt-if-not gptel-runner-ui--abortable-run-at-point-p)]]
+  [["Persistence"
+    ("s" "Save snapshot" gptel-runner-dashboard-save-run
+     :inapt-if-not gptel-runner-ui--persistable-run-at-point-p)
+    ("l" "Load snapshot" gptel-runner-dashboard-load-snapshot)]
+   ["Manage"
+    ("d" "Record decision" gptel-runner-add-decision
+     :inapt-if-not gptel-runner-ui--run-at-point-p)
+    ("V" "Toggle column" gptel-runner-dashboard-toggle-column)
+    ("x" "Forget run" gptel-runner-dashboard-forget-run
+     :inapt-if-not gptel-runner-ui--forgettable-run-at-point-p)
+    ("X" "Forget workflow" gptel-runner-dashboard-forget-workflow
+     :inapt-if-not gptel-runner-ui--forgettable-workflow-at-point-p)
+    ("C" "Clear finished" gptel-runner-dashboard-clear-finished
+     :inapt-if-not gptel-runner-ui--finished-runs-p)
+    ("g" "Refresh" gptel-runner-dashboard-refresh)]])
+
 (let ((map gptel-runner-dashboard-mode-map))
-  (define-key map (kbd "RET") #'gptel-runner-dashboard-inspect-events)
-  (define-key map (kbd "e") #'gptel-runner-add-decision)
-  (define-key map (kbd "v") #'gptel-runner-dashboard-visit-worker)
-  (define-key map (kbd "p") #'gptel-runner-dashboard-pause-call)
-  (define-key map (kbd "x") #'gptel-runner-dashboard-complete-call)
-  (define-key map (kbd "P") #'gptel-runner-dashboard-pause-run)
-  (define-key map (kbd "s") #'gptel-runner-dashboard-save-run)
-  (define-key map (kbd "r") #'gptel-runner-dashboard-resume-run)
-  (define-key map (kbd "R") #'gptel-runner-dashboard-retry-run)
-  (define-key map (kbd "f") #'gptel-runner-dashboard-continue-run)
-  (define-key map (kbd "l") #'gptel-runner-dashboard-load-snapshot)
-  (define-key map (kbd "d") #'gptel-runner-dashboard-forget-run)
-  (define-key map (kbd "D") #'gptel-runner-dashboard-forget-workflow)
-  (define-key map (kbd "C") #'gptel-runner-dashboard-clear-finished)
-  (define-key map (kbd "V") #'gptel-runner-dashboard-toggle-column)
-  (define-key map (kbd "c") #'gptel-runner-dashboard-abort-call)
-  (define-key map (kbd "a") #'gptel-runner-dashboard-abort-run)
+  ;; Clear the historical direct bindings when this file is reevaluated.
+  (dolist (key '("RET" "?" "a" "c" "d" "e" "f" "k" "K" "l"
+                 "p" "P" "r" "R" "s" "t" "v" "V" "x" "C" "D"))
+    (define-key map (kbd key) nil))
+  (define-key map (kbd "RET") #'gptel-runner-dashboard-open-at-point)
+  (define-key map (kbd "?") #'gptel-runner-dashboard-menu)
   (define-key map (kbd "g") #'gptel-runner-dashboard-refresh))
 
 ;;;###autoload
