@@ -17,6 +17,8 @@
 (declare-function gptel-runner-load-run "gptel-runner-store")
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
 (declare-function gptel-runner-continue "gptel-runner-flow")
+(declare-function gptel-runner-extend "gptel-runner-flow")
+(declare-function gptel-runner--exhausted-budget-kinds "gptel-runner-flow")
 (declare-function gptel-runner-retry "gptel-runner-flow")
 (declare-function gptel-runner-complete-call-from-buffer
                   "gptel-runner-gptel")
@@ -531,6 +533,19 @@ CALL may supply explicit provenance when this function is called from Lisp."
   (let ((run (gptel-runner-ui--run-at-point)))
     (and run (gptel-runner--run-terminal-p run))))
 
+(defun gptel-runner-ui--extendable-run-at-point-p ()
+  "Return non-nil when the run at point can have finite budgets extended."
+  (let ((run (gptel-runner-ui--run-at-point)))
+    (when run
+      (let ((state (gptel-runner-run-state run))
+            (budget (gptel-runner-run-budget run)))
+        (if (eq state 'failed)
+            (and (gptel-runner--exhausted-budget-kinds run) t)
+          (and (memq state '(running paused))
+               (or (gptel-runner-budget-max-requests budget)
+                   (gptel-runner-budget-max-calls budget)
+                   (gptel-runner-budget-max-duration budget))))))))
+
 (defun gptel-runner-ui--abortable-run-at-point-p ()
   "Return non-nil when the run at point can be aborted."
   (let ((run (gptel-runner-ui--run-at-point)))
@@ -708,6 +723,16 @@ Visit a call's worker transcript, or inspect a run's event journal."
        (user-error "No run on this row")))
   (revert-buffer))
 
+(defun gptel-runner-dashboard-extend-run ()
+  "Increase finite budgets for the active, paused, or exhausted run at point."
+  (interactive)
+  (let ((run (or (gptel-runner-ui--run-at-point)
+                 (user-error "No run on this row"))))
+    (apply #'gptel-runner-extend run
+           (gptel-runner-ui--budget-additions run))
+    (revert-buffer)
+    (message "Extended limits for %s" (gptel-runner-run-id run))))
+
 (defun gptel-runner-dashboard-load-snapshot (file)
   "Load paused run from snapshot FILE into the dashboard."
   (interactive "fSnapshot file: ")
@@ -782,6 +807,8 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
      :inapt-if-not gptel-runner-ui--resumable-run-at-point-p)
     ("t" "Retry" gptel-runner-dashboard-retry-run
      :inapt-if-not gptel-runner-ui--retryable-run-at-point-p)
+    ("b" "Extend limits" gptel-runner-dashboard-extend-run
+     :inapt-if-not gptel-runner-ui--extendable-run-at-point-p)
     ("c" "Continue with new goal" gptel-runner-dashboard-continue-run
      :inapt-if-not gptel-runner-ui--continuable-run-at-point-p)
     ("K" "Abort run" gptel-runner-dashboard-abort-run
@@ -804,7 +831,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
 
 (let ((map gptel-runner-dashboard-mode-map))
   ;; Clear the historical direct bindings when this file is reevaluated.
-  (dolist (key '("RET" "?" "a" "c" "d" "e" "f" "k" "K" "l"
+  (dolist (key '("RET" "?" "a" "b" "c" "d" "e" "f" "k" "K" "l"
                  "p" "P" "r" "R" "s" "t" "v" "V" "x" "C" "D"))
     (define-key map (kbd key) nil))
   (define-key map (kbd "RET") #'gptel-runner-dashboard-open-at-point)

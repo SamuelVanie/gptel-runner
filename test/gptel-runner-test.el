@@ -645,6 +645,114 @@
         (should (eq (gptel-runner-run-state run) 'succeeded))
         (should (equal (gptel-runner-get run 'result) "second"))))))
 
+(ert-deftest gptel-runner-extend-running-run-without-restarting-work ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'worker '(:manual t :value "first") '(:value "second"))
+      (let* ((run
+              (gptel-runner-start
+               (gptel-runner-sequence
+                :id 'pipeline
+                (gptel-runner-test--step 'first 'worker 'first-result)
+                (gptel-runner-test--step 'second 'worker 'second-result))
+               :driver driver :max-calls 1 :max-requests 1))
+             (active (car (gptel-runner-run-calls run)))
+             (generation (gptel-runner-run-generation run)))
+        (should (eq (gptel-runner-run-state run) 'running))
+        (gptel-runner-extend
+         run :additional-calls 1 :additional-requests 1)
+        (should (eq (gptel-runner-run-state run) 'running))
+        (should (= (gptel-runner-run-generation run) generation))
+        (should (eq (car (gptel-runner-run-active-calls run)) active))
+        (should (= (length (gptel-runner-run-calls run)) 1))
+        (should (= (gptel-runner-budget-max-calls
+                    (gptel-runner-run-budget run)) 2))
+        (should (= (gptel-runner-budget-max-requests
+                    (gptel-runner-run-budget run)) 2))
+        (should
+         (equal (gptel-runner-run-extension-context run)
+                '(:kind run :additional-requests 1 :additional-calls 1)))
+        (gptel-runner-fake-release driver active)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (length (gptel-runner-run-calls run)) 2))
+        (should (equal (gptel-runner-get run 'first-result) "first"))
+        (should (equal (gptel-runner-get run 'second-result) "second"))
+        (should (= (gptel-runner-test--event-count run 'run-extended) 1))
+        (let ((event
+               (cl-find-if
+                (lambda (candidate)
+                  (eq (gptel-runner-event-type candidate) 'run-extended))
+                (gptel-runner-run-events run))))
+          (should (eq (plist-get (gptel-runner-event-data event)
+                                 :previous-state)
+                      'running))
+          (should (plist-member (gptel-runner-event-data event)
+                                :restarted))
+          (should-not (plist-get (gptel-runner-event-data event)
+                                 :restarted)))))))
+
+(ert-deftest gptel-runner-extend-running-duration-replaces-deadline ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'worker '(:manual t :value "done"))
+      (let* ((run
+              (gptel-runner-start
+               (gptel-runner-test--step 'slow 'worker 'result)
+               :driver driver :max-duration 0.05))
+             (call (car (gptel-runner-run-calls run)))
+             (old-timer (gptel-runner-run-duration-timer run)))
+        (accept-process-output nil 0.02)
+        (gptel-runner-extend run :additional-duration 0.2)
+        (should (eq (gptel-runner-run-state run) 'running))
+        (should-not (eq old-timer (gptel-runner-run-duration-timer run)))
+        (should (> (gptel-runner-run-duration-remaining run) 0.2))
+        ;; Let the original deadline pass; only the replacement may expire.
+        (accept-process-output nil 0.05)
+        (should (eq (gptel-runner-run-state run) 'running))
+        (gptel-runner-fake-release driver call)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'result) "done"))))))
+
+(ert-deftest gptel-runner-extend-paused-run-without-resuming-it ()
+  (let* ((callback (lambda (_run)))
+         (run
+          (gptel-runner-run-create
+           :id "paused-run" :state 'paused :events nil
+           :budget (gptel-runner-budget-create
+                    :max-calls 2 :max-duration 10)
+           :duration-remaining 4
+           :extension-context '(:kind run :additional-calls 2)
+           :options '(:max-calls 2 :max-duration 10))))
+    (gptel-runner-extend
+     run :additional-calls 3 :additional-duration 2 :callback callback)
+    (should (eq (gptel-runner-run-state run) 'paused))
+    (should-not (gptel-runner-run-duration-timer run))
+    (should (= (gptel-runner-budget-max-calls
+                (gptel-runner-run-budget run)) 5))
+    (should (= (gptel-runner-budget-max-duration
+                (gptel-runner-run-budget run)) 12))
+    (should (= (gptel-runner-run-duration-remaining run) 6))
+    (should (eq (gptel-runner-run-callback run) callback))
+    (should
+     (equal (gptel-runner-run-extension-context run)
+            '(:kind run :additional-calls 5 :additional-duration 2)))))
+
+(ert-deftest gptel-runner-extend-live-run-requires-a-finite-budget ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'worker '(:manual t))
+      (let ((run (gptel-runner-start
+                  (gptel-runner-test--step 'work 'worker)
+                  :driver driver)))
+        (should-error (gptel-runner-extend run :additional-calls 1)
+                      :type 'user-error)
+        (should (eq (gptel-runner-run-state run) 'running))
+        (gptel-runner-abort-run run)))))
+
 (ert-deftest gptel-runner-repeat-iteration-budget-is-distinct ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
@@ -1969,7 +2077,7 @@
     (should (eq (lookup-key gptel-runner-dashboard-mode-map
                             (kbd (car binding)))
                 (cdr binding))))
-  (dolist (key '("a" "c" "d" "e" "k" "K" "l" "p" "P" "r" "s"
+  (dolist (key '("a" "b" "c" "d" "e" "k" "K" "l" "p" "P" "r" "s"
                  "t" "v" "V" "x" "X" "C"))
     (should-not (lookup-key gptel-runner-dashboard-mode-map (kbd key)))))
 
@@ -2005,6 +2113,7 @@
              ("P" . gptel-runner-dashboard-pause-run)
              ("r" . gptel-runner-dashboard-resume-run)
              ("t" . gptel-runner-dashboard-retry-run)
+             ("b" . gptel-runner-dashboard-extend-run)
              ("c" . gptel-runner-dashboard-continue-run)
              ("K" . gptel-runner-dashboard-abort-run)
              ("s" . gptel-runner-dashboard-save-run)
@@ -2021,7 +2130,9 @@
 
 (ert-deftest gptel-runner-dashboard-menu-actions-follow-row-state ()
   (let* ((workflow (gptel-runner-workflow-create :name 'menu-workflow))
-         (run (gptel-runner-run-create :workflow workflow :state 'paused))
+         (run (gptel-runner-run-create
+               :workflow workflow :state 'paused
+               :budget (gptel-runner-budget-create :max-calls 2)))
          (call (gptel-runner-call-create
                 :run run :state 'waiting-feedback
                 :buffer (current-buffer))))
@@ -2033,16 +2144,23 @@
       (should (gptel-runner-ui--completable-call-at-point-p))
       (should-not (gptel-runner-ui--pausable-call-at-point-p))
       (should (gptel-runner-ui--resumable-run-at-point-p))
+      (should (gptel-runner-ui--extendable-run-at-point-p))
       (should-not (gptel-runner-ui--pausable-run-at-point-p))
       (setf (gptel-runner-call-state call) 'running
             (gptel-runner-run-state run) 'running)
       (should (gptel-runner-ui--pausable-call-at-point-p))
       (should (gptel-runner-ui--pausable-run-at-point-p))
+      (should (gptel-runner-ui--extendable-run-at-point-p))
       (should-not (gptel-runner-ui--completable-call-at-point-p))
       (should-not (gptel-runner-ui--resumable-run-at-point-p))
       (setf (gptel-runner-run-state run) 'failed)
       (should (gptel-runner-ui--retryable-run-at-point-p))
       (should (gptel-runner-ui--continuable-run-at-point-p))
+      (should-not (gptel-runner-ui--extendable-run-at-point-p))
+      (setf (gptel-runner-budget-calls (gptel-runner-run-budget run)) 2
+            (gptel-runner-run-terminal-data run)
+            '(:type budget :kind calls :limit 2))
+      (should (gptel-runner-ui--extendable-run-at-point-p))
       (should-not (gptel-runner-ui--abortable-run-at-point-p)))))
 
 (ert-deftest gptel-runner-dashboard-shows-active-tool-name ()

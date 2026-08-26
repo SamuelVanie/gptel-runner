@@ -280,9 +280,25 @@ iterations cannot mutate earlier list or vector data.  Because the history is
 an ordinary blackboard value, durable snapshots preserve it and downstream
 prompt functions read it with `gptel-runner-get`.
 
-When a run fails because `:max-requests`, `:max-calls`, or `:max-duration` was
-exhausted, increase the exhausted finite budget and continue from its safe
-checkpoint with `gptel-runner-extend`:
+Finite request, call, and active-duration limits can be increased while a run
+is still running or paused:
+
+```elisp
+(gptel-runner-extend my-run
+ :additional-calls 6
+ :additional-requests 8
+ :additional-duration 300)
+```
+
+The new limits take effect immediately without restarting workflow nodes or
+in-flight calls.  Extending active duration replaces the existing deadline
+timer while retaining the time already consumed.  Unlimited budgets remain
+unlimited.  From the dashboard, select a run or call row and choose `b` from
+the action menu to enter additions for its finite limits.
+
+The same function recovers a run that already failed because `:max-requests`,
+`:max-calls`, or `:max-duration` was exhausted.  It increases the exhausted
+finite budget and continues from the safe checkpoint:
 
 ```elisp
 (gptel-runner-extend "run-5"
@@ -290,9 +306,9 @@ checkpoint with `gptel-runner-extend`:
  :additional-requests 8)
 ```
 
-This preserves completed nodes and blackboard values.  Each exhausted budget
-must be increased; the runner reports which keyword is missing rather than
-restarting only to fail at the same limit.
+Recovery preserves completed nodes and blackboard values.  Each exhausted
+budget must be increased; the runner reports which keyword is missing rather
+than restarting only to fail at the same limit.
 
 ### Retry unsuccessful work with the same goal
 

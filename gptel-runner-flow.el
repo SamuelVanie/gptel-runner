@@ -912,6 +912,62 @@ candidate increments."
               (plist-put (gptel-runner-run-options run)
                          (intern (format ":max-%s" slot)) new))))))
 
+(defun gptel-runner--record-live-extension
+    (run additional-requests additional-calls additional-duration)
+  "Record live budget increments in RUN's retained extension context.
+ADDITIONAL-REQUESTS, ADDITIONAL-CALLS, and ADDITIONAL-DURATION are the
+increments to accumulate."
+  (let ((context (copy-sequence
+                  (or (gptel-runner-run-extension-context run)
+                      '(:kind run)))))
+    (dolist (entry `((:additional-requests . ,additional-requests)
+                     (:additional-calls . ,additional-calls)
+                     (:additional-duration . ,additional-duration)))
+      (when (cdr entry)
+        (setq context
+              (plist-put context (car entry)
+                         (+ (or (plist-get context (car entry)) 0)
+                            (cdr entry))))))
+    (setf (gptel-runner-run-extension-context run) context)))
+
+(defun gptel-runner--extend-live-budgets
+    (run state additional-requests additional-calls additional-duration
+         callback)
+  "Extend finite budgets for RUN without restarting it from STATE.
+ADDITIONAL-REQUESTS, ADDITIONAL-CALLS, and ADDITIONAL-DURATION are the
+validated requested increments.
+CALLBACK, when non-nil, replaces the callback for the next terminal state."
+  (let* ((budget (gptel-runner-run-budget run))
+         (requests (and (gptel-runner-budget-max-requests budget)
+                        additional-requests))
+         (calls (and (gptel-runner-budget-max-calls budget)
+                     additional-calls))
+         (duration (and (gptel-runner-budget-max-duration budget)
+                        additional-duration))
+         (clock-running (and duration (eq state 'running))))
+    (unless (or requests calls duration)
+      (user-error "None of the requested budgets has a finite limit"))
+    ;; Account for elapsed active time before replacing the duration timer.
+    (when clock-running
+      (gptel-runner--stop-duration-clock run))
+    (gptel-runner--extend-budget run 'requests requests)
+    (gptel-runner--extend-budget run 'calls calls)
+    (gptel-runner--extend-budget run 'duration duration)
+    (when clock-running
+      (gptel-runner--start-duration-clock run))
+    (gptel-runner--record-live-extension run requests calls duration)
+    (when callback
+      (setf (gptel-runner-run-callback run) callback
+            (gptel-runner-run-callback-called run) nil))
+    (gptel-runner--emit
+     run 'run-extended nil nil
+     (list :previous-state state :restarted nil
+           :additional-requests requests
+           :additional-calls calls
+           :additional-duration duration))
+    (gptel-runner--checkpoint run)
+    run))
+
 (defun gptel-runner--context-extension-for-kind (context kind)
   "Return CONTEXT's previously authorized extension for budget KIND."
   (plist-get context (intern (format ":additional-%s" kind))))
@@ -1135,13 +1191,17 @@ continued run's next terminal transition."
 
 (cl-defun gptel-runner-extend
     (run &key additional-requests additional-calls additional-duration callback)
-  "Continue failed RUN after increasing exhausted run-level budgets.
+  "Increase finite run-level budgets for RUN.
 RUN may be a run object or its displayed string identifier.  Positive
 ADDITIONAL-REQUESTS, ADDITIONAL-CALLS, and ADDITIONAL-DURATION values add to
-the corresponding finite limits.  Every exhausted limit must be extended.
-Completed nodes and blackboard values remain intact; unfinished nodes restart
-from their safe workflow checkpoint.  When CALLBACK is non-nil, use it for the
-extended run's next terminal transition.
+the corresponding finite limits.  A running or paused run is updated in place
+without restarting calls or workflow nodes.  Extending active duration stops
+and replaces its deadline timer so the added time takes effect immediately.
+
+For a failed run, every exhausted limit must be extended.  Completed nodes and
+blackboard values remain intact; unfinished nodes restart from their safe
+workflow checkpoint.  When CALLBACK is non-nil, use it for the run's next
+terminal transition.
 
 This function handles request, call, and duration budget exhaustion.  Use
 `gptel-runner-extend-repeat' when a repeat node exhausted its `:max'."
@@ -1154,37 +1214,44 @@ This function handles request, call, and duration budget exhaustion.  Use
    additional-duration "ADDITIONAL-DURATION" nil)
   (unless (or additional-requests additional-calls additional-duration)
     (user-error "Provide at least one positive budget extension"))
-  (unless (eq (gptel-runner-run-state run) 'failed)
-    (user-error "Run %s is not failed" (gptel-runner-run-id run)))
-  (let ((exhausted (gptel-runner--exhausted-budget-kinds run)))
-    (unless exhausted
-      (if (let ((failure (gptel-runner--terminal-failure-data run)))
-            (and (listp failure)
-                 (eq (plist-get failure :type) 'iteration-budget)))
-          (user-error
-           "Run exhausted a repeat limit; use gptel-runner-extend-repeat")
-        (user-error "Run %s did not exhaust a run-level budget"
-                    (gptel-runner-run-id run))))
-    (dolist (kind exhausted)
-      (unless (gptel-runner--extension-for-kind
-               kind additional-requests additional-calls additional-duration)
-        (user-error "Run exhausted %s; provide :additional-%s"
-                    kind kind)))
-    (setf (gptel-runner-run-extension-context run)
-          (list :kind 'run
-                :additional-requests additional-requests
-                :additional-calls additional-calls
-                :additional-duration additional-duration))
-    (gptel-runner--extend-budget run 'requests additional-requests)
-    (gptel-runner--extend-budget run 'calls additional-calls)
-    (gptel-runner--extend-budget run 'duration additional-duration)
-    (gptel-runner--restart-run
-     run 'run-extended
-     (list :exhausted exhausted
-           :additional-requests additional-requests
-           :additional-calls additional-calls
-           :additional-duration additional-duration)
-     callback)))
+  (let ((state (gptel-runner-run-state run)))
+    (if (memq state '(running paused))
+        (gptel-runner--extend-live-budgets
+         run state additional-requests additional-calls additional-duration
+         callback)
+      (unless (eq state 'failed)
+        (user-error "Run %s cannot be extended from state %s"
+                    (gptel-runner-run-id run) state))
+      (let ((exhausted (gptel-runner--exhausted-budget-kinds run)))
+        (unless exhausted
+          (if (let ((failure (gptel-runner--terminal-failure-data run)))
+                (and (listp failure)
+                     (eq (plist-get failure :type) 'iteration-budget)))
+              (user-error
+               "Run exhausted a repeat limit; use gptel-runner-extend-repeat")
+            (user-error "Run %s did not exhaust a run-level budget"
+                        (gptel-runner-run-id run))))
+        (dolist (kind exhausted)
+          (unless (gptel-runner--extension-for-kind
+                   kind additional-requests additional-calls
+                   additional-duration)
+            (user-error "Run exhausted %s; provide :additional-%s"
+                        kind kind)))
+        (setf (gptel-runner-run-extension-context run)
+              (list :kind 'run
+                    :additional-requests additional-requests
+                    :additional-calls additional-calls
+                    :additional-duration additional-duration))
+        (gptel-runner--extend-budget run 'requests additional-requests)
+        (gptel-runner--extend-budget run 'calls additional-calls)
+        (gptel-runner--extend-budget run 'duration additional-duration)
+        (gptel-runner--restart-run
+         run 'run-extended
+         (list :exhausted exhausted
+               :additional-requests additional-requests
+               :additional-calls additional-calls
+               :additional-duration additional-duration)
+         callback)))))
 
 (cl-defun gptel-runner-extend-repeat
     (run node-id additional-iterations

@@ -20,8 +20,9 @@
   command for recording decisions from worker buffers or the dashboard.
 - Add `gptel-runner-extend-repeat` to continue iteration-budget failures while
   preserving saved history and using a run-local, durable repeat limit.
-- Add `gptel-runner-extend` for continuing persisted request, call, or duration
-  budget failures, and retain terminal failure details in snapshots.
+- Add `gptel-runner-extend` for increasing request, call, or duration budgets
+  on running and paused runs without restarting work, as well as continuing
+  persisted budget failures, and retain terminal failure details in snapshots.
 - Add `gptel-runner-continue` and dashboard follow-ups for rerunning a finished
   pipeline with a human observation as its new goal, archived prior results,
   and optional budget reset or growth.
