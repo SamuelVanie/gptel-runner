@@ -16,6 +16,7 @@
 (declare-function gptel-runner-load-run "gptel-runner-store")
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
 (declare-function gptel-runner-continue "gptel-runner-flow")
+(declare-function gptel-runner-retry "gptel-runner-flow")
 (declare-function gptel-runner-complete-call-from-buffer
                   "gptel-runner-gptel")
 
@@ -533,6 +534,14 @@ CALL may supply explicit provenance when this function is called from Lisp."
     (apply #'gptel-runner-continue run observation arguments)
     (revert-buffer)))
 
+(defun gptel-runner-dashboard-retry-run ()
+  "Retry the unsuccessful run at point without changing its goal."
+  (interactive)
+  (gptel-runner-retry
+   (or (gptel-runner-ui--run-at-point)
+       (user-error "No run on this row")))
+  (revert-buffer))
+
 (defun gptel-runner-dashboard-load-snapshot (file)
   "Load paused run from snapshot FILE into the dashboard."
   (interactive "fSnapshot file: ")
@@ -595,6 +604,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
   (define-key map (kbd "P") #'gptel-runner-dashboard-pause-run)
   (define-key map (kbd "s") #'gptel-runner-dashboard-save-run)
   (define-key map (kbd "r") #'gptel-runner-dashboard-resume-run)
+  (define-key map (kbd "R") #'gptel-runner-dashboard-retry-run)
   (define-key map (kbd "f") #'gptel-runner-dashboard-continue-run)
   (define-key map (kbd "l") #'gptel-runner-dashboard-load-snapshot)
   (define-key map (kbd "d") #'gptel-runner-dashboard-forget-run)

@@ -116,8 +116,9 @@ Changes take effect on the next refresh; press `g` to apply one immediately.
 The dashboard also uses `RET` to inspect a run journal, `e` to record a
 decision, `v` to visit an agent transcript, `p` to pause a call for feedback,
 `x` to accept its latest response, `P` to pause and snapshot a run, `r` to
-resume it, `f` to follow up on a finished run, `s` to save a snapshot, `l` to
-load one, `c` to abort a call, and `a` to abort a run.
+resume it, `R` to retry unsuccessful work without changing its goal, `f` to
+follow up on a finished run, `s` to save a snapshot, `l` to load one, `c` to
+abort a call, and `a` to abort a run.
 Workflow headers contain their run summary rows, and each run contains its
 agent-call rows; registered workflows with no runs remain visible.  The
 automatic refresh timer is stopped when the dashboard buffer is closed or
@@ -276,6 +277,27 @@ checkpoint with `gptel-runner-extend`:
 This preserves completed nodes and blackboard values.  Each exhausted budget
 must be increased; the runner reports which keyword is missing rather than
 restarting only to fail at the same limit.
+
+### Retry unsuccessful work with the same goal
+
+When a run failed for a reason other than an exhausted run or repeat budget,
+retry its safe checkpoint without changing the goal:
+
+```elisp
+(gptel-runner-retry "run-17")
+```
+
+Previously succeeded nodes and their blackboard results remain complete.  The
+failed, blocked, stalled, or cancelled node is retried, and following sequence
+nodes remain gated until it succeeds.  The function accepts either a run
+object or the string ID displayed in the dashboard.  An optional `:callback`
+applies to the retry's next terminal transition.  Press `R` on a dashboard run
+or call row for the same operation.
+
+`gptel-runner-retry` deliberately rejects exhausted request, call, duration,
+and repeat limits because retrying without more capacity would immediately
+fail again.  Use `gptel-runner-extend` for run-level budgets or
+`gptel-runner-extend-repeat` for a repeat limit.
 
 ### Follow up after a finished pipeline
 

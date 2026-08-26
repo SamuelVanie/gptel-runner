@@ -28,6 +28,8 @@
 - Make continuation of unsuccessful runs retry the failed or unfinished safe
   checkpoint before dispatching later nodes, while successful runs still begin
   a fresh full workflow cycle.
+- Add `gptel-runner-retry` and a dashboard command for retrying unsuccessful
+  work from its safe checkpoint without changing the run goal.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
 - Show active tool calls in the dashboard as `Calling TOOL-NAME...` using a

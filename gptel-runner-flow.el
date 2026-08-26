@@ -750,6 +750,22 @@ CALLBACK runs exactly once with the terminal run."
        (puthash id 'pending (gptel-runner-run-node-states run))))
    (gptel-runner-run-node-states run)))
 
+(defun gptel-runner--prepare-terminal-repeat-bodies (run root)
+  "Reset completed repeat bodies in RUN that made ROOT blocked or stalled.
+Other failed composite nodes retain their successful descendants so execution
+can resume at the narrowest safe checkpoint."
+  (cl-labels
+      ((walk
+        (node)
+        (if (and (eq (gptel-runner-node-kind node) 'repeat)
+                 (memq (gethash (gptel-runner-node-id node)
+                                (gptel-runner-run-node-states run))
+                       '(blocked stalled)))
+            (gptel-runner--reset-subtree
+             run (plist-get (gptel-runner-node-properties node) :body))
+          (mapc #'walk (gptel-runner-node-children node)))))
+    (walk root)))
+
 (defun gptel-runner--supersede-paused-calls (run)
   "Mark every unfinished historical call skipped before resuming RUN."
   (dolist (call (gptel-runner-run-calls run))
@@ -768,6 +784,8 @@ When CALLBACK is non-nil, replace the previous terminal callback with it."
     (setf (gptel-runner-run-callback run) callback
           (gptel-runner-run-callback-called run) nil))
   (gptel-runner--supersede-paused-calls run)
+  (gptel-runner--prepare-terminal-repeat-bodies
+   run (gptel-runner-workflow-root (gptel-runner-run-workflow run)))
   (gptel-runner--prepare-node-states-for-resume run)
   (cl-incf (gptel-runner-run-generation run))
   (setf (gptel-runner-run-state run) 'running
@@ -854,6 +872,40 @@ finite limits whose accounting has reached the limit."
              (numberp (gptel-runner-run-duration-remaining run))
              (<= (gptel-runner-run-duration-remaining run) 0)
              'duration)))))))
+
+(cl-defun gptel-runner-retry (run &key callback)
+  "Retry unsuccessful RUN from its safe checkpoint without changing its goal.
+RUN may be a run object or its displayed string identifier.  Nodes that have
+already succeeded and their blackboard results remain complete.  The failed,
+blocked, stalled, or cancelled checkpoint is reset and retried; later skipped
+nodes remain gated until it succeeds.
+
+Budget-exhaustion failures must use `gptel-runner-extend'.  Repeat-limit
+failures must use `gptel-runner-extend-repeat'.  When CALLBACK is non-nil, use
+it for the retried run's next terminal transition."
+  (setq run (gptel-runner--resolve-run run))
+  (let ((state (gptel-runner-run-state run)))
+    (unless (memq state '(failed blocked stalled cancelled))
+      (user-error "Run %s is not retryable from state %s"
+                  (gptel-runner-run-id run) state))
+    (when (eq state 'failed)
+      (let ((failure (gptel-runner--terminal-failure-data run))
+            (budgets (gptel-runner--exhausted-budget-kinds run)))
+        (when budgets
+          (user-error
+           (concat "Run exhausted budget %S; use gptel-runner-extend "
+                   "with the corresponding :additional-* value")
+           budgets))
+        (when (and (listp failure)
+                   (eq (plist-get failure :type) 'iteration-budget))
+          (user-error
+           (concat "Run exhausted a repeat limit; use "
+                   "gptel-runner-extend-repeat")))))
+    (gptel-runner--restart-run
+     run 'run-retried
+     (list :previous-state state
+           :goal (gptel-runner-run-goal run))
+     callback)))
 
 (defun gptel-runner--extension-for-kind
     (kind additional-requests additional-calls additional-duration)
