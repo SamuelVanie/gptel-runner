@@ -43,6 +43,8 @@
   while exposing their complete text as hover help.
 - Refresh open dashboards automatically at a user-configurable interval and
   clean up their timers when the dashboard is closed.
+- Preserve each dashboard window's cursor and scroll position across automatic
+  and manual refreshes.
 - Fix the built-in reviewer schema so nullable issue fields serialize as valid
   JSON instead of failing reviewer calls with `json-value-p`.
 - Reject empty final agent responses, attempt one stateless repair, and fail

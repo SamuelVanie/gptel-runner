@@ -2047,6 +2047,56 @@
       (with-temp-buffer
         (should-error (gptel-runner-dashboard-mode) :type 'user-error)))))
 
+(ert-deftest gptel-runner-dashboard-refresh-preserves-window-position ()
+  (let ((gptel-runner-dashboard-refresh-interval nil)
+        (gptel-runner-dashboard-columns '(workflow state))
+        (dashboard (generate-new-buffer " *gptel-runner-dashboard-test*"))
+        (other (generate-new-buffer " *gptel-runner-other-test*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((other-window (selected-window))
+                 (dashboard-window (split-window other-window))
+                 point-id start-id)
+            (set-window-buffer other-window other)
+            (set-window-buffer dashboard-window dashboard)
+            (with-current-buffer dashboard
+              (gptel-runner-dashboard-mode)
+              (setq tabulated-list-entries
+                    (mapcar
+                     (lambda (number)
+                       (list (list 'workflow number)
+                             (vector (format "workflow-%d" number) "1 run")))
+                     (number-sequence 1 40)))
+              (tabulated-list-print)
+              (goto-char (point-min))
+              (forward-line 15)
+              (set-window-start dashboard-window (point) t)
+              (setq start-id (tabulated-list-get-id))
+              (forward-line 5)
+              (move-to-column 7)
+              (set-window-point dashboard-window (point))
+              (setq point-id (tabulated-list-get-id))
+              ;; A non-selected window has its own point, distinct from the
+              ;; buffer point used by the timer callback.
+              (goto-char (point-min)))
+            (gptel-runner-dashboard--refresh-buffer dashboard)
+            (with-current-buffer dashboard
+              (should (equal
+                       (get-text-property (window-point dashboard-window)
+                                          'tabulated-list-id)
+                       point-id))
+              (should (= (save-excursion
+                           (goto-char (window-point dashboard-window))
+                           (current-column))
+                         7))
+              (should (equal
+                       (get-text-property (window-start dashboard-window)
+                                          'tabulated-list-id)
+                       start-id)))))
+      (kill-buffer dashboard)
+      (kill-buffer other))))
+
 (ert-deftest gptel-runner-forget-run-and-workflow-clean-session-noise ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)

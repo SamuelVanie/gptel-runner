@@ -284,6 +284,77 @@ An elided value retains its complete unpropertized text as hover help."
                interval interval #'gptel-runner-dashboard--refresh-buffer
                (current-buffer)))))))
 
+(defun gptel-runner-dashboard--position-state (position)
+  "Capture dashboard location information at buffer POSITION."
+  (save-excursion
+    (goto-char position)
+    (list :id (tabulated-list-get-id)
+          :line (line-number-at-pos)
+          :column (current-column))))
+
+(defun gptel-runner-dashboard--position-from-state (state)
+  "Return the buffer position described by dashboard location STATE."
+  (save-excursion
+    (let ((id (plist-get state :id))
+          found)
+      (when id
+        (goto-char (point-min))
+        (while (and (< (point) (point-max))
+                    (not (equal id (tabulated-list-get-id))))
+          (goto-char
+           (next-single-property-change
+            (point) 'tabulated-list-id nil (point-max))))
+        (setq found (equal id (tabulated-list-get-id))))
+      (unless found
+        (goto-char (point-min))
+        (forward-line (1- (plist-get state :line))))
+      (move-to-column (plist-get state :column))
+      (point))))
+
+(defun gptel-runner-dashboard--window-states ()
+  "Capture positions of windows currently displaying this dashboard."
+  (mapcar
+   (lambda (window)
+     (list :window window
+           :point (gptel-runner-dashboard--position-state
+                   (window-point window))
+           :start (gptel-runner-dashboard--position-state
+                   (window-start window))
+           :hscroll (window-hscroll window)
+           :vscroll (window-vscroll window t)))
+   (get-buffer-window-list (current-buffer) nil t)))
+
+(defun gptel-runner-dashboard--restore-window-states (states)
+  "Restore dashboard window positions captured in STATES."
+  (dolist (state states)
+    (let ((window (plist-get state :window)))
+      (when (and (window-live-p window)
+                 (eq (window-buffer window) (current-buffer)))
+        (set-window-point
+         window
+         (gptel-runner-dashboard--position-from-state
+          (plist-get state :point)))
+        (set-window-start
+         window
+         (gptel-runner-dashboard--position-from-state
+          (plist-get state :start))
+         t)
+        (set-window-hscroll window (plist-get state :hscroll))
+        (set-window-vscroll window (plist-get state :vscroll) t)))))
+
+(defun gptel-runner-dashboard--print ()
+  "Print the dashboard without moving its buffer or window positions."
+  (let ((point-state (gptel-runner-dashboard--position-state (point)))
+        (window-states (gptel-runner-dashboard--window-states)))
+    (tabulated-list-print t)
+    (gptel-runner-dashboard--restore-window-states window-states)
+    (goto-char (gptel-runner-dashboard--position-from-state point-state))))
+
+(defun gptel-runner-dashboard--revert (&rest _ignored)
+  "Refresh the dashboard in response to `revert-buffer'."
+  (run-hooks 'tabulated-list-revert-hook)
+  (gptel-runner-dashboard-refresh))
+
 (define-derived-mode gptel-runner-dashboard-mode tabulated-list-mode
   "Runner-Dashboard"
   "Major mode for inspecting session-local gptel-runner state."
@@ -291,6 +362,7 @@ An elided value retains its complete unpropertized text as hover help."
         tabulated-list-padding 2
         tabulated-list-entries #'gptel-runner-ui--entries)
   (setq-local truncate-lines t)
+  (setq-local revert-buffer-function #'gptel-runner-dashboard--revert)
   (add-hook 'change-major-mode-hook
             #'gptel-runner-dashboard--cancel-refresh-timer nil t)
   (add-hook 'kill-buffer-hook
@@ -305,7 +377,7 @@ An elided value retains its complete unpropertized text as hover help."
   (gptel-runner-dashboard--configure-refresh-timer)
   (setq tabulated-list-format (gptel-runner-ui--format))
   (tabulated-list-init-header)
-  (tabulated-list-print t))
+  (gptel-runner-dashboard--print))
 
 (defun gptel-runner-dashboard-toggle-column (column)
   "Toggle visibility of dashboard COLUMN and refresh the table."
@@ -559,7 +631,7 @@ With prefix argument DELETE-SNAPSHOT, also delete its durable snapshot."
            (format "Forget run %s%s? " id
                    (if delete-snapshot " and delete its snapshot" "")))
       (gptel-runner-forget-run run delete-snapshot)
-      (tabulated-list-print t)
+      (gptel-runner-dashboard-refresh)
       (message "Forgot run %s" id))))
 
 (defun gptel-runner-dashboard-forget-workflow (&optional delete-snapshots)
@@ -574,7 +646,7 @@ Active runs prevent the operation."
            (format "Unregister workflow %S, forget its runs%s? "
                    name (if delete-snapshots ", and delete snapshots" "")))
       (gptel-runner-forget-workflow name delete-snapshots)
-      (tabulated-list-print t)
+      (gptel-runner-dashboard-refresh)
       (message "Forgot workflow %S" name))))
 
 (defun gptel-runner-dashboard-clear-finished (&optional delete-snapshots)
@@ -591,7 +663,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
                    (if delete-snapshots " and delete their snapshots" "")))
       (dolist (run runs)
         (gptel-runner-forget-run run delete-snapshots))
-      (tabulated-list-print t)
+      (gptel-runner-dashboard-refresh)
       (message "Forgot %d completed run%s"
                (length runs) (if (= (length runs) 1) "" "s")))))
 
