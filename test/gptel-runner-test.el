@@ -619,6 +619,32 @@
                       (car (gptel-runner-run-calls run))) :type)
                     'budget))))))
 
+(ert-deftest gptel-runner-extend-requires-every-budget-at-limit ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'worker '(:value "first") '(:value "second"))
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-sequence
+               :id 'pipeline
+               (gptel-runner-test--step 'first 'worker)
+               (gptel-runner-test--step 'second 'worker 'result))
+              :driver driver :max-calls 1 :max-requests 1)))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (let ((error
+               (should-error
+                (gptel-runner-extend run :additional-calls 1)
+                :type 'user-error)))
+          (should (string-match-p ":additional-requests"
+                                  (error-message-string error))))
+        (should-not (gptel-runner-run-extension-context run))
+        (gptel-runner-extend
+         run :additional-calls 1 :additional-requests 1)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'result) "second"))))))
+
 (ert-deftest gptel-runner-repeat-iteration-budget-is-distinct ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
@@ -974,6 +1000,77 @@
         (should (equal (gptel-runner-get run 'following-result) "finished"))
         (should (= initial-callbacks 1))
         (should (= retry-callbacks 1))
+        (should (= (gptel-runner-test--event-count run 'run-retried) 1))))))
+
+(ert-deftest gptel-runner-retry-reapplies-consumed-run-extension ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'worker
+       '(:value "first")
+       '(:status permanent :value "extension failed")
+       '(:value "recovered"))
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-sequence
+               :id 'pipeline
+               (gptel-runner-test--step 'first 'worker 'first-result)
+               (gptel-runner-test--step 'second 'worker 'second-result))
+              :goal "Keep trying" :driver driver :max-calls 1)))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (gptel-runner-extend run :additional-calls 1)
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should (eq (plist-get (gptel-runner-run-terminal-data run) :type)
+                    'permanent))
+        (should (= (gptel-runner-budget-calls
+                    (gptel-runner-run-budget run)) 2))
+        (should (= (gptel-runner-budget-max-calls
+                    (gptel-runner-run-budget run)) 2))
+        (gptel-runner-retry run)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'first-result) "first"))
+        (should (equal (gptel-runner-get run 'second-result) "recovered"))
+        (should (= (gptel-runner-budget-calls
+                    (gptel-runner-run-budget run)) 3))
+        (should (= (gptel-runner-budget-max-calls
+                    (gptel-runner-run-budget run)) 3))
+        (should (= (gptel-runner-test--event-count run 'run-extended) 1))
+        (should (= (gptel-runner-test--event-count run 'run-retried) 1))
+        (let ((event
+               (cl-find-if
+                (lambda (candidate)
+                  (eq (gptel-runner-event-type candidate) 'run-retried))
+                (gptel-runner-run-events run) :from-end t)))
+          (should
+           (equal (plist-get (gptel-runner-event-data event)
+                             :reapplied-extension)
+                  '(:additional-calls 1))))))))
+
+(ert-deftest gptel-runner-retry-reapplies-consumed-repeat-extension ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'worker
+       '(:value "revise") '(:value "revise") '(:value "pass"))
+      (let* ((repeat
+              (gptel-runner-repeat-until
+               :id 'cycle :max 1
+               :until (lambda (run)
+                        (equal (gptel-runner-get run 'result) "pass"))
+               :body (gptel-runner-test--step 'work 'worker 'result)))
+             (run (gptel-runner-start repeat :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (gptel-runner-extend-repeat run 'cycle 1)
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should (= (gptel-runner--repeat-limit run repeat) 2))
+        (gptel-runner-retry run)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (gptel-runner--repeat-limit run repeat) 3))
+        (should (= (gptel-runner-iteration run 'cycle) 3))
+        (should (equal (gptel-runner-get run 'result) "pass"))
+        (should (= (gptel-runner-test--event-count run 'repeat-extended) 1))
         (should (= (gptel-runner-test--event-count run 'run-retried) 1))))))
 
 (ert-deftest gptel-runner-retry-rejects-ineligible-and-budget-failed-runs ()
@@ -1523,6 +1620,13 @@
                   (let ((restored
                          (gptel-runner-load-run file nil restored-driver)))
                     (should (eq (gptel-runner-run-state restored) 'failed))
+                    (should
+                     (equal
+                      (gptel-runner-run-extension-context restored)
+                      '(:kind repeat :node-id cycle
+                        :additional-iterations 1
+                        :additional-requests nil :additional-calls nil
+                        :additional-duration nil)))
                     (should (= (gethash
                                 'cycle
                                 (gptel-runner-run-repeat-limits restored))

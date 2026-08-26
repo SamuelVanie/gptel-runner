@@ -30,6 +30,8 @@
   a fresh full workflow cycle.
 - Add `gptel-runner-retry` and a dashboard command for retrying unsuccessful
   work from its safe checkpoint without changing the run goal.
+- Make retry reuse the previous budget or repeat increment when an extended
+  run fails after consuming that newly added capacity.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM
   and the runner leaves `waiting-confirmation`.
 - Show active tool calls in the dashboard as `Calling TOOL-NAME...` using a

@@ -846,66 +846,36 @@ Require an integer when INTEGER-ONLY is non-nil."
                    (gptel-runner-run-events run) :from-end t)))
         (gptel-runner-event-data event))))
 
+(defun gptel-runner--budget-kinds-at-limit (run)
+  "Return finite run-level budget kinds with no capacity left in RUN."
+  (let ((budget (gptel-runner-run-budget run)))
+    (delq
+     nil
+     (list
+      (and (gptel-runner-budget-max-requests budget)
+           (>= (gptel-runner-budget-requests budget)
+               (gptel-runner-budget-max-requests budget))
+           'requests)
+      (and (gptel-runner-budget-max-calls budget)
+           (>= (gptel-runner-budget-calls budget)
+               (gptel-runner-budget-max-calls budget))
+           'calls)
+      (and (gptel-runner-budget-max-duration budget)
+           (numberp (gptel-runner-run-duration-remaining run))
+           (<= (gptel-runner-run-duration-remaining run) 0)
+           'duration)))))
+
 (defun gptel-runner--exhausted-budget-kinds (run)
   "Return run-level budget kinds exhausted by failed RUN.
 For snapshots written before terminal data was retained, infer exhaustion from
 finite limits whose accounting has reached the limit."
   (let ((failure (gptel-runner--terminal-failure-data run))
-        (budget (gptel-runner-run-budget run)))
+        (at-limit (gptel-runner--budget-kinds-at-limit run)))
     (cond
      ((and (listp failure) (eq (plist-get failure :type) 'budget))
-      (list (plist-get failure :kind)))
+      (delete-dups (cons (plist-get failure :kind) at-limit)))
      (failure nil)
-     (t
-      (delq
-       nil
-       (list
-        (and (gptel-runner-budget-max-requests budget)
-             (>= (gptel-runner-budget-requests budget)
-                 (gptel-runner-budget-max-requests budget))
-             'requests)
-        (and (gptel-runner-budget-max-calls budget)
-             (>= (gptel-runner-budget-calls budget)
-                 (gptel-runner-budget-max-calls budget))
-             'calls)
-        (and (gptel-runner-budget-max-duration budget)
-             (numberp (gptel-runner-run-duration-remaining run))
-             (<= (gptel-runner-run-duration-remaining run) 0)
-             'duration)))))))
-
-(cl-defun gptel-runner-retry (run &key callback)
-  "Retry unsuccessful RUN from its safe checkpoint without changing its goal.
-RUN may be a run object or its displayed string identifier.  Nodes that have
-already succeeded and their blackboard results remain complete.  The failed,
-blocked, stalled, or cancelled checkpoint is reset and retried; later skipped
-nodes remain gated until it succeeds.
-
-Budget-exhaustion failures must use `gptel-runner-extend'.  Repeat-limit
-failures must use `gptel-runner-extend-repeat'.  When CALLBACK is non-nil, use
-it for the retried run's next terminal transition."
-  (setq run (gptel-runner--resolve-run run))
-  (let ((state (gptel-runner-run-state run)))
-    (unless (memq state '(failed blocked stalled cancelled))
-      (user-error "Run %s is not retryable from state %s"
-                  (gptel-runner-run-id run) state))
-    (when (eq state 'failed)
-      (let ((failure (gptel-runner--terminal-failure-data run))
-            (budgets (gptel-runner--exhausted-budget-kinds run)))
-        (when budgets
-          (user-error
-           (concat "Run exhausted budget %S; use gptel-runner-extend "
-                   "with the corresponding :additional-* value")
-           budgets))
-        (when (and (listp failure)
-                   (eq (plist-get failure :type) 'iteration-budget))
-          (user-error
-           (concat "Run exhausted a repeat limit; use "
-                   "gptel-runner-extend-repeat")))))
-    (gptel-runner--restart-run
-     run 'run-retried
-     (list :previous-state state
-           :goal (gptel-runner-run-goal run))
-     callback)))
+     (t at-limit))))
 
 (defun gptel-runner--extension-for-kind
     (kind additional-requests additional-calls additional-duration)
@@ -941,6 +911,106 @@ candidate increments."
         (setf (gptel-runner-run-options run)
               (plist-put (gptel-runner-run-options run)
                          (intern (format ":max-%s" slot)) new))))))
+
+(defun gptel-runner--context-extension-for-kind (context kind)
+  "Return CONTEXT's previously authorized extension for budget KIND."
+  (plist-get context (intern (format ":additional-%s" kind))))
+
+(defun gptel-runner--reapply-extension-budgets (run context kinds)
+  "Reapply CONTEXT's budget increments for exhausted KINDS in RUN.
+Return an ordered plist describing the increments that were reapplied."
+  (let (reapplied)
+    (dolist (kind kinds)
+      (let ((amount (gptel-runner--context-extension-for-kind context kind)))
+        (gptel-runner--extend-budget run kind amount)
+        (setq reapplied
+              (plist-put reapplied
+                         (intern (format ":additional-%s" kind)) amount))))
+    reapplied))
+
+(defun gptel-runner--repeat-context-node (run context failure)
+  "Return the repeat node in CONTEXT when FAILURE exhausted it in RUN."
+  (when (and (eq (plist-get failure :type) 'iteration-budget)
+             (eq (plist-get context :kind) 'repeat))
+    (let* ((root (gptel-runner-workflow-root
+                  (gptel-runner-run-workflow run)))
+           (node-id (plist-get context :node-id))
+           (node (gptel-runner--find-node root node-id)))
+      (when (and node
+                 (eq (gptel-runner-node-kind node) 'repeat)
+                 (eq (gethash node-id (gptel-runner-run-node-states run))
+                     'failed)
+                 (>= (gptel-runner-iteration run node-id)
+                     (gptel-runner--repeat-limit run node)))
+        node))))
+
+(cl-defun gptel-runner-retry (run &key callback)
+  "Retry unsuccessful RUN from its safe checkpoint without changing its goal.
+RUN may be a run object or its displayed string identifier.  Nodes that have
+already succeeded and their blackboard results remain complete.  The failed,
+blocked, stalled, or cancelled checkpoint is reset and retried; later skipped
+nodes remain gated until it succeeds.
+
+Budget-exhaustion failures must normally use `gptel-runner-extend', and repeat
+limits must normally use `gptel-runner-extend-repeat'.  When the failed work
+was started by either extension command, retry reuses that command's increment
+for any capacity that the failed attempt exhausted.  When CALLBACK is non-nil,
+use it for the retried run's next terminal transition."
+  (setq run (gptel-runner--resolve-run run))
+  (let ((state (gptel-runner-run-state run)))
+    (unless (memq state '(failed blocked stalled cancelled))
+      (user-error "Run %s is not retryable from state %s"
+                  (gptel-runner-run-id run) state))
+    (let* ((failure (and (eq state 'failed)
+                         (gptel-runner--terminal-failure-data run)))
+           (budgets (and (eq state 'failed)
+                         (gptel-runner--budget-kinds-at-limit run)))
+           (context (gptel-runner-run-extension-context run))
+           (missing
+            (cl-remove-if
+             (lambda (kind)
+               (gptel-runner--context-extension-for-kind context kind))
+             budgets))
+           (repeat-node
+            (and failure
+                 (gptel-runner--repeat-context-node run context failure)))
+           (repeat-failure
+            (and (listp failure)
+                 (eq (plist-get failure :type) 'iteration-budget))))
+      ;; Validate every needed increment before mutating any limit.
+      (when (and budgets missing)
+        (user-error
+         (concat "Run exhausted budget %S; use gptel-runner-extend "
+                 "with the corresponding :additional-* value")
+         budgets))
+      (when (and repeat-failure (not repeat-node))
+        (user-error
+         (concat "Run exhausted a repeat limit; use "
+                 "gptel-runner-extend-repeat")))
+      (let ((reapplied
+             (and budgets
+                  (gptel-runner--reapply-extension-budgets
+                   run context budgets)))
+            repeat-data)
+        (when repeat-node
+          (let* ((node-id (gptel-runner-node-id repeat-node))
+                 (old-limit (gptel-runner--repeat-limit run repeat-node))
+                 (additional (plist-get context :additional-iterations))
+                 (new-limit (+ old-limit additional)))
+            (puthash node-id new-limit (gptel-runner-run-repeat-limits run))
+            (gptel-runner--reset-subtree
+             run (plist-get (gptel-runner-node-properties repeat-node) :body))
+            (setq repeat-data
+                  (list :node-id node-id :additional additional
+                        :old-limit old-limit :new-limit new-limit))))
+        (gptel-runner--restart-run
+         run 'run-retried
+         (append
+          (list :previous-state state
+                :goal (gptel-runner-run-goal run))
+          (and reapplied (list :reapplied-extension reapplied))
+          (and repeat-data (list :reapplied-repeat-extension repeat-data)))
+         callback)))))
 
 (defun gptel-runner--reset-budget-accounting (run)
   "Reset RUN's consumed budget while retaining its configured limits."
@@ -1040,7 +1110,8 @@ continued run's next terminal transition."
              (gptel-runner-run-blackboard run))
     (remhash 'gptel-runner-resume-feedback
              (gptel-runner-run-blackboard run))
-    (setf (gptel-runner-run-goal run) observation)
+    (setf (gptel-runner-run-goal run) observation
+          (gptel-runner-run-extension-context run) nil)
     (when (eq restart-mode 'new-cycle)
       (gptel-runner--reset-subtree run root)
       (gptel-runner--clear-repeat-progress run root))
@@ -1099,6 +1170,11 @@ This function handles request, call, and duration budget exhaustion.  Use
                kind additional-requests additional-calls additional-duration)
         (user-error "Run exhausted %s; provide :additional-%s"
                     kind kind)))
+    (setf (gptel-runner-run-extension-context run)
+          (list :kind 'run
+                :additional-requests additional-requests
+                :additional-calls additional-calls
+                :additional-duration additional-duration))
     (gptel-runner--extend-budget run 'requests additional-requests)
     (gptel-runner--extend-budget run 'calls additional-calls)
     (gptel-runner--extend-budget run 'duration additional-duration)
@@ -1163,6 +1239,12 @@ for the extended run's next terminal transition."
             (user-error
              "Repeat %S is %S at iteration %d; its effective limit is %d"
              node-id state iterations old-limit))))
+      (setf (gptel-runner-run-extension-context run)
+            (list :kind 'repeat :node-id node-id
+                  :additional-iterations additional-iterations
+                  :additional-requests additional-requests
+                  :additional-calls additional-calls
+                  :additional-duration additional-duration))
       (puthash node-id new-limit limits)
       (gptel-runner--extend-budget run 'requests additional-requests)
       (gptel-runner--extend-budget run 'calls additional-calls)
@@ -1172,7 +1254,10 @@ for the extended run's next terminal transition."
       (gptel-runner--restart-run
        run 'repeat-extended
        (list :node-id node-id :additional additional-iterations
-             :old-limit old-limit :new-limit new-limit)
+             :old-limit old-limit :new-limit new-limit
+             :additional-requests additional-requests
+             :additional-calls additional-calls
+             :additional-duration additional-duration)
        callback))))
 
 (defun gptel-runner--complete-restored-call (call value)

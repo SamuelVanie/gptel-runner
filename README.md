@@ -297,7 +297,10 @@ or call row for the same operation.
 `gptel-runner-retry` deliberately rejects exhausted request, call, duration,
 and repeat limits because retrying without more capacity would immediately
 fail again.  Use `gptel-runner-extend` for run-level budgets or
-`gptel-runner-extend-repeat` for a repeat limit.
+`gptel-runner-extend-repeat` for a repeat limit.  If work started by one of
+those extension commands fails after consuming its added capacity, an explicit
+retry reuses the previous increment instead of asking for the same extension
+again.  The reapplied increment is recorded on the `run-retried` event.
 
 ### Follow up after a finished pipeline
 

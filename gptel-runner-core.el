@@ -109,6 +109,7 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
   iterations repeat-limits active-calls calls events budget driver queue
   (active-count 0)
   (writer-active 0) started-at finished-at terminal-data
+  extension-context
   callback callback-called
   duration-timer duration-remaining active-started-at
   paused-at snapshot-file (generation 0) options)
