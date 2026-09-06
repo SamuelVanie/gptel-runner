@@ -264,6 +264,7 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
          (decisions (and (gptel-runner-decision-memory-p run)
                          (gptel-runner-decisions run)))
          (continuation (gptel-runner--latest-continuation run))
+         (retry-feedback (gptel-runner-get run 'gptel-runner-retry-feedback))
          (feedback (gethash 'gptel-runner-resume-feedback
                             (gptel-runner-run-blackboard run))))
     (when decisions
@@ -287,6 +288,15 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
              "Continue from the current workspace and take this observation "
              "into account.  Inspect the actual current state before making "
              "the changes needed for the current goal.")))
+    (when (and retry-feedback
+               (or (null (plist-get retry-feedback :node))
+                   (equal (plist-get retry-feedback :node)
+                          (gptel-runner-node-id node))))
+      (remhash 'gptel-runner-retry-feedback (gptel-runner-run-blackboard run))
+      (setq resolved
+            (concat resolved
+                    "\n\nHuman feedback supplied when retrying this node:\n\n"
+                    (plist-get retry-feedback :text))))
     (if feedback
         (progn
           (remhash 'gptel-runner-resume-feedback
@@ -508,9 +518,12 @@ Return the new history entry, or nil when NODE does not collect history."
          (progress-fn (plist-get props :progress-key))
          (progress-slot (list 'gptel-runner-progress
                               (gptel-runner-node-id node)))
+         (retry-slot (list 'gptel-runner-retry-repeat
+                           (gptel-runner-node-id node)))
+         (retry-body (gptel-runner-get run retry-slot))
          (previous-key (gptel-runner-get run progress-slot))
-         (continue-current (gptel-runner--subtree-state-p
-                            run body 'succeeded)))
+         (continue-current (or retry-body (gptel-runner--subtree-state-p
+                                          run body 'succeeded))))
     (cl-labels
         ((iterate
           (resume-body)
@@ -531,6 +544,7 @@ Return the new history entry, or nil when NODE does not collect history."
                         (iteration (1+ (gptel-runner-iteration run id)))
                         (key (and progress-fn (funcall progress-fn run))))
                    (puthash id iteration (gptel-runner-run-iterations run))
+                   (remhash retry-slot (gptel-runner-run-blackboard run))
                    (gptel-runner--collect-repeat-history run node iteration)
                    (gptel-runner--emit run 'iteration-completed node nil
                                        (list :iteration iteration
@@ -553,7 +567,7 @@ Return the new history entry, or nil when NODE does not collect history."
                      (gptel-runner--checkpoint run)
                      (iterate nil))))))))))
       (gptel-runner--set-node-state run node 'running)
-      (if (and until (funcall until run))
+      (if (and (not retry-body) until (funcall until run))
           (progn
             (gptel-runner--set-node-state run node 'succeeded)
             (funcall done 'succeeded nil))
@@ -760,7 +774,12 @@ can resume at the narrowest safe checkpoint."
         (if (and (eq (gptel-runner-node-kind node) 'repeat)
                  (memq (gethash (gptel-runner-node-id node)
                                 (gptel-runner-run-node-states run))
-                       '(blocked stalled)))
+                       '(blocked stalled))
+                 (eq (gethash
+                      (gptel-runner-node-id
+                       (plist-get (gptel-runner-node-properties node) :body))
+                      (gptel-runner-run-node-states run))
+                     'succeeded))
             (gptel-runner--reset-subtree
              run (plist-get (gptel-runner-node-properties node) :body))
           (mapc #'walk (gptel-runner-node-children node)))))
@@ -1000,12 +1019,69 @@ Return an ordered plist describing the increments that were reapplied."
                      (gptel-runner--repeat-limit run node)))
         node))))
 
-(cl-defun gptel-runner-retry (run &key callback)
+(defun gptel-runner--retry-node-path (run node-id)
+  "Return the path to an executed agent NODE-ID in RUN, or signal an error."
+  (let ((root (gptel-runner-workflow-root (gptel-runner-run-workflow run))))
+    (cl-labels
+        ((walk (node)
+           (if (equal (gptel-runner-node-id node) node-id)
+               (list node)
+             (when-let* ((path (cl-some #'walk
+                                       (gptel-runner-node-children node))))
+               (cons node path)))))
+      (let* ((path (walk root))
+             (target (car (last path))))
+        (unless (and target (eq (gptel-runner-node-kind target) 'agent))
+          (user-error "No agent node %S in this workflow" node-id))
+        (dolist (node path)
+          (unless (memq (gethash (gptel-runner-node-id node)
+                                (gptel-runner-run-node-states run))
+                        '(succeeded failed blocked stalled cancelled running))
+            (user-error "Node %S is not on an executed workflow path" node-id)))
+        path))))
+
+(defun gptel-runner--prepare-retry-path (run path)
+  "Invalidate PATH's agent and dependent sequence nodes in RUN.
+Completed preceding nodes and independent parallel siblings remain complete.
+Enclosing repeat histories and counters are retained."
+  (cl-labels
+      ((reset (node)
+         (gptel-runner--clear-workflow-results run node)
+         (gptel-runner--reset-subtree run node)
+         (gptel-runner--clear-repeat-progress run node))
+       (walk (remaining)
+         (let ((node (car remaining))
+               (child (cadr remaining)))
+           (if (null child)
+               (reset node)
+             (walk (cdr remaining))
+             (when (eq (gptel-runner-node-kind node) 'sequence)
+               (mapc #'reset (cdr (memq child (gptel-runner-node-children node)))))
+             (when (eq (gptel-runner-node-kind node) 'parallel)
+               (when-let* ((key (gptel-runner--node-save-key node)))
+                 (remhash key (gptel-runner-run-blackboard run))))
+             (when (eq (gptel-runner-node-kind node) 'repeat)
+               (puthash (list 'gptel-runner-retry-repeat
+                              (gptel-runner-node-id node))
+                        t (gptel-runner-run-blackboard run)))
+             (puthash (gptel-runner-node-id node) 'pending
+                      (gptel-runner-run-node-states run))))))
+    (walk path)))
+
+(cl-defun gptel-runner-retry (run &key from-node feedback callback)
   "Retry unsuccessful RUN from its safe checkpoint without changing its goal.
-RUN may be a run object or its displayed string identifier.  Nodes that have
-already succeeded and their blackboard results remain complete.  The failed,
-blocked, stalled, or cancelled checkpoint is reset and retried; later skipped
-nodes remain gated until it succeeds.
+RUN may be a run object or its displayed string identifier.  By default,
+completed work is kept except in completed blocked or stalled repeat bodies,
+which restart as a whole.  The failed, blocked, stalled, or cancelled
+checkpoint is reset and retried; later skipped nodes remain gated until it
+succeeds.
+
+FROM-NODE explicitly selects an executed agent node by ID, even if its call
+succeeded but its verdict blocked a surrounding loop.  Rerun that node and
+later sequence nodes, retaining earlier results and independent parallel
+siblings.  Enclosing repeats retain their history and consume another
+iteration on completion.  FEEDBACK is an optional string added to the selected
+node's next prompt, or the next dispatched prompt when FROM-NODE is nil.
 
 Budget-exhaustion failures must normally use `gptel-runner-extend', and repeat
 limits must normally use `gptel-runner-extend-repeat'.  When the failed work
@@ -1013,11 +1089,17 @@ was started by either extension command, retry reuses that command's increment
 for any capacity that the failed attempt exhausted.  When CALLBACK is non-nil,
 use it for the retried run's next terminal transition."
   (setq run (gptel-runner--resolve-run run))
+  (unless (or (null feedback) (stringp feedback))
+    (user-error "FEEDBACK must be a string"))
+  (when feedback
+    (setq feedback (string-trim feedback))
+    (when (string-empty-p feedback) (setq feedback nil)))
   (let ((state (gptel-runner-run-state run)))
     (unless (memq state '(failed blocked stalled cancelled))
       (user-error "Run %s is not retryable from state %s"
                   (gptel-runner-run-id run) state))
-    (let* ((failure (and (eq state 'failed)
+    (let* ((path (and from-node (gptel-runner--retry-node-path run from-node)))
+           (failure (and (eq state 'failed)
                          (gptel-runner--terminal-failure-data run)))
            (budgets (and (eq state 'failed)
                          (gptel-runner--budget-kinds-at-limit run)))
@@ -1054,16 +1136,25 @@ use it for the retried run's next terminal transition."
                  (additional (plist-get context :additional-iterations))
                  (new-limit (+ old-limit additional)))
             (puthash node-id new-limit (gptel-runner-run-repeat-limits run))
-            (gptel-runner--reset-subtree
-             run (plist-get (gptel-runner-node-properties repeat-node) :body))
+            (unless path
+              (gptel-runner--reset-subtree
+               run (plist-get (gptel-runner-node-properties repeat-node) :body)))
             (setq repeat-data
                   (list :node-id node-id :additional additional
                         :old-limit old-limit :new-limit new-limit))))
+        (when path (gptel-runner--prepare-retry-path run path))
+        (remhash 'gptel-runner-retry-feedback (gptel-runner-run-blackboard run))
+        (when feedback
+          (puthash 'gptel-runner-retry-feedback
+                   (list :node from-node :text feedback)
+                   (gptel-runner-run-blackboard run)))
         (gptel-runner--restart-run
          run 'run-retried
          (append
           (list :previous-state state
                 :goal (gptel-runner-run-goal run))
+          (and from-node (list :from-node from-node))
+          (and feedback (list :feedback feedback))
           (and reapplied (list :reapplied-extension reapplied))
           (and repeat-data (list :reapplied-repeat-extension repeat-data)))
          callback)))))
@@ -1086,7 +1177,7 @@ use it for the retried run's next terminal transition."
     (nreverse results)))
 
 (defun gptel-runner--clear-workflow-results (run root)
-  "Clear values written below ROOT before RUN begins a new goal cycle."
+  "Clear values written below ROOT before RUN reruns those nodes."
   (dolist (key (delete-dups (gptel-runner--node-save-keys root)))
     (unless (memq key (list gptel-runner-decisions-key
                             gptel-runner-continuations-key))
@@ -1094,11 +1185,14 @@ use it for the retried run's next terminal transition."
 
 (defun gptel-runner--clear-repeat-progress (run root)
   "Reset repeat counters and internal progress below ROOT in RUN."
-  (clrhash (gptel-runner-run-iterations run))
   (cl-labels
       ((walk
         (node)
         (when (eq (gptel-runner-node-kind node) 'repeat)
+          (remhash (gptel-runner-node-id node) (gptel-runner-run-iterations run))
+          (remhash (list 'gptel-runner-retry-repeat
+                         (gptel-runner-node-id node))
+                   (gptel-runner-run-blackboard run))
           (remhash (list 'gptel-runner-progress
                          (gptel-runner-node-id node))
                    (gptel-runner-run-blackboard run)))
@@ -1165,6 +1259,8 @@ continued run's next terminal transition."
              (append history (list entry))
              (gptel-runner-run-blackboard run))
     (remhash 'gptel-runner-resume-feedback
+             (gptel-runner-run-blackboard run))
+    (remhash 'gptel-runner-retry-feedback
              (gptel-runner-run-blackboard run))
     (setf (gptel-runner-run-goal run) observation
           (gptel-runner-run-extension-context run) nil)

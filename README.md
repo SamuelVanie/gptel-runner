@@ -319,12 +319,49 @@ retry its safe checkpoint without changing the goal:
 (gptel-runner-retry "run-17")
 ```
 
-Previously succeeded nodes and their blackboard results remain complete.  The
-failed, blocked, stalled, or cancelled node is retried, and following sequence
-nodes remain gated until it succeeds.  The function accepts either a run
+Previously succeeded nodes and their blackboard results remain complete,
+except for completed blocked or stalled repeat bodies, which restart as a
+whole.  The failed, blocked, stalled, or cancelled node is retried, and
+following sequence nodes remain gated until it succeeds.  The function accepts either a run
 object or the string ID displayed in the dashboard.  An optional `:callback`
 applies to the retry's next terminal transition.  Select a dashboard run or
 call row and choose `t` from its action menu for the same operation.
+
+For a reviewer that returned a valid `BLOCKED` verdict, the call itself may
+show `succeeded`: the enclosing repeat's `:stop-when` predicate blocked the
+run.  Plain retry restarts that completed repeat body, including its
+implementer.  To fix the environment and rerun only the reviewer before
+continuing the pipeline:
+
+1. Fix the problem in the workspace, such as installing the missing test
+   dependency or starting a required service.
+2. Open `M-x gptel-runner-show-dashboard` and select the reviewer's call row.
+3. Press `?`, then `T` (Retry from this node).  Optionally describe what you
+   fixed; the reviewer receives that note in its new prompt.
+
+The same operation is available from Lisp:
+
+```elisp
+(gptel-runner-retry "run-17"
+ :from-node 'review
+ :feedback "Installed the missing test dependency. Please rerun the tests.")
+```
+
+Use the workflow step's `:id` for `:from-node`.  This creates a fresh agent
+call against the current workspace with the original goal.  Earlier completed
+steps and independent successful parallel siblings are kept.  The selected
+node's saved result and later sequence results are cleared and recomputed;
+downstream steps wait until their prerequisites succeed.  Selecting a
+historical call retries its node in the current workflow state, not the
+historical iteration.  Repeat histories remain available, and completing the
+retried body consumes another iteration.  Existing call, request, duration,
+and repeat limits still apply.
+
+`:feedback` also works without `:from-node`, in which case it is included in
+the next dispatched agent prompt.  After restarting Emacs, load a saved run
+with `gptel-runner-load-run`, then use `gptel-runner-retry` with its run object
+and node ID; restored snapshots do not contain historical call rows.  Durable
+recovery requires enabling `:persist t` before leaving the original session.
 
 `gptel-runner-retry` deliberately rejects exhausted request, call, duration,
 and repeat limits because retrying without more capacity would immediately

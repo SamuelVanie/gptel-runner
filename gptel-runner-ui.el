@@ -528,6 +528,11 @@ CALL may supply explicit provenance when this function is called from Lisp."
     (and run (memq (gptel-runner-run-state run)
                    '(failed blocked stalled cancelled)))))
 
+(defun gptel-runner-ui--retryable-node-at-point-p ()
+  "Return non-nil when an unsuccessful run has a call selected at point."
+  (and (gptel-runner-ui--call-at-point)
+       (gptel-runner-ui--retryable-run-at-point-p)))
+
 (defun gptel-runner-ui--continuable-run-at-point-p ()
   "Return non-nil when the run at point can be continued with a new goal."
   (let ((run (gptel-runner-ui--run-at-point)))
@@ -723,6 +728,19 @@ Visit a call's worker transcript, or inspect a run's event journal."
        (user-error "No run on this row")))
   (revert-buffer))
 
+(defun gptel-runner-dashboard-retry-node ()
+  "Retry from the selected call's workflow node with optional feedback.
+The node is rerun in the current workflow state, even for a historical call."
+  (interactive)
+  (let* ((call (or (gptel-runner-ui--call-at-point)
+                   (user-error "No agent call on this row")))
+         (feedback (read-string "What changed since this call? (optional): ")))
+    (gptel-runner-retry
+     (gptel-runner-call-run call)
+     :from-node (gptel-runner-node-id (gptel-runner-call-node call))
+     :feedback feedback)
+    (revert-buffer)))
+
 (defun gptel-runner-dashboard-extend-run ()
   "Increase finite budgets for the active, paused, or exhausted run at point."
   (interactive)
@@ -798,6 +816,8 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
      :inapt-if-not gptel-runner-ui--pausable-call-at-point-p)
     ("a" "Accept response" gptel-runner-dashboard-complete-call
      :inapt-if-not gptel-runner-ui--completable-call-at-point-p)
+    ("T" "Retry from this node" gptel-runner-dashboard-retry-node
+     :inapt-if-not gptel-runner-ui--retryable-node-at-point-p)
     ("k" "Abort call" gptel-runner-dashboard-abort-call
      :inapt-if-not gptel-runner-ui--abortable-call-at-point-p)]
    ["Run"

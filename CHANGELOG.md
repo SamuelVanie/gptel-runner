@@ -31,6 +31,10 @@
   a fresh full workflow cycle.
 - Add `gptel-runner-retry` and a dashboard command for retrying unsuccessful
   work from its safe checkpoint without changing the run goal.
+- Add retry `:from-node` and `:feedback` options, plus a dashboard action to
+  rerun a selected reviewer after fixing a blocker while keeping earlier work.
+- Preserve completed repeat prefixes when retrying an agent call that blocked
+  before its repeat body completed.
 - Make retry reuse the previous budget or repeat increment when an extended
   run fails after consuming that newly added capacity.
 - Fix confirmed tool calls so raw tool-result rendering returns to gptel's FSM

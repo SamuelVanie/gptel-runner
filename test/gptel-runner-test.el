@@ -1110,6 +1110,240 @@
         (should (= retry-callbacks 1))
         (should (= (gptel-runner-test--event-count run 'run-retried) 1))))))
 
+(ert-deftest gptel-runner-retry-blocked-call-keeps-completed-repeat-prefix ()
+  (gptel-runner-test--isolated
+    (gptel-runner-test--register-review-agents)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'implementer '(:value "kept"))
+      (gptel-runner-fake-queue
+       driver 'reviewer '(:status blocked :value "Tests unavailable")
+       '(:value "{\"verdict\":\"pass\",\"summary\":\"ok\",\"issues\":[]}"))
+      (let ((run (gptel-runner-start (gptel-runner-test--review-flow)
+                                    :driver driver :allow-writes t)))
+        (should (eq (gptel-runner-run-state run) 'blocked))
+        (gptel-runner-retry run)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 3))
+        (should (equal (gptel-runner-get run 'implementation) "kept"))
+        (should (= (gptel-runner-iteration run 'cycle) 1))))))
+
+(ert-deftest gptel-runner-retry-from-reviewer-after-blocked-verdict ()
+  (gptel-runner-test--isolated
+    (gptel-runner-test--register-review-agents)
+    (gptel-runner-register-agent 'summary :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create))
+          (callbacks 0) retry-prompt)
+      (gptel-runner-fake-queue driver 'implementer '(:value "kept"))
+      (gptel-runner-fake-queue
+       driver 'reviewer
+       '(:value "{\"verdict\":\"blocked\",\"summary\":\"needs tests\",\"issues\":[]}")
+       (lambda (call)
+         (setq retry-prompt (gptel-runner-call-prompt call))
+         '(:manual t :value "{\"verdict\":\"pass\",\"summary\":\"ok\",\"issues\":[]}")))
+      (gptel-runner-fake-queue driver 'summary '(:value "finished"))
+      (let* ((repeat (gptel-runner-test--review-flow))
+             (_ (setf (gptel-runner-node-properties repeat)
+                      (append (gptel-runner-node-properties repeat)
+                              '(:collect-keys (implementation review)
+                                :save-history-as history))))
+             (run (gptel-runner-start
+                   (gptel-runner-sequence
+                    :id 'pipeline repeat
+                    (gptel-runner-test--step 'summary 'summary 'summary))
+                   :driver driver :allow-writes t :goal "Original goal")))
+        (should (eq (gptel-runner-run-state run) 'blocked))
+        (gptel-runner-retry
+         (gptel-runner-run-id run) :from-node 'review
+         :feedback "Installed the missing test dependency."
+         :callback (lambda (_run) (cl-incf callbacks)))
+        (should (eq (gptel-runner-run-state run) 'running))
+        (should-not (gptel-runner-get run 'review))
+        (should-not (gptel-runner-get run 'summary))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 3))
+        (should (string-match-p "Installed the missing" retry-prompt))
+        (should (equal (gptel-runner-get run 'implementation) "kept"))
+        (gptel-runner-fake-release
+         driver (car (last (gptel-runner-fake-driver-starts driver))))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-run-goal run) "Original goal"))
+        (should (equal (gptel-runner-get run 'summary) "finished"))
+        (should (= callbacks 1))
+        (should (= (gptel-runner-budget-calls (gptel-runner-run-budget run)) 4))
+        (should (= (gptel-runner-iteration run 'cycle) 2))
+        (should (equal (mapcar (lambda (entry) (plist-get entry :iteration))
+                              (gptel-runner-get run 'history)) '(1 2)))
+        (should-not (gptel-runner-get run 'gptel-runner-retry-feedback))
+        (should-not (string-match-p
+                     "Installed the missing"
+                     (gptel-runner-call-prompt
+                      (car (last (gptel-runner-fake-driver-starts driver))))))))))
+
+(ert-deftest gptel-runner-retry-from-node-invalidates-dependent-results ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue
+       driver 'worker '(:value "old") '(:value "old dependent")
+       '(:status permanent :value "failed")
+       (lambda (call)
+         (should-not (gptel-runner-get (gptel-runner-call-run call) 'dependent))
+         '(:value "new"))
+       '(:value "new dependent") '(:value "finished"))
+      (let ((run (gptel-runner-start
+                  (gptel-runner-sequence
+                   :id 'pipeline
+                   (gptel-runner-test--step 'first 'worker 'first)
+                   (gptel-runner-repeat-until
+                    :id 'dependent-loop :max 1
+                    :until (lambda (run) (gptel-runner-get run 'dependent))
+                    :body (gptel-runner-test--step 'dependent 'worker 'dependent))
+                   (gptel-runner-test--step 'last 'worker 'last))
+                  :driver driver)))
+        (gptel-runner-retry run :from-node 'first)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'dependent) "new dependent"))
+        (should (= (gptel-runner-iteration run 'dependent-loop) 1))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 6))))))
+
+(ert-deftest gptel-runner-retry-from-parallel-review-keeps-independent-sibling ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(writer reviewer-a reviewer-b))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'writer '(:value "kept"))
+      (gptel-runner-fake-queue driver 'reviewer-a '(:value "blocked")
+                               '(:value "pass"))
+      (gptel-runner-fake-queue driver 'reviewer-b '(:value "pass"))
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-repeat-until
+               :id 'cycle :max 3
+               :stop-when (lambda (run) (equal (gptel-runner-get run 'a) "blocked"))
+               :until (lambda (run) (equal (gptel-runner-get run 'a) "pass"))
+               :body (gptel-runner-sequence
+                      :id 'body
+                      (gptel-runner-test--step 'writer 'writer 'implementation)
+                      (gptel-runner-parallel
+                       :id 'reviews :save-as 'reviews
+                       (gptel-runner-test--step 'a 'reviewer-a 'a)
+                       (gptel-runner-test--step 'b 'reviewer-b 'b))))
+              :driver driver)))
+        (should (eq (gptel-runner-run-state run) 'blocked))
+        (gptel-runner-retry run :from-node 'a)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 4))
+        (should (equal (gptel-runner-get run 'b) "pass"))
+        (should (equal (gptel-runner-get run 'implementation) "kept"))
+        (should (cl-every (lambda (result)
+                            (equal (plist-get result :value) "pass"))
+                          (gptel-runner-get run 'reviews)))))))
+
+(ert-deftest gptel-runner-retry-from-node-validates-before-changing-state ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'worker '(:status permanent :value "failed"))
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-sequence
+                    :id 'pipeline
+                    (gptel-runner-test--step 'first 'worker)
+                    (gptel-runner-test--step 'skipped 'worker))
+                   :driver driver :max-calls 1))
+             (states (copy-hash-table (gptel-runner-run-node-states run))))
+        (dolist (node '(missing pipeline skipped))
+          (should-error (gptel-runner-retry run :from-node node) :type 'user-error))
+        (should-error (gptel-runner-retry run :from-node 'first :feedback 42)
+                      :type 'user-error)
+        (should-error (gptel-runner-retry run :from-node 'first)
+                      :type 'user-error)
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should (= (hash-table-count states)
+                   (hash-table-count (gptel-runner-run-node-states run))))
+        (maphash (lambda (id state)
+                   (should (eq state (gethash id (gptel-runner-run-node-states run)))))
+                 states)
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 1))))))
+
+(ert-deftest gptel-runner-retry-from-node-can-recover-after-another-failure ()
+  (gptel-runner-test--isolated
+    (gptel-runner-test--register-review-agents)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'implementer '(:value "kept"))
+      (gptel-runner-fake-queue
+       driver 'reviewer
+       '(:value "{\"verdict\":\"blocked\",\"summary\":\"needs tests\",\"issues\":[]}")
+       '(:status permanent :value "Still unavailable")
+       '(:value "{\"verdict\":\"pass\",\"summary\":\"ok\",\"issues\":[]}"))
+      (let ((run (gptel-runner-start (gptel-runner-test--review-flow)
+                                    :driver driver :allow-writes t)))
+        (gptel-runner-retry run :from-node 'review)
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should (= (gptel-runner-iteration run 'cycle) 1))
+        (gptel-runner-retry run :feedback "Service is now running.")
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 4))
+        (should (equal (gptel-runner-get run 'implementation) "kept"))
+        (should (string-match-p
+                 "Service is now running"
+                 (gptel-runner-call-prompt
+                  (car (last (gptel-runner-fake-driver-starts driver))))))))))
+
+(ert-deftest gptel-runner-retry-from-node-runs-before-rechecking-until ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'reviewer :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)) fixed)
+      (gptel-runner-fake-queue driver 'reviewer '(:value "blocked") '(:value "pass"))
+      (let ((run (gptel-runner-start
+                  (gptel-runner-repeat-until
+                   :id 'cycle :max 3
+                   :until (lambda (_run) fixed)
+                   :stop-when (lambda (run)
+                                (equal (gptel-runner-get run 'review) "blocked"))
+                   :body (gptel-runner-test--step 'review 'reviewer 'review))
+                  :driver driver)))
+        (setq fixed t)
+        (gptel-runner-retry run :from-node 'review)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-get run 'review) "pass"))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 2))))))
+
+(ert-deftest gptel-runner-blocked-snapshot-can-retry-from-reviewer ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(writer reviewer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let* ((snapshot-directory (make-temp-file "gptel-runner-blocked-retry-" t))
+           (gptel-runner-snapshot-directory snapshot-directory)
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (gptel-runner-defworkflow persisted-review-retry (:persist t)
+              (gptel-runner-repeat-until
+               :id 'cycle :max 3
+               :stop-when (lambda (run) (equal (gptel-runner-get run 'review) "blocked"))
+               :until (lambda (run) (equal (gptel-runner-get run 'review) "pass"))
+               :body (gptel-runner-sequence
+                      :id 'body
+                      (gptel-runner-test--step 'write 'writer 'implementation)
+                      (gptel-runner-test--step 'review 'reviewer 'review))))
+            (gptel-runner-fake-queue driver 'writer '(:value "kept"))
+            (gptel-runner-fake-queue driver 'reviewer '(:value "blocked"))
+            (let ((run (gptel-runner-start 'persisted-review-retry :driver driver)))
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (setq gptel-runner--runs (make-hash-table :test #'equal))
+              (let* ((restored-driver (gptel-runner-fake-driver-create))
+                     (restored (gptel-runner-load-run
+                                (gptel-runner-run-snapshot-file run)
+                                nil restored-driver)))
+                (should-not (gptel-runner-run-calls restored))
+                (gptel-runner-fake-queue restored-driver 'reviewer '(:value "pass"))
+                (gptel-runner-retry restored :from-node 'review)
+                (should (eq (gptel-runner-run-state restored) 'succeeded))
+                (should (= (length (gptel-runner-fake-driver-starts restored-driver)) 1))
+                (should (equal (gptel-runner-get restored 'implementation) "kept"))
+                (should (= (gptel-runner-iteration restored 'cycle) 2))
+                (should (eq (gptel-runner-test--wait-for-snapshot restored) 'clean)))))
+        (delete-directory snapshot-directory t)))))
+
 (ert-deftest gptel-runner-retry-reapplies-consumed-run-extension ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
@@ -1180,6 +1414,31 @@
         (should (equal (gptel-runner-get run 'result) "pass"))
         (should (= (gptel-runner-test--event-count run 'repeat-extended) 1))
         (should (= (gptel-runner-test--event-count run 'run-retried) 1))))))
+
+(ert-deftest gptel-runner-retry-from-node-keeps-prefix-when-reapplying-extension ()
+  (gptel-runner-test--isolated
+    (dolist (agent '(writer reviewer))
+      (gptel-runner-register-agent agent :preset 'p))
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (gptel-runner-fake-queue driver 'writer '(:value "first") '(:value "kept"))
+      (gptel-runner-fake-queue driver 'reviewer
+                               '(:value "revise") '(:value "revise") '(:value "pass"))
+      (let ((run (gptel-runner-start
+                  (gptel-runner-repeat-until
+                   :id 'cycle :max 1
+                   :until (lambda (run) (equal (gptel-runner-get run 'review) "pass"))
+                   :body (gptel-runner-sequence
+                          :id 'body
+                          (gptel-runner-test--step 'write 'writer 'implementation)
+                          (gptel-runner-test--step 'review 'reviewer 'review)))
+                  :driver driver)))
+        (gptel-runner-extend-repeat run 'cycle 1)
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (gptel-runner-retry run :from-node 'review)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= (gptel-runner-iteration run 'cycle) 3))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 5))
+        (should (equal (gptel-runner-get run 'implementation) "kept"))))))
 
 (ert-deftest gptel-runner-retry-rejects-ineligible-and-budget-failed-runs ()
   (gptel-runner-test--isolated
@@ -2078,7 +2337,7 @@
                             (kbd (car binding)))
                 (cdr binding))))
   (dolist (key '("a" "b" "c" "d" "e" "k" "K" "l" "p" "P" "r" "s"
-                 "t" "v" "V" "x" "X" "C"))
+                 "t" "T" "v" "V" "x" "X" "C"))
     (should-not (lookup-key gptel-runner-dashboard-mode-map (kbd key)))))
 
 (ert-deftest gptel-runner-dashboard-ret-opens-row-inspection-target ()
@@ -2113,6 +2372,7 @@
              ("P" . gptel-runner-dashboard-pause-run)
              ("r" . gptel-runner-dashboard-resume-run)
              ("t" . gptel-runner-dashboard-retry-run)
+             ("T" . gptel-runner-dashboard-retry-node)
              ("b" . gptel-runner-dashboard-extend-run)
              ("c" . gptel-runner-dashboard-continue-run)
              ("K" . gptel-runner-dashboard-abort-run)
@@ -2127,6 +2387,20 @@
     (let ((suffix (transient-get-suffix
                    'gptel-runner-dashboard-menu (car binding))))
       (should (eq (plist-get (cdr suffix) :command) (cdr binding))))))
+
+(ert-deftest gptel-runner-dashboard-retries-selected-node-with-feedback ()
+  (let* ((run (gptel-runner-run-create :state 'blocked))
+         (node (gptel-runner-node-create :id 'review))
+         (call (gptel-runner-call-create :run run :node node))
+         arguments refreshed)
+    (cl-letf (((symbol-function 'gptel-runner-ui--call-at-point) (lambda () call))
+              ((symbol-function 'read-string) (lambda (&rest _) "Fixed tests"))
+              ((symbol-function 'gptel-runner-retry)
+               (lambda (&rest args) (setq arguments args)))
+              ((symbol-function 'revert-buffer) (lambda (&rest _) (setq refreshed t))))
+      (gptel-runner-dashboard-retry-node)
+      (should (equal arguments (list run :from-node 'review :feedback "Fixed tests")))
+      (should refreshed))))
 
 (ert-deftest gptel-runner-dashboard-menu-actions-follow-row-state ()
   (let* ((workflow (gptel-runner-workflow-create :name 'menu-workflow))
@@ -2153,8 +2427,10 @@
       (should (gptel-runner-ui--extendable-run-at-point-p))
       (should-not (gptel-runner-ui--completable-call-at-point-p))
       (should-not (gptel-runner-ui--resumable-run-at-point-p))
+      (should-not (gptel-runner-ui--retryable-node-at-point-p))
       (setf (gptel-runner-run-state run) 'failed)
       (should (gptel-runner-ui--retryable-run-at-point-p))
+      (should (gptel-runner-ui--retryable-node-at-point-p))
       (should (gptel-runner-ui--continuable-run-at-point-p))
       (should-not (gptel-runner-ui--extendable-run-at-point-p))
       (setf (gptel-runner-budget-calls (gptel-runner-run-budget run)) 2
