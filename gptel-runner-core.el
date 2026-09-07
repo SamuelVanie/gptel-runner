@@ -66,7 +66,8 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
 (cl-defstruct (gptel-runner-agent
                (:constructor gptel-runner-agent-create))
   "Configuration used to invoke an agent."
-  name preset workspace-mode schema parser validator retry-policy metadata)
+  name preset workspace-mode schema parser validator retry-policy metadata
+  context)
 
 (cl-defstruct (gptel-runner-node
                (:constructor gptel-runner-node-create))
@@ -184,7 +185,7 @@ defensive against duplicate and late calls.")
 (defun gptel-runner-register-agent (name &rest properties)
   "Register NAME using PROPERTIES and return the new agent.
 Recognized properties include `:preset', `:workspace-mode', `:schema',
-`:parser', `:validator', `:retry-policy', and `:metadata'."
+`:parser', `:validator', `:retry-policy', `:metadata', and `:context'."
   (unless (symbolp name)
     (user-error "Agent name must be a symbol: %S" name))
   (let ((mode (or (plist-get properties :workspace-mode) 'read)))
@@ -198,7 +199,8 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
             :validator (plist-get properties :validator)
             :retry-policy (or (plist-get properties :retry-policy)
                               (gptel-runner-retry-policy-create))
-            :metadata (plist-get properties :metadata))))
+            :metadata (plist-get properties :metadata)
+            :context (plist-get properties :context))))
       (puthash name agent gptel-runner--agents)
       agent)))
 

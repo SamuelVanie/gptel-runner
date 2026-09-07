@@ -70,6 +70,66 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
+### Starting context and artifacts
+
+Add `:context` at any workflow level to prepend stable project knowledge to
+the stateless prompt of each affected agent call.  A context value is one
+source or a list of sources.  Each source can be an inline string, a function
+of `(run node)` that returns a string (or nil to omit itself), or a file
+descriptor produced by `gptel-runner-context-file`.  `node` is the target
+agent step even when the function belongs to a broader scope:
+
+```elisp
+(defun example/current-plan-context (run _node)
+  (when-let ((plan (gptel-runner-get run 'plan)))
+    (format "The accepted plan is:\n%s" plan)))
+
+(gptel-runner-register-agent
+ 'implementer :preset 'runner-implementer :workspace-mode 'write
+ :context (list "Follow the repository conventions exactly."
+                (gptel-runner-context-file "docs/architecture.md")))
+
+(gptel-runner-defworkflow context-aware
+    ;; Workflow options are quoted by the macro, so write file descriptors
+    ;; as data here.  This context reaches every agent in the workflow.
+    (:context ((:file "AGENTS.md")))
+  (gptel-runner-sequence
+   :id 'delivery
+   :context "Keep all changes within the requested feature."
+   (gptel-runner-agent-step
+    :id 'plan :agent 'planner :prompt #'example/plan-prompt
+    :save-as 'plan)
+   (gptel-runner-repeat-until
+    :id 'implementation-cycle :max 3
+    :context #'example/current-plan-context
+    :until #'example/review-passed-p
+    :body
+    (gptel-runner-agent-step
+     :id 'implement :agent 'implementer
+     :context "Run the focused tests before returning."
+     :prompt #'example/implementation-prompt))))
+```
+
+Context is additive and appears from broadest to narrowest: workflow, optional
+`gptel-runner-start :context`, registered agent, then each node from the root
+through the agent step.  The step's ordinary `:prompt` follows all starting
+context.  Context on a sequence, repeat, parallel, or branch is inherited only
+by agent steps in that subtree.
+
+Relative file names are resolved from the run workspace.  Files and context
+functions are evaluated when each call is prepared, so a later sequence step
+or loop iteration sees updated artifact contents.  Missing or unreadable files
+and non-string function results are reported as context errors.  Use
+`gptel-runner-start :context` for context specific to one run:
+
+```elisp
+(gptel-runner-start 'context-aware
+ :goal "Implement the requested change"
+ :workspace (project-root (project-current t))
+ :context "The migration must remain backward compatible."
+ :allow-writes t)
+```
+
 Every workflow has decision memory enabled by default.  Record a workflow-wide,
 run-scoped choice from Lisp with:
 
@@ -522,8 +582,10 @@ outputs, tool results, and secrets; protect and delete them as sensitive data.
 
 Run options include `:driver`, `:max-requests`, `:max-calls`,
 `:max-concurrency`, `:max-duration`, `:allow-writes`,
-`:allow-unconfirmed-tools`, `:decision-memory`, and `:persist`.  Workflow
-defaults are used when an option is not provided.  `:decision-memory` is the
+`:allow-unconfirmed-tools`, `:decision-memory`, `:context`, and `:persist`.
+Workflow defaults are used when an option is not provided.  A function passed
+as per-run `:context` must be readable Emacs Lisp data for persistent runs, so
+prefer a named function there.  `:decision-memory` is the
 exception whose package fallback is `t`; use an explicit nil value to opt out.
 
 ## Semantics and safety
@@ -587,7 +649,7 @@ can change; CI checks v0.9.9.4 and uses current master as an early-warning job.
 | `invalid-output` | The original and one repair response both failed validation. |
 | Cancellation cannot undo a tool | Stop/undo the external tool action separately. |
 | Snapshot cannot find a node | Reload the same named workflow with stable explicit node IDs. |
-| Snapshot cannot be saved | Keep blackboard keys/values and the run goal readable as Emacs Lisp data. |
+| Snapshot cannot be saved | Keep blackboard keys/values, the run goal, and per-run context readable as Emacs Lisp data. |
 
 ## Development
 

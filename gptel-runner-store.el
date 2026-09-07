@@ -509,7 +509,8 @@ calls, events, and transcripts are deliberately not restored."
     (unless (gptel-runner-run-driver run)
       (user-error "No driver configured for restored run"))
     (gptel-runner--validate-workflow
-     root (plist-get (gptel-runner-run-options run) :allow-writes))
+     root (plist-get (gptel-runner-run-options run) :allow-writes)
+     (gptel-runner-run-workspace run))
     (dolist (entry (plist-get data :node-states))
       (unless (gptel-runner-store--node root (car entry))
         (user-error "Snapshot node %S is absent from workflow %S"

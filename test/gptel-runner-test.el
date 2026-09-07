@@ -44,6 +44,14 @@
   "Make a simple step with ID, AGENT, and SAVE key."
   (gptel-runner-agent-step :id id :agent agent :prompt "work" :save-as save))
 
+(defun gptel-runner-test--assert-text-order (text fragments)
+  "Assert that every string in FRAGMENTS occurs in order in TEXT."
+  (let ((position 0))
+    (dolist (fragment fragments)
+      (let ((found (string-match (regexp-quote fragment) text position)))
+        (should found)
+        (setq position (+ found (length fragment)))))))
+
 (ert-deftest gptel-runner-review-schema-is-json-serializable ()
   (let* ((encoded (json-serialize gptel-runner-review-schema))
          (decoded (json-parse-string encoded :object-type 'plist)))
@@ -80,6 +88,114 @@
       (should (eq (gptel-runner-find-run "run-42") run))
       (should-not (gptel-runner-find-run "missing"))
       (should-not (gptel-runner-find-run 'run-42)))))
+
+(ert-deftest gptel-runner-context-is-resolved-and-inherited-by-scope ()
+  (gptel-runner-test--isolated
+    (let ((workspace (make-temp-file "gptel-runner-context-" t))
+          first-prompt second-prompt)
+      (unwind-protect
+          (progn
+            (with-temp-file (expand-file-name "AGENTS.md" workspace)
+              (insert "File context version one"))
+            (gptel-runner-register-agent
+             'worker :preset 'p
+             :context "Agent context")
+            (gptel-runner-defworkflow context-inheritance
+                (:context
+                 ("Workflow context"
+                  (:file "AGENTS.md")
+                  (lambda (_run node)
+                    (format "Workflow function for %s"
+                            (gptel-runner-node-id node)))))
+              (gptel-runner-sequence
+               :id 'root :context "Root context"
+               (gptel-runner-repeat-until
+                :id 'cycle :max 1 :context "Repeat context"
+                :until (lambda (run)
+                         (> (gptel-runner-iteration run 'cycle) 0))
+                :body
+                (gptel-runner-agent-step
+                 :id 'first :agent 'worker :prompt "First task"
+                 :context (lambda (_run node)
+                            (format "Step context for %s"
+                                    (gptel-runner-node-id node)))))
+               (gptel-runner-agent-step
+                :id 'second :agent 'worker :prompt "Second task")))
+            (let ((driver (gptel-runner-fake-driver-create)))
+              (gptel-runner-fake-queue
+               driver 'worker
+               (lambda (call)
+                 (setq first-prompt (gptel-runner-call-prompt call))
+                 (with-temp-file (expand-file-name "AGENTS.md" workspace)
+                   (insert "File context version two"))
+                 '(:value "first done"))
+               (lambda (call)
+                 (setq second-prompt (gptel-runner-call-prompt call))
+                 '(:value "second done")))
+              (let ((run (gptel-runner-start
+                          'context-inheritance
+                          :workspace workspace :driver driver
+                          :context "Run context")))
+                (should (eq (gptel-runner-run-state run) 'succeeded))))
+            (gptel-runner-test--assert-text-order
+             first-prompt
+             '("Workflow context"
+               "File context version one"
+               "Workflow function for first"
+               "Run context"
+               "Agent context"
+               "Root context"
+               "Repeat context"
+               "Step context for first"
+               "First task"))
+            (gptel-runner-test--assert-text-order
+             second-prompt
+             '("Workflow context"
+               "File context version two"
+               "Workflow function for second"
+               "Run context"
+               "Agent context"
+               "Root context"
+               "Second task"))
+            (should-not (string-match-p "Repeat context" second-prompt))
+            (should-not (string-match-p "Step context" second-prompt)))
+        (delete-directory workspace t)))))
+
+(ert-deftest gptel-runner-context-validation-rejects-invalid-sources ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((driver (gptel-runner-fake-driver-create)))
+      (should (equal (gptel-runner-context-file "AGENTS.md")
+                     '(:file "AGENTS.md")))
+      (should-error (gptel-runner-context-file 42) :type 'user-error)
+      (should-error
+       (gptel-runner-start
+        (gptel-runner-agent-step
+         :id 'work :agent 'worker :prompt "work" :context 42)
+        :driver driver)
+       :type 'user-error)
+      (should-error
+       (gptel-runner-start
+        (gptel-runner-agent-step
+         :id 'work :agent 'worker :prompt "work")
+        :driver driver :context '(:file 42))
+       :type 'user-error)
+      (let ((run-count (hash-table-count gptel-runner--runs)))
+        (should-error
+         (gptel-runner-start
+          (gptel-runner-agent-step
+           :id 'missing :agent 'worker :prompt "work")
+          :driver driver :context '(:file "missing-context.md"))
+         :type 'user-error)
+        (should (= (hash-table-count gptel-runner--runs) run-count)))
+      (let ((run (gptel-runner-start
+                  (gptel-runner-agent-step
+                   :id 'dynamic :agent 'worker :prompt "work")
+                  :driver driver :context (lambda (_run _node) 42))))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should (eq (plist-get (gptel-runner-run-terminal-data run) :type)
+                    'prompt))
+        (should-not (gptel-runner-run-calls run))))))
 
 (ert-deftest gptel-runner-records-ordered-decisions-with-provenance ()
   (gptel-runner-test--isolated

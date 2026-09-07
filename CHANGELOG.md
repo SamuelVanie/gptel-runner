@@ -57,3 +57,6 @@
   JSON instead of failing reviewer calls with `json-value-p`.
 - Reject empty final agent responses, attempt one stateless repair, and fail
   the node before handing an empty value to downstream workflow steps.
+- Add composable `:context` sources at workflow, run, registered-agent, and
+  node scopes, including inherited subtree context, workspace-relative files,
+  and functions evaluated for each agent call.

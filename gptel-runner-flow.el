@@ -21,27 +21,33 @@
 (defun gptel-runner-agent-step (&rest properties)
   "Return an agent node described by PROPERTIES.
 Required keys are `:id', `:agent', and `:prompt'.  `:save-as', `:retries',
-`:parser', `:validator', `:repair-invalid', and `:pause-after' customize result
-handling.  A non-nil `:pause-after' holds a successful response for human
-feedback before completing the node."
+`:parser', `:validator', `:repair-invalid', `:pause-after', and `:context'
+customize its execution.  A non-nil `:pause-after' holds a successful response
+for human feedback before completing the node."
   (gptel-runner-node-create
    :id (gptel-runner--node-id properties 'agent)
    :kind 'agent :properties properties))
 
 (defun gptel-runner-sequence (&rest arguments)
   "Return a fail-fast sequence described by ARGUMENTS.
-An optional leading `:id' and its value give the sequence a stable identity;
-the remaining arguments are child nodes."
-  (let ((id (when (eq (car arguments) :id)
-              (pop arguments)
-              (or (pop arguments) (user-error "Sequence :id cannot be nil")))))
+Leading keyword/value pairs set properties such as `:id' and inherited
+`:context'; the remaining arguments are child nodes."
+  (let (properties)
+    (while (keywordp (car arguments))
+      (let ((key (pop arguments)))
+        (unless arguments (error "Missing value for %S" key))
+        (setq properties (plist-put properties key (pop arguments)))))
+    (when (and (plist-member properties :id)
+               (null (plist-get properties :id)))
+      (user-error "Sequence :id cannot be nil"))
     (gptel-runner-node-create
-     :id (or id (intern (gptel-runner--id "sequence")))
-     :kind 'sequence :children arguments)))
+     :id (gptel-runner--node-id properties 'sequence)
+     :kind 'sequence :properties properties :children arguments)))
 
 (defun gptel-runner-branch (&rest properties)
   "Return a predicate branch described by PROPERTIES.
-Use `:predicate' (or `:if'), `:then', `:else', and optional `:id'."
+Use `:predicate' (or `:if'), `:then', `:else', and optional `:id'.  A
+`:context' value is inherited by the selected subtree."
   (gptel-runner-node-create
    :id (gptel-runner--node-id properties 'branch)
    :kind 'branch :properties properties
@@ -52,7 +58,8 @@ Use `:predicate' (or `:if'), `:then', `:else', and optional `:id'."
   "Return a bounded repeat node described by PROPERTIES.
 The node requires `:body' and a positive `:max'.  `:until', `:stop-when', and
 `:progress-key' are functions accepting the current run.  `:collect-keys' and
-`:save-history-as' retain ordered per-iteration blackboard snapshots."
+`:save-history-as' retain ordered per-iteration blackboard snapshots.
+`:context' is inherited by every agent call in the body."
   (gptel-runner-node-create
    :id (gptel-runner--node-id properties 'repeat)
    :kind 'repeat :properties properties
@@ -61,7 +68,8 @@ The node requires `:body' and a positive `:max'.  `:until', `:stop-when', and
 (defun gptel-runner-parallel (&rest arguments)
   "Return a parallel node from ARGUMENTS.
 Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
-`:save-as'.  Remaining arguments are child nodes."
+`:save-as'.  A `:context' property is inherited by every child.  Remaining
+arguments are child nodes."
   (let (properties)
     (while (keywordp (car arguments))
       (let ((key (pop arguments)))
@@ -80,6 +88,141 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
             (gptel-runner-workflow-create
              :name ',name :options ',options :root ,(car body))
             gptel-runner--workflows))
+
+(defun gptel-runner-context-file (file)
+  "Return a context source that reads FILE from a run's workspace.
+Absolute names are used as given.  Relative names are expanded from the
+workspace passed to `gptel-runner-start'."
+  (unless (stringp file)
+    (user-error "Context file must be a string: %S" file))
+  (list :file file))
+
+(defun gptel-runner--context-function (source)
+  "Return the callable represented by context SOURCE, or nil."
+  (cond
+   ((functionp source) source)
+   ((and (consp source)
+         (eq (car source) 'function)
+         (null (cddr source))
+         (functionp (cadr source)))
+    (cadr source))))
+
+(defun gptel-runner--context-file-p (source)
+  "Return non-nil when SOURCE is a context file descriptor."
+  (and (proper-list-p source)
+       (= (length source) 2)
+       (eq (car source) :file)))
+
+(defun gptel-runner--context-sources (context)
+  "Normalize CONTEXT into an ordered list of individual sources."
+  (cond
+   ((null context) nil)
+   ((or (stringp context)
+        (gptel-runner--context-function context)
+        (gptel-runner--context-file-p context))
+    (list context))
+   ((proper-list-p context) context)
+   (t (user-error "Invalid context value: %S" context))))
+
+(defun gptel-runner--validate-context (context owner &optional workspace)
+  "Validate CONTEXT associated with OWNER.
+When WORKSPACE is non-nil, also require every declared file to be readable."
+  (dolist (source (gptel-runner--context-sources context))
+    (cond
+     ((or (null source) (stringp source)
+          (gptel-runner--context-function source)))
+     ((gptel-runner--context-file-p source)
+      (unless (stringp (cadr source))
+        (user-error "Invalid context source for %s: %S" owner source))
+      (when workspace
+        (let ((path (expand-file-name (cadr source) workspace)))
+          (unless (and (file-regular-p path) (file-readable-p path))
+            (user-error
+             "Context file for %s is not a readable regular file: %s"
+             owner path)))))
+     (t (user-error "Invalid context source for %s: %S" owner source)))))
+
+(defun gptel-runner--node-path (root target)
+  "Return the path from ROOT to TARGET, including both nodes."
+  (when (gptel-runner-node-p root)
+    (if (or (eq root target)
+            (equal (gptel-runner-node-id root)
+                   (gptel-runner-node-id target)))
+        (list root)
+      (cl-loop for child in (gptel-runner-node-children root)
+               for path = (gptel-runner--node-path child target)
+               when path return (cons root path)))))
+
+(defun gptel-runner--read-context-file (run file)
+  "Return FILE's contents, resolving it from RUN's workspace."
+  (let ((path (expand-file-name file (gptel-runner-run-workspace run))))
+    (unless (and (file-regular-p path) (file-readable-p path))
+      (user-error "Context file is not a readable regular file: %s" path))
+    (with-temp-buffer
+      (insert-file-contents path)
+      (buffer-string))))
+
+(defun gptel-runner--resolve-context-source (run node source owner)
+  "Resolve SOURCE for RUN and agent NODE, labeling it with OWNER.
+Return a cons of label and text, or nil when a function omits its context."
+  (cond
+   ((null source) nil)
+   ((stringp source) (cons owner source))
+   ((gptel-runner--context-file-p source)
+    (let ((file (cadr source)))
+      (cons (format "%s (file %s)" owner file)
+            (gptel-runner--read-context-file run file))))
+   ((gptel-runner--context-function source)
+    (let ((value (funcall (gptel-runner--context-function source) run node)))
+      (unless (or (null value) (stringp value))
+        (user-error "Context function for %s returned non-string value: %S"
+                    owner value))
+      (and value (cons owner value))))
+   (t (user-error "Invalid context source for %s: %S" owner source))))
+
+(defun gptel-runner--resolve-context (run node)
+  "Return ordered context entries inherited by agent NODE in RUN."
+  (let* ((workflow (gptel-runner-run-workflow run))
+         (root (gptel-runner-workflow-root workflow))
+         (workflow-context
+          (plist-get (gptel-runner-workflow-options workflow) :context))
+         (run-context (plist-get (gptel-runner-run-options run) :context))
+         (agent (gptel-runner--agent
+                 (plist-get (gptel-runner-node-properties node) :agent)))
+         (layers
+          (append
+           (list (cons "Workflow" workflow-context)
+                 (cons "Run" run-context)
+                 (cons (format "Agent %s" (gptel-runner-agent-name agent))
+                       (gptel-runner-agent-context agent)))
+           (mapcar
+            (lambda (ancestor)
+              (cons (format "Node %s" (gptel-runner-node-id ancestor))
+                    (plist-get (gptel-runner-node-properties ancestor)
+                               :context)))
+            (gptel-runner--node-path root node))))
+         entries)
+    (dolist (layer layers (nreverse entries))
+      (dolist (source (gptel-runner--context-sources (cdr layer)))
+        (when-let* ((entry (gptel-runner--resolve-context-source
+                            run node source (car layer))))
+          (push entry entries))))))
+
+(defun gptel-runner--prepend-context (prompt entries)
+  "Prepend resolved context ENTRIES to PROMPT."
+  (if (null entries)
+      prompt
+    (concat
+     "Starting context\n================\n\n"
+     (mapconcat
+      (lambda (entry)
+        (format "%s context\n%s\n%s"
+                (car entry)
+                (make-string (+ (length (car entry)) 8) ?-)
+                (cdr entry)))
+      entries "\n\n")
+     "\n\nTask\n====\n\n"
+     prompt)))
 
 (defun gptel-runner--node-save-key (node)
   "Return NODE's own blackboard destination key, if any."
@@ -129,8 +272,9 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
       (cl-some #'gptel-runner--node-writable-p
                (gptel-runner-node-children node))))
 
-(defun gptel-runner--validate-workflow (root &optional allow-writes)
-  "Validate ROOT, including write opt-in ALLOW-WRITES, or signal an error."
+(defun gptel-runner--validate-workflow (root &optional allow-writes workspace)
+  "Validate ROOT, including write opt-in ALLOW-WRITES, or signal an error.
+When WORKSPACE is non-nil, validate context files relative to it."
   (let ((ids (make-hash-table :test #'equal)))
     (cl-labels
         ((walk
@@ -143,9 +287,17 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
             (when (gethash id ids)
               (user-error "Duplicate workflow node ID: %S" id))
             (puthash id t ids)
+            (when (plist-member props :context)
+              (gptel-runner--validate-context
+               (plist-get props :context) (format "node %S" id) workspace))
             (pcase kind
               ('agent
-               (gptel-runner--agent (plist-get props :agent))
+               (let ((agent (gptel-runner--agent
+                             (plist-get props :agent))))
+                 (gptel-runner--validate-context
+                  (gptel-runner-agent-context agent)
+                  (format "agent %S" (gptel-runner-agent-name agent))
+                  workspace))
                (unless (plist-member props :prompt)
                  (user-error "Agent node %S has no :prompt" id))
                (let ((retries (or (plist-get props :retries) 0)))
@@ -261,6 +413,8 @@ Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
   "Resolve NODE's prompt for RUN."
   (let* ((prompt (plist-get (gptel-runner-node-properties node) :prompt))
          (resolved (if (functionp prompt) (funcall prompt run node) prompt))
+         (resolved (gptel-runner--prepend-context
+                    resolved (gptel-runner--resolve-context run node)))
          (decisions (and (gptel-runner-decision-memory-p run)
                          (gptel-runner-decisions run)))
          (continuation (gptel-runner--latest-continuation run))
@@ -370,6 +524,16 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
         ((finish (state value)
            (gptel-runner--set-node-state run node state value)
            (funcall done state value))
+         (resolve-and-launch
+          ()
+          (let ((resolved
+                 (condition-case err
+                     (cons t (gptel-runner--prompt run node))
+                   (error
+                    (finish 'failed (list :type 'prompt :error err))
+                    nil))))
+            (when resolved
+              (launch (cdr resolved) nil))))
          (repair-empty
           (call error-data)
           (setq repaired t)
@@ -419,11 +583,11 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
                     (cl-decf semantic-left)
                     (gptel-runner--emit run 'agent-step-retry
                                         node nil value)
-                    (launch (gptel-runner--prompt run node) nil))
+                    (resolve-and-launch))
                    (t (finish 'failed value))))))
              repair-p))))
       (gptel-runner--set-node-state run node 'running)
-      (launch (gptel-runner--prompt run node) nil))))
+      (resolve-and-launch))))
 
 (defun gptel-runner--execute-sequence (run node done)
   "Execute sequence NODE in RUN and invoke DONE."
@@ -674,7 +838,7 @@ Return the new history entry, or nil when NODE does not collect history."
     (workflow &rest arguments
               &key goal workspace driver max-requests max-calls
               max-concurrency max-duration allow-writes
-              allow-unconfirmed-tools decision-memory persist callback
+              allow-unconfirmed-tools decision-memory persist context callback
               &allow-other-keys)
   "Start WORKFLOW with keyword ARGUMENTS and return its run immediately.
 GOAL and WORKSPACE describe the stateless task.  DRIVER defaults to
@@ -684,6 +848,7 @@ non-nil for any workflow containing a write agent.
 ALLOW-UNCONFIRMED-TOOLS disables gptel confirmation only when explicitly set.
 DECISION-MEMORY controls automatic propagation of recorded decisions and
 defaults to non-nil.
+CONTEXT adds run-wide starting context to the workflow's own context.
 PERSIST enables versioned snapshots at workflow checkpoints.
 CALLBACK runs exactly once with the terminal run."
   (ignore max-requests max-calls max-concurrency max-duration
@@ -716,6 +881,7 @@ CALLBACK runs exactly once with the terminal run."
                 :allow-unconfirmed-tools allow-unconfirmed-tools
                 :decision-memory (gptel-runner--option
                                   :decision-memory arguments defaults t)
+                :context context
                 :persist (gptel-runner--option
                           :persist arguments defaults persist))))
     (when (and (plist-get options :persist)
@@ -724,7 +890,11 @@ CALLBACK runs exactly once with the terminal run."
     (unless (and (integerp (plist-get options :max-concurrency))
                  (> (plist-get options :max-concurrency) 0))
       (user-error ":max-concurrency must be positive"))
-    (gptel-runner--validate-workflow root allow-writes)
+    (gptel-runner--validate-context
+     (plist-get defaults :context) "workflow" directory)
+    (gptel-runner--validate-context
+     (plist-get options :context) "run" directory)
+    (gptel-runner--validate-workflow root allow-writes directory)
     (let* ((budget (gptel-runner-budget-create
                     :max-requests (plist-get options :max-requests)
                     :max-calls (plist-get options :max-calls)
