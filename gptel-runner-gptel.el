@@ -24,6 +24,7 @@
 (declare-function gptel--handle-post "gptel-request")
 (declare-function gptel--apply-preset "gptel")
 (declare-function gptel--insert-response "gptel")
+(declare-function gptel-curl--stream-insert-response "gptel")
 (declare-function gptel--update-tool-ask "gptel")
 (declare-function gptel--update-tool-call "gptel")
 (declare-function gptel--update-status "gptel")
@@ -36,6 +37,7 @@
 (defvar gptel-request--handlers)
 (defvar gptel-confirm-tool-calls)
 (defvar gptel-default-mode)
+(defvar gptel-stream)
 
 (cl-defstruct (gptel-runner-gptel-driver
                (:constructor gptel-runner-gptel-driver-create))
@@ -59,6 +61,7 @@
   (dolist (function '(gptel-request gptel-abort gptel-make-fsm
                       gptel--fsm-transition gptel--handle-post
                       gptel--apply-preset gptel--insert-response
+                      gptel-curl--stream-insert-response
                       gptel--update-tool-ask gptel--update-tool-call
                       gptel--update-status gptel--update-wait
                       gptel--accept-tool-calls))
@@ -144,8 +147,43 @@ preset setter is private and has changed across releases."
                             (if (stringp retry-after)
                                 (string-to-number retry-after)
                               retry-after))
+          :retryable (plist-get info :runner-incomplete-tool-call)
+          :stop-reason (plist-get info :stop-reason)
           :status (plist-get info :status)
           :error (plist-get info :error))))
+
+(defun gptel-runner-gptel--prepare-request (fsm)
+  "Reset per-response state before sending runner FSM's next request."
+  (let* ((info (gptel-fsm-info fsm))
+         (call (plist-get info :context)))
+    ;; Keep intermediate commentary in the transcript and journal, but hand
+    ;; only the final model response to downstream nodes and output parsers.
+    (when (gptel-runner-call-p call)
+      (setf (gptel-runner-call-response-parts call) nil))
+    (plist-put info :stop-reason nil)
+    (plist-put info :runner-incomplete-tool-call nil)))
+
+(defun gptel-runner-gptel--incomplete-tool-response-p (info)
+  "Return non-nil for an incomplete tool response in request INFO.
+Used as a TYPE transition predicate, after the full response is parsed."
+  ;; Some providers report a tool-call stop with only introductory text
+  ;; and no tool payload.  The default TYPE transition treats this as DONE.
+  ;; Check before TOOL so schema tools that become final JSON remain valid.
+  (when (and (not (plist-get info :error))
+             (member (plist-get info :stop-reason)
+                     '("tool_calls" "tool_use" "function_call"))
+             (null (plist-get info :tool-use)))
+    (plist-put info :runner-incomplete-tool-call t)
+    (plist-put info :error
+               (format "Incomplete tool response: stop reason %S without tool calls"
+                       (plist-get info :stop-reason)))))
+
+(defun gptel-runner-gptel--insert-response (response info &optional raw)
+  "Render RESPONSE using the transport described by INFO, honoring RAW."
+  (funcall (if (plist-get info :stream)
+               #'gptel-curl--stream-insert-response
+             #'gptel--insert-response)
+           response info raw))
 
 (defun gptel-runner-gptel--callback (call observe response info &optional raw)
   "Use OBSERVE to record gptel RESPONSE and INFO for CALL.
@@ -155,22 +193,23 @@ RAW is gptel's internal flag for already formatted transcript content."
     (unless raw
       (push response (gptel-runner-call-response-parts call))
       (funcall observe 'response response))
-    (gptel--insert-response response info raw))
-   ((eq response 'abort) nil)
-   ((null response) nil)
+    (gptel-runner-gptel--insert-response response info raw))
+   ;; Streaming completion ends one HTTP response, not the agent's tool loop.
+   ((memq response '(nil abort t)) nil)
    ((consp response)
     (pcase (car response)
       ('reasoning
-       (funcall observe 'reasoning (cdr response))
-       (gptel--insert-response response info))
+       (when (stringp (cdr response))
+         (funcall observe 'reasoning (cdr response)))
+       (gptel-runner-gptel--insert-response response info))
       ('tool-call
        (funcall observe 'tool-calls (cdr response))
        (funcall observe 'waiting-confirmation (cdr response))
        ;; The normal gptel renderer adds its confirmation UI and callbacks.
-       (gptel--insert-response response info))
+       (gptel-runner-gptel--insert-response response info))
       ('tool-result
        (funcall observe 'tool-results (cdr response))
-       (gptel--insert-response response info))
+       (gptel-runner-gptel--insert-response response info))
       (_ (funcall observe 'response-part response))))
    (t (funcall observe 'response-part response))))
 
@@ -223,7 +262,7 @@ RAW is gptel's internal flag for already formatted transcript content."
   (let* ((info (gptel-fsm-info fsm))
          (call (plist-get info :context))
          (value (mapconcat #'identity
-                           (nreverse (gptel-runner-call-response-parts call)) "")))
+                           (reverse (gptel-runner-call-response-parts call)) "")))
     (gptel-runner-gptel--update-status info " Ready" 'success)
     (gptel-runner-gptel--post-once call fsm)
     (funcall (gptel-runner-gptel--complete-function call) 'success value nil)))
@@ -236,10 +275,14 @@ RAW is gptel's internal flag for already formatted transcript content."
          (status (plist-get metadata :http-status))
          (retryable (gptel-runner--retryable-p call status metadata)))
     (gptel-runner-gptel--update-status
-     info (format " Error: %s" (or status "request failed")) 'error)
+     info (format " Error: %s"
+                  (or (and (plist-get metadata :retryable)
+                           (plist-get metadata :error))
+                      status "request failed"))
+     'error)
     (unless retryable (gptel-runner-gptel--post-once call fsm))
     (funcall (gptel-runner-gptel--complete-function call)
-             (if (or retryable (null status)
+             (if (or retryable (plist-get metadata :retryable) (null status)
                      (memq status gptel-runner--retryable-statuses))
                  'transient
                'permanent)
@@ -259,7 +302,12 @@ RAW is gptel's internal flag for already formatted transcript content."
 
 (defun gptel-runner-gptel--make-fsm ()
   "Create a per-call FSM with runner terminals and gptel status handlers."
-  (let ((handlers (copy-tree gptel-request--handlers)))
+  (let ((handlers (copy-tree gptel-request--handlers))
+        (table (copy-tree gptel-request--transitions)))
+    ;; Streaming enters TYPE on the HTTP headers, before tool chunks arrive.
+    ;; Validate when leaving TYPE so both transports have parsed the payload.
+    (push (cons #'gptel-runner-gptel--incomplete-tool-response-p 'ERRS)
+          (alist-get 'TYPE table))
     ;; `gptel-request--handlers' drive the transport but intentionally omit
     ;; the status handlers used by interactive gptel buffers.  Runner worker
     ;; buffers enable `gptel-mode', so compose those handlers back in.  The
@@ -267,7 +315,8 @@ RAW is gptel's internal flag for already formatted transcript content."
     ;; synchronous tool can transition the FSM recursively before its handler
     ;; returns.
     (setf (alist-get 'WAIT handlers)
-          (append (alist-get 'WAIT handlers) (list #'gptel--update-wait))
+          (append (list #'gptel-runner-gptel--prepare-request)
+                  (alist-get 'WAIT handlers) (list #'gptel--update-wait))
           (alist-get 'TOOL handlers)
           (append (list #'gptel-runner-gptel--tool-started
                         #'gptel--update-tool-call)
@@ -276,7 +325,7 @@ RAW is gptel's internal flag for already formatted transcript content."
           (alist-get 'DONE handlers) (list #'gptel-runner-gptel--done)
           (alist-get 'ERRS handlers) (list #'gptel-runner-gptel--error)
           (alist-get 'ABRT handlers) (list #'gptel-runner-gptel--aborted))
-    (gptel-make-fsm :table (copy-tree gptel-request--transitions)
+    (gptel-make-fsm :table table
                     :handlers handlers)))
 
 (defun gptel-runner-gptel--cleanup (call)
@@ -325,7 +374,8 @@ RAW is gptel's internal flag for already formatted transcript content."
           (setf (gptel-runner-call-fsm call) fsm)
           (gptel-request
               (gptel-runner-call-prompt call)
-            :buffer buffer :stream nil :context call :schema schema :fsm fsm
+            :buffer buffer :stream gptel-stream
+            :context call :schema schema :fsm fsm
             :callback
             (lambda (response info &optional raw)
               (gptel-runner-gptel--callback

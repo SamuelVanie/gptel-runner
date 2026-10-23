@@ -2,6 +2,12 @@
 
 ## 0.1.0 - unreleased
 
+- Honor gptel's streaming setting instead of forcing non-streaming requests,
+  render streamed text and reasoning correctly, and validate incomplete tool
+  responses after the full payload arrives.
+- Retry incomplete tool-call responses instead of accepting introductory text
+  as a completed node, and save only the final model response for downstream
+  steps while retaining intermediate commentary in transcripts and events.
 - Add deterministic workflow AST and asynchronous scheduler.
 - Add fake and gptel drivers, retries, budgets, cancellation, and events.
 - Add structured review cycles, stall detection, and parallel joins.

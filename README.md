@@ -610,7 +610,16 @@ exception whose package fallback is `t`; use an explicit nil value to opt out.
 - Request retries reuse one logical call and consume request attempts.  An
   agent-step retry creates a new call.  An implementation revision is a new
   workflow iteration.  These are intentionally separate counters.
+- Requests honor `gptel-stream`, including preset overrides and backend/model
+  support, just like ordinary gptel chats.  Tool calls and reasoning can stream
+  into the worker transcript; a stream ending does not finish the agent until
+  gptel's tool loop has completed.
 - A successful provider request must still return a non-empty final response.
+  Intermediate text accompanying tool calls stays in the transcript and event
+  journal; only the final response is saved for downstream nodes.  A provider
+  response that reports `tool_calls`, `tool_use`, or `function_call` without
+  supplying tool calls is retried within the existing request/retry limits,
+  and fails the node if those limits are exhausted.
   If it returns only `nil` or whitespace (for example, after ending on a tool
   call), the runner marks that call failed, asks the same agent once for a
   stateless repaired answer, and fails the node immediately if that answer is

@@ -119,7 +119,9 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
   "Start CALL with DRIVER.
 COMPLETE accepts STATUS, VALUE, and optional METADATA.  OBSERVE accepts an
 event type and data.  A driver must call COMPLETE at most once, but the core is
-defensive against duplicate and late calls.")
+defensive against duplicate and late calls.  METADATA may include
+`:retryable t' for a transient protocol failure despite a successful HTTP
+status; request budgets, retry limits, and `:permanent' still apply.")
 
 (cl-defgeneric gptel-runner-driver-cancel (driver call)
   "Ask DRIVER to cancel CALL.")
@@ -536,7 +538,8 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
           (gptel-runner-call-run call))
          (< attempt (1+ (gptel-runner-retry-policy-max-retries policy)))
          (or (null status)
-             (memq status (gptel-runner-retry-policy-statuses policy)))
+             (memq status (gptel-runner-retry-policy-statuses policy))
+             (plist-get metadata :retryable))
          (not (plist-get metadata :permanent)))))
 
 (defun gptel-runner--retry-delay (call metadata)

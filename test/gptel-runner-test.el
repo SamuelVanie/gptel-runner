@@ -486,6 +486,36 @@
         (should (= (gptel-runner-call-request-attempt
                     (car (gptel-runner-run-calls run))) 2))))))
 
+(ert-deftest gptel-runner-retryable-protocol-errors-respect-retry-policy ()
+  (dolist (recover '(t nil))
+    (gptel-runner-test--isolated
+      (gptel-runner-register-agent
+       'worker :preset 'p
+       :retry-policy (gptel-runner-retry-policy-create
+                      :max-retries 1 :base-delay 0 :jitter 0))
+      (let* ((driver (gptel-runner-fake-driver-create))
+             (incomplete '(:status transient :value "Missing tool calls"
+                           :metadata (:http-status 200 :retryable t))))
+        (gptel-runner-fake-queue
+         driver 'worker incomplete
+         (if recover '(:value "complete proposal") incomplete)
+         '(:value "report"))
+        (let ((run (gptel-runner-start
+                    (gptel-runner-sequence
+                     (gptel-runner-test--step 'proposal 'worker 'proposal)
+                     (gptel-runner-test--step 'report 'worker 'report))
+                    :driver driver)))
+          (should (eq (gptel-runner-test--wait run)
+                      (if recover 'succeeded 'failed)))
+          (should (= (length (gptel-runner-run-calls run))
+                     (if recover 2 1)))
+          (should (= (length (gptel-runner-fake-driver-starts driver))
+                     (if recover 3 2)))
+          (should (equal (gptel-runner-get run 'proposal)
+                         (and recover "complete proposal")))
+          (should (equal (gptel-runner-get run 'report)
+                         (and recover "report"))))))))
+
 (ert-deftest gptel-runner-cancellation-during-backoff-stops-retry ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent
