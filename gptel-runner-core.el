@@ -115,6 +115,31 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
   duration-timer duration-remaining active-started-at
   paused-at snapshot-file (generation 0) options)
 
+(defun gptel-runner--node-workspace (node workspace)
+  "Resolve NODE's workspace override relative to run WORKSPACE.
+An absent or nil override falls back to WORKSPACE."
+  (if-let* ((override (plist-get (gptel-runner-node-properties node)
+                                :workspace)))
+      (progn
+        (unless (and (stringp override) (not (string-empty-p override)))
+          (user-error "Node %S workspace must be a non-empty directory name"
+                      (gptel-runner-node-id node)))
+        (let ((directory (file-name-as-directory
+                          (file-truename
+                           (expand-file-name override workspace)))))
+          (unless (file-directory-p directory)
+            (user-error "Node %S workspace is not a directory: %s"
+                        (gptel-runner-node-id node) directory))
+          directory))
+    workspace))
+
+(defun gptel-runner-node-workspace (run node)
+  "Return the effective workspace for agent NODE in RUN.
+NODE's non-nil `:workspace' overrides the run workspace.  Relative paths
+are resolved from the run workspace, and symbolic links are canonicalized.
+Use this function in prompts and context functions that need NODE's directory."
+  (gptel-runner--node-workspace node (gptel-runner-run-workspace run)))
+
 (cl-defgeneric gptel-runner-driver-start (driver call complete observe)
   "Start CALL with DRIVER.
 COMPLETE accepts STATUS, VALUE, and optional METADATA.  OBSERVE accepts an
@@ -685,7 +710,12 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
   (and (< (gptel-runner-run-active-count run)
           (or (plist-get (gptel-runner-run-options run) :max-concurrency) 1))
        (or (not (gptel-runner--writer-p call))
-           (zerop (gptel-runner-run-writer-active run)))))
+           (not (cl-some
+                 (lambda (active)
+                   (and (gptel-runner--writer-p active)
+                        (equal (gptel-runner-call-workspace active)
+                               (gptel-runner-call-workspace call))))
+                 (gptel-runner-run-active-calls run))))))
 
 (defun gptel-runner--drain-queue (run)
   "Process queued work in RUN as budgets and locks permit."
@@ -725,7 +755,7 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
     (let ((call (gptel-runner-call-create
                  :id (gptel-runner--id "call") :run run :node node
                  :agent agent :prompt prompt
-                 :workspace (gptel-runner-run-workspace run)
+                 :workspace (gptel-runner-node-workspace run node)
                  :state 'ready :on-complete done :repair-p repair-p)))
       (setf (gptel-runner-run-calls run)
             (nconc (gptel-runner-run-calls run) (list call))

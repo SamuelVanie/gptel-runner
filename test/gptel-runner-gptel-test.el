@@ -439,6 +439,45 @@
                   " Ready")))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
+(ert-deftest gptel-runner-gptel-workers-use-node-workspaces ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'researcher :preset nil)
+    (let* ((workspace (make-temp-file "gptel-runner-workspaces-" t))
+           (directory (file-name-as-directory (file-truename workspace)))
+           (node-directory (expand-file-name "node/" directory))
+           (original-directory default-directory))
+      (unwind-protect
+          (progn
+            (make-directory node-directory)
+            (let* ((run (gptel-runner-start
+                         (gptel-runner-parallel
+                          (gptel-runner-agent-step
+                           :id 'override :agent 'researcher :workspace "node"
+                           :prompt "Research node")
+                          (gptel-runner-agent-step
+                           :id 'inherited :agent 'researcher :prompt "Research run"))
+                         :workspace workspace :max-concurrency 2
+                         :driver (gptel-runner-gptel-driver-create)))
+                   (calls (gptel-runner-run-calls run)))
+              (should (= (length requests) 2))
+              (cl-mapc
+               (lambda (call expected)
+                 (let ((buffer (gptel-runner-call-buffer call)))
+                   (should (equal (buffer-local-value 'default-directory buffer)
+                                  expected))
+                   (with-current-buffer buffer
+                     (should (string-match-p
+                              (regexp-quote (concat "Workspace: " expected))
+                              (buffer-string))))))
+               calls (list node-directory directory))
+              (should-not (eq (gptel-runner-call-buffer (car calls))
+                              (gptel-runner-call-buffer (cadr calls))))
+              (dolist (request requests)
+                (gptel-runner-gptel-test--reply request "Findings" "stop"))
+              (should (eq (gptel-runner-run-state run) 'succeeded))
+              (should (equal default-directory original-directory))))
+        (delete-directory workspace t)))))
+
 (ert-deftest gptel-runner-gptel-worker-is-private-and-local ()
   (let* ((agent (gptel-runner-agent-create :name 'a :preset nil))
          (run (gptel-runner-run-create :id "run"))

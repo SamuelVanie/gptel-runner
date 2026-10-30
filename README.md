@@ -70,6 +70,50 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
+### Per-node workspaces
+
+Set `:workspace` on an agent step to run it in a different directory.  An
+omitted or nil value inherits the workspace passed to `gptel-runner-start`.
+Relative paths are resolved from that run workspace; absolute paths are used
+directly.  Overrides must name existing directories and are validated before
+any calls start.
+
+For example, with a registered `researcher` agent, three nodes can research
+three repositories concurrently:
+
+```elisp
+(defun example/research-prompt (run node)
+  (format "Research this goal: %s\nWorkspace: %s\nReturn your findings."
+          (gptel-runner-run-goal run)
+          (gptel-runner-node-workspace run node)))
+
+(gptel-runner-defworkflow multi-workspace-research (:max-concurrency 3)
+  (gptel-runner-parallel
+   (gptel-runner-agent-step
+    :id 'research-a :agent 'researcher :workspace "/projects/repo-a"
+    :prompt #'example/research-prompt :save-as 'findings-a)
+   (gptel-runner-agent-step
+    :id 'research-b :agent 'researcher :workspace "/projects/repo-b"
+    :prompt #'example/research-prompt :save-as 'findings-b)
+   (gptel-runner-agent-step
+    :id 'research-c :agent 'researcher
+    :prompt #'example/research-prompt :save-as 'findings-c)))
+
+(gptel-runner-start 'multi-workspace-research
+ :goal "Compare the authentication implementations"
+ :workspace "/projects/repo-c")
+```
+
+Use `gptel-runner-node-workspace` in prompt and context functions to get the
+selected node directory.  `gptel-runner-run-workspace` continues to return the
+run's default.  Each worker buffer uses its node directory as
+`default-directory`.  Workspace overrides belong to agent steps; sequence,
+parallel, branch, and repeat nodes do not set a subtree workspace.
+
+Within a run, writers targeting the same canonical directory (including
+symlink aliases) are serialized.  Writers in different directories can run
+concurrently up to `:max-concurrency`.
+
 ### Starting context and artifacts
 
 Add `:context` at any workflow level to prepend stable project knowledge to
@@ -116,7 +160,9 @@ through the agent step.  The step's ordinary `:prompt` follows all starting
 context.  Context on a sequence, repeat, parallel, or branch is inherited only
 by agent steps in that subtree.
 
-Relative file names are resolved from the run workspace.  Files and context
+Relative file names at every context scope are resolved from the receiving
+agent node's effective workspace.  Use absolute paths for files shared across
+different workspaces.  Files and context
 functions are evaluated when each call is prepared, so a later sequence step
 or loop iteration sees updated artifact contents.  Missing or unreadable files
 and non-string function results are reported as context errors.  Use
@@ -601,8 +647,8 @@ exception whose package fallback is `t`; use an explicit nil value to opt out.
   `:allow-writes t`.  Writers sharing a canonical workspace are serialized.
 - `workspace-mode` is orchestration metadata, **not a security sandbox**.  Tool
   lists and gptel confirmation policy remain the real capability boundary.
-  Parallel writable isolation and enforced read-only access require future
-  worktree/tool-wrapper support.
+  The runner does not create isolated worktrees or enforce read-only access;
+  provision separate directories and tool restrictions as needed.
 - Tool confirmation remains enabled unless callers also explicitly request
   `:allow-unconfirmed-tools t`.  Side-effecting tools should be idempotent:
   transport retries have at-least-once semantics, and arbitrary asynchronous

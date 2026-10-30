@@ -21,9 +21,12 @@
 (defun gptel-runner-agent-step (&rest properties)
   "Return an agent node described by PROPERTIES.
 Required keys are `:id', `:agent', and `:prompt'.  `:save-as', `:retries',
-`:parser', `:validator', `:repair-invalid', `:pause-after', and `:context'
-customize its execution.  A non-nil `:pause-after' holds a successful response
-for human feedback before completing the node."
+`:parser', `:validator', `:repair-invalid', `:pause-after', `:workspace',
+and `:context' customize its execution.  A non-nil `:pause-after' holds a
+successful response for human feedback before completing the node.
+`:workspace' selects an existing directory, relative to the run workspace
+or absolute.  Omitted or
+nil values inherit the workspace passed to `gptel-runner-start'."
   (gptel-runner-node-create
    :id (gptel-runner--node-id properties 'agent)
    :kind 'agent :properties properties))
@@ -90,9 +93,9 @@ arguments are child nodes."
             gptel-runner--workflows))
 
 (defun gptel-runner-context-file (file)
-  "Return a context source that reads FILE from a run's workspace.
+  "Return a context source that reads FILE from an agent node's workspace.
 Absolute names are used as given.  Relative names are expanded from the
-workspace passed to `gptel-runner-start'."
+effective workspace of the agent node receiving the context."
   (unless (stringp file)
     (user-error "Context file must be a string: %S" file))
   (list :file file))
@@ -153,9 +156,9 @@ When WORKSPACE is non-nil, also require every declared file to be readable."
                for path = (gptel-runner--node-path child target)
                when path return (cons root path)))))
 
-(defun gptel-runner--read-context-file (run file)
-  "Return FILE's contents, resolving it from RUN's workspace."
-  (let ((path (expand-file-name file (gptel-runner-run-workspace run))))
+(defun gptel-runner--read-context-file (run node file)
+  "Return FILE's contents, resolving it from NODE's workspace in RUN."
+  (let ((path (expand-file-name file (gptel-runner-node-workspace run node))))
     (unless (and (file-regular-p path) (file-readable-p path))
       (user-error "Context file is not a readable regular file: %s" path))
     (with-temp-buffer
@@ -171,7 +174,7 @@ Return a cons of label and text, or nil when a function omits its context."
    ((gptel-runner--context-file-p source)
     (let ((file (cadr source)))
       (cons (format "%s (file %s)" owner file)
-            (gptel-runner--read-context-file run file))))
+            (gptel-runner--read-context-file run node file))))
    ((gptel-runner--context-function source)
     (let ((value (funcall (gptel-runner--context-function source) run node)))
       (unless (or (null value) (stringp value))
@@ -272,32 +275,44 @@ Return a cons of label and text, or nil when a function omits its context."
       (cl-some #'gptel-runner--node-writable-p
                (gptel-runner-node-children node))))
 
-(defun gptel-runner--validate-workflow (root &optional allow-writes workspace)
+(defun gptel-runner--validate-workflow
+    (root &optional allow-writes workspace contexts)
   "Validate ROOT, including write opt-in ALLOW-WRITES, or signal an error.
-When WORKSPACE is non-nil, validate context files relative to it."
+When WORKSPACE is non-nil, validate context files in each agent's workspace.
+CONTEXTS is an alist of labels and context sources inherited by every agent."
   (let ((ids (make-hash-table :test #'equal)))
+    (dolist (entry contexts)
+      (gptel-runner--validate-context (cdr entry) (car entry)))
     (cl-labels
         ((walk
-          (node)
+          (node inherited-contexts)
           (unless (gptel-runner-node-p node)
             (user-error "Workflow child is not a runner node: %S" node))
-          (let ((id (gptel-runner-node-id node))
-                (kind (gptel-runner-node-kind node))
-                (props (gptel-runner-node-properties node)))
+          (let* ((id (gptel-runner-node-id node))
+                 (kind (gptel-runner-node-kind node))
+                 (props (gptel-runner-node-properties node))
+                 (contexts (cons (cons (format "node %S" id)
+                                       (plist-get props :context))
+                                 inherited-contexts)))
             (when (gethash id ids)
               (user-error "Duplicate workflow node ID: %S" id))
             (puthash id t ids)
             (when (plist-member props :context)
               (gptel-runner--validate-context
-               (plist-get props :context) (format "node %S" id) workspace))
+               (plist-get props :context) (format "node %S" id)))
+            (when (and (plist-get props :workspace) (not (eq kind 'agent)))
+              (user-error "Only agent nodes support :workspace (node %S)" id))
             (pcase kind
               ('agent
-               (let ((agent (gptel-runner--agent
-                             (plist-get props :agent))))
+               (let ((agent (gptel-runner--agent (plist-get props :agent)))
+                     (directory (gptel-runner--node-workspace node workspace)))
+                 (dolist (entry contexts)
+                   (gptel-runner--validate-context
+                    (cdr entry) (car entry) directory))
                  (gptel-runner--validate-context
                   (gptel-runner-agent-context agent)
                   (format "agent %S" (gptel-runner-agent-name agent))
-                  workspace))
+                  directory))
                (unless (plist-member props :prompt)
                  (user-error "Agent node %S has no :prompt" id))
                (let ((retries (or (plist-get props :retries) 0)))
@@ -376,8 +391,9 @@ When WORKSPACE is non-nil, validate context files relative to it."
                      (puthash key t seen)))))
               ((or 'sequence) nil)
               (_ (user-error "Unknown node kind %S at %S" kind id)))
-            (mapc #'walk (gptel-runner-node-children node)))))
-      (walk root))
+            (dolist (child (gptel-runner-node-children node))
+              (walk child contexts)))))
+      (walk root contexts))
     (when (and (gptel-runner--node-writable-p root) (not allow-writes))
       (user-error "Writable workflow requires explicit :allow-writes t"))
     t))
@@ -495,7 +511,7 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
            "Original goal: %s\nWorkspace: %s\nNode: %S\n"
            "Invalid output:\n%s\nValidation error: %S\n"
            "Do not perform the task again; repair only the output format.")
-   (gptel-runner-run-goal run) (gptel-runner-run-workspace run)
+   (gptel-runner-run-goal run) (gptel-runner-node-workspace run node)
    (gptel-runner-node-id node) value error-data))
 
 (defun gptel-runner--empty-output-repair-prompt (run node original-prompt)
@@ -509,7 +525,7 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
            "non-empty final response for the next workflow step.\n"
            "Original goal: %s\nWorkspace: %s\nNode: %S\n"
            "Original task:\n%s")
-   (gptel-runner-run-goal run) (gptel-runner-run-workspace run)
+   (gptel-runner-run-goal run) (gptel-runner-node-workspace run node)
    (gptel-runner-node-id node) original-prompt))
 
 (defun gptel-runner--execute-agent (run node done)
@@ -841,7 +857,8 @@ Return the new history entry, or nil when NODE does not collect history."
               allow-unconfirmed-tools decision-memory persist context callback
               &allow-other-keys)
   "Start WORKFLOW with keyword ARGUMENTS and return its run immediately.
-GOAL and WORKSPACE describe the stateless task.  DRIVER defaults to
+GOAL and WORKSPACE describe the stateless task.  Agent nodes may override
+WORKSPACE with their own `:workspace' property.  DRIVER defaults to
 `gptel-runner-default-driver'.  MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
 MAX-DURATION override workflow defaults.  ALLOW-WRITES must be explicitly
 non-nil for any workflow containing a write agent.
@@ -890,11 +907,10 @@ CALLBACK runs exactly once with the terminal run."
     (unless (and (integerp (plist-get options :max-concurrency))
                  (> (plist-get options :max-concurrency) 0))
       (user-error ":max-concurrency must be positive"))
-    (gptel-runner--validate-context
-     (plist-get defaults :context) "workflow" directory)
-    (gptel-runner--validate-context
-     (plist-get options :context) "run" directory)
-    (gptel-runner--validate-workflow root allow-writes directory)
+    (gptel-runner--validate-workflow
+     root allow-writes directory
+     (list (cons "workflow" (plist-get defaults :context))
+           (cons "run" (plist-get options :context))))
     (let* ((budget (gptel-runner-budget-create
                     :max-requests (plist-get options :max-requests)
                     :max-calls (plist-get options :max-calls)

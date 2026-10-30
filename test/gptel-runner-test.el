@@ -89,6 +89,221 @@
       (should-not (gptel-runner-find-run "missing"))
       (should-not (gptel-runner-find-run 'run-42)))))
 
+(ert-deftest gptel-runner-node-workspaces-override-and-inherit ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'researcher :preset 'p)
+    (let* ((workspace (make-temp-file "gptel-runner-workspaces-" t))
+           (directory (file-name-as-directory (file-truename workspace)))
+           (a (expand-file-name "a/" directory))
+           (b (expand-file-name "b/" directory))
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (make-directory a)
+            (make-directory b)
+            (dotimes (_ 4)
+              (gptel-runner-fake-queue driver 'researcher '(:manual t)))
+            (let* ((root
+                    (gptel-runner-parallel
+                     (gptel-runner-agent-step
+                      :id 'a :agent 'researcher :workspace a
+                      :prompt #'gptel-runner-node-workspace)
+                     (gptel-runner-agent-step
+                      :id 'b :agent 'researcher :workspace "b"
+                      :prompt #'gptel-runner-node-workspace)
+                     (gptel-runner-agent-step
+                      :id 'inherited :agent 'researcher
+                      :prompt #'gptel-runner-node-workspace)
+                     (gptel-runner-agent-step
+                      :id 'explicit-nil :agent 'researcher :workspace nil
+                      :prompt #'gptel-runner-node-workspace)))
+                   (run (gptel-runner-start
+                         root :workspace workspace :driver driver
+                         :max-concurrency 4))
+                   (calls (gptel-runner-run-calls run)))
+              (should (equal (gptel-runner-run-workspace run) directory))
+              (should (equal (mapcar #'gptel-runner-call-workspace calls)
+                             (list a b directory directory)))
+              (should (equal (mapcar #'gptel-runner-call-prompt calls)
+                             (list a b directory directory)))
+              (should (= (gptel-runner-fake-driver-max-active driver) 4))
+              (dolist (call calls)
+                (gptel-runner-fake-release driver call '(:value "findings")))
+              (should (eq (gptel-runner-run-state run) 'succeeded))
+              ;; Resolving a relative workspace must not mutate the definition.
+              (should (equal (plist-get (gptel-runner-node-properties
+                                         (cadr (gptel-runner-node-children root)))
+                                        :workspace)
+                             "b"))))
+        (delete-directory workspace t)))))
+
+(ert-deftest gptel-runner-node-workspaces-validate-before-dispatch ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let ((workspace (make-temp-file "gptel-runner-workspaces-" t))
+          (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (with-temp-file (expand-file-name "file" workspace) (insert "text"))
+            (dolist (invalid '(42 "" "missing" "file"))
+              (should-error
+               (gptel-runner-start
+                (gptel-runner-sequence
+                 (gptel-runner-test--step 'first 'worker)
+                 (gptel-runner-agent-step
+                  :id 'invalid :agent 'worker :workspace invalid :prompt "work"))
+                :workspace workspace :driver driver)
+               :type 'user-error))
+            (should-not (gptel-runner-fake-driver-starts driver))
+            (should (zerop (hash-table-count gptel-runner--runs))))
+        (delete-directory workspace t)))))
+
+(ert-deftest gptel-runner-node-workspaces-resolve-all-context-scopes ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p :context '(:file "notes"))
+    (let ((workspace (make-temp-file "gptel-runner-workspaces-" t))
+          (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            ;; The file exists only in the node workspaces, not the run root.
+            (dolist (name '("a" "b"))
+              (make-directory (expand-file-name name workspace))
+              (with-temp-file (expand-file-name (concat name "/notes") workspace)
+                (insert (concat "Evidence from " name)))
+              (gptel-runner-fake-queue driver 'worker '(:value "done")))
+            (gptel-runner-defworkflow workspace-context
+                (:context (:file "notes"))
+              (gptel-runner-sequence
+               :context '(:file "notes")
+               (gptel-runner-agent-step
+                :id 'a :agent 'worker :workspace "a" :context '(:file "notes")
+                :prompt #'gptel-runner-node-workspace)
+               (gptel-runner-agent-step
+                :id 'b :agent 'worker :workspace "b" :context '(:file "notes")
+                :prompt #'gptel-runner-node-workspace)))
+            (let ((run (gptel-runner-start
+                        'workspace-context :workspace workspace :driver driver
+                        :context '(:file "notes"))))
+              (should (eq (gptel-runner-run-state run) 'succeeded))
+              (cl-mapc
+               (lambda (call name)
+                 (let ((prompt (gptel-runner-call-prompt call)))
+                   (should (= (length (split-string
+                                       prompt (concat "Evidence from " name))) 6))
+                   (should (string-suffix-p
+                            (gptel-runner-call-workspace call) prompt))))
+               (gptel-runner-run-calls run) '("a" "b")))
+            ;; Inherited files must also be checked in each target workspace.
+            (delete-file (expand-file-name "b/notes" workspace))
+            (should-error
+             (gptel-runner-start
+              'workspace-context :workspace workspace :driver driver)
+             :type 'user-error))
+        (delete-directory workspace t)))))
+
+(ert-deftest gptel-runner-node-workspaces-survive-repairs-and-step-retries ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((workspace (make-temp-file "gptel-runner-workspaces-" t))
+           (directory (expand-file-name
+                       "node/" (file-name-as-directory (file-truename workspace)))))
+      (unwind-protect
+          (progn
+            (make-directory directory)
+            (dolist (outcome '((:value "") (:value "invalid")
+                               (:status permanent :value "failed")))
+              (let ((driver (gptel-runner-fake-driver-create)))
+                (gptel-runner-fake-queue driver 'worker outcome '(:value "done"))
+                (let ((run (gptel-runner-start
+                            (gptel-runner-agent-step
+                             :id 'work :agent 'worker :workspace "node"
+                             :prompt "Research" :retries 1 :repair-invalid t
+                             :validator (lambda (value) (equal value "done")))
+                            :workspace workspace :driver driver)))
+                  (should (eq (gptel-runner-run-state run) 'succeeded))
+                  (should (= (length (gptel-runner-run-calls run)) 2))
+                  (dolist (call (gptel-runner-run-calls run))
+                    (should (equal (gptel-runner-call-workspace call) directory))
+                    (when (gptel-runner-call-repair-p call)
+                      (should (string-match-p
+                               (regexp-quote (concat "Workspace: " directory))
+                               (gptel-runner-call-prompt call)))))))))
+        (delete-directory workspace t)))))
+
+(ert-deftest gptel-runner-node-workspaces-lock-writers-by-canonical-directory ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'writer :preset 'p :workspace-mode 'write)
+    (let* ((workspace (make-temp-file "gptel-runner-workspaces-" t))
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (make-directory (expand-file-name "a" workspace))
+            (make-directory (expand-file-name "b" workspace))
+            (make-symbolic-link (expand-file-name "a" workspace)
+                                (expand-file-name "alias" workspace))
+            (dotimes (_ 3)
+              (gptel-runner-fake-queue driver 'writer '(:manual t)))
+            (let* ((run (gptel-runner-start
+                         (gptel-runner-parallel
+                          (gptel-runner-agent-step
+                           :id 'a :agent 'writer :workspace "a" :prompt "write")
+                          (gptel-runner-agent-step
+                           :id 'alias :agent 'writer :workspace "alias"
+                           :prompt "write")
+                          (gptel-runner-agent-step
+                           :id 'b :agent 'writer :workspace "b" :prompt "write"))
+                         :driver driver :workspace workspace
+                         :allow-writes t :max-concurrency 2))
+                   (calls (gptel-runner-run-calls run)))
+              (should (equal (gptel-runner-fake-driver-starts driver)
+                             (list (nth 0 calls) (nth 2 calls))))
+              (should (equal (gptel-runner-call-workspace (nth 0 calls))
+                             (gptel-runner-call-workspace (nth 1 calls))))
+              (gptel-runner-fake-release driver (nth 0 calls) '(:value "a"))
+              (should (equal (gptel-runner-fake-driver-starts driver)
+                             (list (nth 0 calls) (nth 2 calls) (nth 1 calls))))
+              (gptel-runner-fake-release driver (nth 1 calls) '(:value "alias"))
+              (gptel-runner-fake-release driver (nth 2 calls) '(:value "b"))
+              (should (eq (gptel-runner-run-state run) 'succeeded))
+              (should (= (gptel-runner-fake-driver-max-active driver) 2))
+              (should (zerop (gptel-runner-run-writer-active run)))))
+        (delete-directory workspace t)))))
+
+(ert-deftest gptel-runner-node-workspaces-survive-snapshot-resume ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'worker :preset 'p)
+    (let* ((workspace (make-temp-file "gptel-runner-workspaces-" t))
+           (gptel-runner-snapshot-directory (expand-file-name "snapshots" workspace))
+           (directory (expand-file-name "node/" (file-truename workspace)))
+           (driver (gptel-runner-fake-driver-create)))
+      (unwind-protect
+          (progn
+            (make-directory directory)
+            (with-temp-file (expand-file-name "notes" directory)
+              (insert "Node evidence"))
+            (gptel-runner-defworkflow workspace-resume
+                (:persist t :context (:file "notes"))
+              (gptel-runner-agent-step
+               :id 'research :agent 'worker :workspace "node" :prompt "Research"))
+            (gptel-runner-fake-queue driver 'worker '(:manual t))
+            (let ((run (gptel-runner-start
+                        'workspace-resume :workspace workspace :driver driver)))
+              (gptel-runner-pause-run run)
+              (should (eq (gptel-runner-test--wait-for-snapshot run) 'clean))
+              (setq gptel-runner--runs (make-hash-table :test #'equal))
+              (gptel-runner-fake-queue driver 'worker '(:value "done"))
+              (let ((restored (gptel-runner-load-run
+                               (gptel-runner-run-snapshot-file run) nil driver)))
+                (gptel-runner-resume-run restored)
+                (should (eq (gptel-runner-run-state restored) 'succeeded))
+                (let ((call (car (gptel-runner-run-calls restored))))
+                  (should (equal (gptel-runner-call-workspace call) directory))
+                  (should (string-match-p "Node evidence"
+                                          (gptel-runner-call-prompt call))))
+                (should (eq (gptel-runner-test--wait-for-snapshot restored)
+                            'clean)))))
+        (delete-directory workspace t)))))
+
 (ert-deftest gptel-runner-context-is-resolved-and-inherited-by-scope ()
   (gptel-runner-test--isolated
     (let ((workspace (make-temp-file "gptel-runner-context-" t))

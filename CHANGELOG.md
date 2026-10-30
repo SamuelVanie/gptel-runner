@@ -2,6 +2,8 @@
 
 ## 0.1.0 - unreleased
 
+- Add per-agent-step `:workspace` overrides with run-workspace fallback,
+  node-relative context files, and writer serialization per directory.
 - Honor gptel's streaming setting instead of forcing non-streaming requests,
   render streamed text and reasoning correctly, and validate incomplete tool
   responses after the full payload arrives.
