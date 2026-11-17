@@ -251,15 +251,15 @@ ignored so the table keeps a stable canonical layout:
 
 ```elisp
 (setq gptel-runner-dashboard-columns
-      '(workflow run node state elapsed))
+      '(workflow run node job agent state elapsed))
 ```
 
-Available symbols are `workflow`, `run`, `node`, `call`, `state`, `elapsed`,
+Available symbols are `workflow`, `run`, `node`, `call`, `job`, `agent`, `state`, `elapsed`,
 `attempts`, `iteration`, `requests`, and `calls`.  Press `g` in an open
 dashboard after changing the variable, or choose `V` from the `?` action menu
 to toggle one column interactively.  The same action is available as
 `M-x gptel-runner-dashboard-toggle-column`.
-The default is deliberately compact, rows stay on one line instead of
+The default includes job and agent names.  Rows stay on one line instead of
 wrapping, and the current row is highlighted.  Values longer than their column
 are shortened with an ellipsis so later columns stay aligned; hovering the
 shortened value shows its complete text.  The spelling
@@ -633,6 +633,248 @@ Workflow defaults are used when an option is not provided.  A function passed
 as per-run `:context` must be readable Emacs Lisp data for persistent runs, so
 prefer a named function there.  `:decision-memory` is the
 exception whose package fallback is `t`; use an explicit nil value to opt out.
+
+## Background jobs and macOS schedules
+
+A job is a reusable invocation of any named workflow.  It specifies the
+workflow, an initialization file for a fresh worker Emacs, start arguments,
+and optionally a recurring schedule.  Jobs do not depend on a repository
+hosting service or a particular kind of agent.
+
+Each invocation runs in a separate `emacs -Q --batch` process.  Parallel nodes
+still execute concurrent agent requests inside that worker.  Your ordinary
+Emacs reads the durable history and sends commands; it never takes ownership
+of the worker's executable run.  Connecting another `emacsclient` to your
+ordinary Emacs server would share its process and would not provide this
+isolation.
+
+### Define and run a job
+
+The bundled [background example](examples/background-jobs.el) uses the fake
+driver and makes no network requests.  It runs two agents in parallel, saves
+both results, synthesizes a report, and publishes a report file:
+
+```elisp
+(require 'gptel-runner-jobs)
+(require 'gptel-runner-jobs-ui)
+
+(setq my-background-job
+      (gptel-runner-job-save
+       (list :name "Parallel example"
+             :workflow 'background-example
+             :init-file "/path/to/gptel-runner/examples/background-jobs.el"
+             :preload-features nil ; This fake example needs no agent packages.
+             :arguments
+             '(:goal "Demonstrate a background pipeline"
+               :workspace "/path/to/workspace/"
+               :inputs ((subject . "my project")))
+             :schedule '(:interval 3600))))
+
+;; On macOS, launchd owns this worker, so it survives closing the editor.
+(setq my-invocation (gptel-runner-job-run my-background-job))
+(gptel-runner-show-dashboard)
+```
+
+Saving a job does not install its schedule or execute it.  The saved record
+has a stable `:id`; pass that identifier or the record to job commands.  Use
+`M-x gptel-runner-show-jobs` to manage definitions and schedules.
+
+Workers automatically load `gptel` and `gptel-agent` **before** the job's
+`:init-file`, then call `gptel-agent-update` to discover agent definitions
+and refresh the package's standard presets.  Your init file runs afterward
+and has final authority over configuration and preset overrides.  If it
+changes `gptel-agent-dirs`, call `gptel-agent-update` there to discover those
+additional definitions.  This bootstrap runs on every worker start,
+including checkpoint recovery.  Other agent files still need explicit
+runner registrations if they are used as pipeline steps.
+
+Saving a new job captures the editor's external Lisp library directories,
+so Straight installs and local packages remain available in a fresh `-Q`
+process.  Emacs's bundled Lisp directories are excluded; the worker uses
+those from its own executable.  For a checkout not already on `load-path`,
+configure this once before saving jobs:
+
+```elisp
+(setq gptel-runner-job-load-path '("~/projects/gptel-agent/"))
+```
+
+The captured paths and `gptel-runner-job-preload-features` (default
+`'(gptel gptel-agent)`) are stored as `:load-path` and `:preload-features`.
+Existing values survive job updates and schedule changes.  Supply either
+key explicitly to replace it; `:preload-features nil` disables automatic
+package loading and agent discovery for fake-driver or standalone jobs.
+Jobs created before this bootstrap was added must be re-saved once from
+your configured Emacs to capture the new fields for future invocations.
+Existing invocation histories retain their original init-controlled loading
+when resumed.  A missing package or dependency produces a durable
+`startup-error` before the init file runs.
+
+The `:init-file` is trusted Emacs Lisp loaded **inside the worker**.  It can
+focus on credentials and backends, runner agent registrations, the workflow,
+and driver selection; extra packages can still be loaded there.  The worker
+does not load your normal Emacs initialization or inherit live variable
+values, backend objects, or interactive hooks from the editor.  Keep window,
+keybinding, and interactive session setup out of the job init file.
+Workers disable automatic native compilation and trampoline generation, so
+starting a scheduled job does not require a compiler toolchain or update the
+interactive editor's native compilation cache.  Already installed native
+code can still run.  Tools must support headless execution; direct native
+calls to input primitives cannot always be intercepted by Lisp input guards.
+Named workflows and stable explicit node IDs are required for durable jobs,
+just as they are for checkpoint recovery.
+
+Optional job `:emacs` names an absolute executable path; saving captures the
+current Emacs executable by default.  `:environment` is an explicit alist of
+environment variable names and string values, for example
+`'(("PATH" . "/opt/homebrew/bin:/usr/bin:/bin"))`.  A scheduler does not inherit
+your interactive shell setup, so use absolute tool paths or configure `PATH`
+in the job/bootstrap.
+
+### Inputs, workspaces, and outputs
+
+The start option `:inputs` accepts an alist or hash table and initializes the
+blackboard before any prompt or node executes.  Read values using
+`gptel-runner-get`; continue saving outputs with `:save-as` or
+`gptel-runner-put`.  Inputs and durable outputs must be readable Lisp data.
+
+Workflows can define a default `:workspace`.  An explicit start argument takes
+precedence, and existing per-node overrides still resolve against the selected
+run workspace.  Saving a job captures its `:base-directory`, so the directory
+from which launchd starts Emacs cannot change file resolution.  Leave
+`:arguments :workspace` absent to use the pipeline's default, including when
+the pipeline is defined only inside the worker initialization file.  Relative
+defaults resolve against the captured base directory.
+The job layer does not create Git worktrees or copy working directories.
+An agent editing these shared directories changes the same files your normal
+Emacs visits.  Processes also share CPU, memory, and network resources.
+
+History contains each agent's result, the run's saved values, transcripts,
+events, errors, and logs.  A pipeline can publish any number of named files:
+
+```elisp
+(gptel-runner-publish-artifact run "report" "/tmp/report.txt" "text/plain")
+```
+
+Publishing copies the file into the invocation's private artifact directory;
+later changes to the source file do not change that historical output.
+Snapshot recovery data stays separate from inspection history.  Existing v2
+snapshots and session-local run IDs remain supported; external identities also
+include the invocation and worker generation to avoid cross-process collisions.
+
+### Inspect and control background work
+
+The dashboard displays external invocations alongside local runs.  Inspecting
+a background row opens durable results or transcripts without restoring its
+checkpoint in your interactive Emacs.  Its action menu sends commands to the
+owning worker, including pause, resume, cancel, retry, continue, budget
+extensions, decisions, call feedback, and tool approval or rejection.
+
+The programmatic control interface is:
+
+```elisp
+(gptel-runner-job-command my-invocation 'pause)
+(gptel-runner-job-command my-invocation 'resume
+                          '(:feedback "Prefer the smaller implementation."))
+```
+
+Commands are data records with durable receipts.  The worker validates the
+operation, target generation, and current state before applying a command.
+An approval can authorize only the pending tool interaction shown in the
+dashboard; stale approvals cannot authorize a later tool call.  Rejecting an
+approval cancels that call.  Tool confirmation policy remains explicit;
+running in the background does not automatically authorize tools.
+
+The `background-example-feedback` workflow from the same initialization file
+stops after synthesis.  Create a job using that workflow, inspect the final
+call, and accept a result from the dashboard to release the pipeline.  Real
+gptel workers also support sending feedback to the retained conversation
+before accepting its new response.  Tools which directly read a synchronous
+minibuffer cannot automatically become remote conversations; they need an
+asynchronous input adapter and otherwise report an unsupported-input error.
+
+Workers remain alive while paused or waiting for feedback/approval.  Existing
+duration semantics apply: pausing a whole run stops its active-duration clock;
+waiting for call feedback or approval continues to consume a configured run
+duration limit.  Closing the dashboard neither accepts input nor stops work.
+After a terminal exit, retry/continue starts another worker from the checkpoint
+within the same invocation history.  A crashed worker loses live callbacks;
+explicit recovery restarts unfinished nodes and old interactions are invalid.
+
+Only one invocation of a job is active at a time.  Overlapping triggers are
+recorded as skipped rather than queued.  Different jobs may run concurrently;
+background calls declared as writers coordinate access to the same canonical
+workspace.  This is orchestration, not a filesystem security boundary.
+
+### Run from a shell or cron
+
+The generic batch entry point can execute a saved job without launchd:
+
+```sh
+/absolute/path/to/emacs -Q --batch -L /path/to/gptel-runner \
+  -l gptel-runner-jobs -f gptel-runner-jobs-batch-main -- \
+  run JOB-ID --root /absolute/path/to/job-store/
+```
+
+Use the `:id` returned by `gptel-runner-job-save`; the default store is
+`~/.emacs.d/gptel-runner/jobs/` unless `gptel-runner-job-directory` is changed.
+`run` keeps that Emacs process alive until the pipeline finishes, including
+human-input waits.  It returns exit code `0` for success or a skipped duplicate,
+`1` for another terminal pipeline outcome, and `2` for startup or persistence
+failure.  This same command can be placed in a user crontab with appropriate
+stdout/stderr redirection.  It does not require an interactive Emacs server.
+
+On macOS, the `trigger JOB-ID --root STORE` command dispatches through the
+detached launcher and returns after the worker has adopted ownership.  That
+handoff prevents a short-lived trigger from releasing its reservation too
+early.  If worker startup times out, the exact worker service is stopped before
+the reservation is released.  If stopping cannot be confirmed, the invocation
+remains visibly uncertain and its reservation stays held until absence is
+confirmed; it is not silently retried.
+
+### Manage user schedules on macOS
+
+macOS supports per-user cron jobs through `crontab -e`, without requiring root.
+The integrated scheduler uses user LaunchAgents, Apple's recommended mechanism
+for scheduled work.  It manages only package-owned property lists in
+`~/Library/LaunchAgents` and services in the current user's `gui/<uid>` domain.
+No system daemon is installed.
+
+```elisp
+(require 'gptel-runner-launchd)
+
+;; Enable or update the saved recurring schedule.
+(gptel-runner-launchd-install my-background-job)
+
+;; Disable future triggers; an active worker continues.
+(gptel-runner-launchd-disable my-background-job)
+
+;; Remove the installed schedule without deleting job/history data.
+(gptel-runner-launchd-remove my-background-job)
+
+;; Obtain raw launchctl diagnostics and the last installation result.
+(gptel-runner-launchd-diagnostics my-background-job)
+```
+
+Schedules support positive integer intervals such as `(:interval 900)` and
+calendar rules such as `(:calendar ((:hour 9 :minute 0)))`.  Multiple calendar
+rules are allowed; `:weekday 1` is Monday, while `0` or `7` is Sunday.  Supported
+fields are `:minute`, `:hour`, `:day`, `:weekday`, and `:month`; omitted fields
+are wildcards.  Rules follow launchd's semantics, including matching either
+day-of-month or weekday when both are supplied.  Calendar times use the Mac's
+local timezone.  Future one-off scheduling is not provided.
+
+Scheduled triggers exit after dispatching a separate invocation service.  This
+lets schedule disabling and worker cancellation remain independent operations.
+Completed worker registrations are removed during later launches or jobs-view
+refreshes; their history stays on disk.  Installation failures are stored in
+the job's scheduler status and are visible in diagnostics.
+
+User LaunchAgents require the login session.  Calendar triggers missed while
+the Mac sleeps coalesce into one trigger on wake; interval triggers can be
+missed.  Jobs do not run while the machine is powered off, and cron likewise
+misses executions during sleep.  See Apple's
+[scheduled jobs guide](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html)
+and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
 
 ## Semantics and safety
 

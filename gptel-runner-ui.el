@@ -27,6 +27,8 @@
   '((workflow "Workflow" 22)
     (run "Run" 16)
     (node "Node" 20)
+    (job "Job" 24)
+    (agent "Agent" 18)
     (call "Call" 16)
     (state "State" 28)
     (elapsed "Elapsed" 9)
@@ -41,13 +43,15 @@
   "Alias for `gptel-runner-dashboard-columns'.")
 
 (defcustom gptel-runner-dashboard-columns
-  '(workflow run node state elapsed)
+  '(workflow run node job agent state elapsed)
   "Columns visible in the runner dashboard.
 List order is ignored; columns always use the canonical dashboard order."
   :type '(set
           (const :tag "Workflow" workflow)
           (const :tag "Run" run)
           (const :tag "Node" node)
+          (const :tag "Background job" job)
+          (const :tag "Agent" agent)
           (const :tag "Call" call)
           (const :tag "State" state)
           (const :tag "Elapsed time" elapsed)
@@ -68,6 +72,16 @@ time the dashboard refreshes or its mode is activated."
 
 (defvar gptel-runner-dashboard-buffer "*gptel-runner*"
   "Name of the session dashboard buffer.")
+
+(defvar gptel-runner-dashboard-entry-functions nil
+  "Functions returning additional dashboard entries.
+External sources must use distinct row identifiers and must not register
+observed runs in the local execution registry.")
+
+(defvar gptel-runner-dashboard-row-action-functions nil
+  "Functions handling actions on externally supplied dashboard rows.
+Each receives ACTION and the row identifier.  Return non-nil when handled.
+Supported actions are `open' and `menu'.")
 
 (defvar-local gptel-runner-dashboard--refresh-timer nil
   "Timer responsible for refreshing the current dashboard buffer.")
@@ -212,6 +226,8 @@ An elided value retains its complete unpropertized text as hover help."
      (list 'call (gptel-runner-call-id call))
      (gptel-runner-ui--row-vector
       `((node . ,(format "%s" (gptel-runner-node-id node)))
+        (agent . ,(when-let* ((agent (gptel-runner-call-agent call)))
+                    (format "%s" (gptel-runner-agent-name agent))))
         (call . ,(gptel-runner-call-id call))
         (state . ,(gptel-runner-ui--call-state call))
         (elapsed . ,(gptel-runner-ui--elapsed run call))
@@ -227,7 +243,7 @@ An elided value retains its complete unpropertized text as hover help."
                    run #'gptel-runner-budget-calls
                    #'gptel-runner-budget-max-calls)))))))
 
-(defun gptel-runner-ui--entries ()
+(defun gptel-runner-ui--local-entries ()
   "Return dashboard entries grouped as workflow, run, and call rows."
   (let* ((runs (gptel-runner-list-runs)) entries)
     (dolist (name (gptel-runner-ui--workflow-keys runs) entries)
@@ -248,6 +264,12 @@ An elided value retains its complete unpropertized text as hover help."
                        (mapcar (lambda (call)
                                  (gptel-runner-ui--call-entry run call))
                                (gptel-runner-run-calls run)))))))))
+
+(defun gptel-runner-ui--entries ()
+  "Return local dashboard entries followed by external source entries."
+  (append (gptel-runner-ui--local-entries)
+          (apply #'append
+                 (mapcar #'funcall gptel-runner-dashboard-entry-functions))))
 
 (defun gptel-runner-dashboard--configured-refresh-interval ()
   "Return the configured dashboard refresh interval after validation."
@@ -604,9 +626,12 @@ CALL may supply explicit provenance when this function is called from Lisp."
   "Open the natural inspection target for the dashboard row at point.
 Visit a call's worker transcript, or inspect a run's event journal."
   (interactive)
-  (if (gptel-runner-ui--call-at-point)
-      (gptel-runner-dashboard-visit-worker)
-    (gptel-runner-dashboard-inspect-events)))
+  (unless (run-hook-with-args-until-success
+           'gptel-runner-dashboard-row-action-functions
+           'open (tabulated-list-get-id))
+    (if (gptel-runner-ui--call-at-point)
+        (gptel-runner-dashboard-visit-worker)
+      (gptel-runner-dashboard-inspect-events))))
 
 (defun gptel-runner-dashboard-visit-worker ()
   "Visit the retained or active worker transcript for the call at point."
@@ -848,6 +873,16 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
     ("C" "Clear finished" gptel-runner-dashboard-clear-finished
      :inapt-if-not gptel-runner-ui--finished-runs-p)
     ("g" "Refresh" gptel-runner-dashboard-refresh)]])
+
+(defun gptel-runner-ui--dispatch-menu (original &rest arguments)
+  "Dispatch the row's external menu, or invoke ORIGINAL with ARGUMENTS."
+  (unless (run-hook-with-args-until-success
+           'gptel-runner-dashboard-row-action-functions
+           'menu (tabulated-list-get-id))
+    (apply original arguments)))
+
+(advice-add 'gptel-runner-dashboard-menu :around
+            #'gptel-runner-ui--dispatch-menu)
 
 (let ((map gptel-runner-dashboard-mode-map))
   ;; Clear the historical direct bindings when this file is reevaluated.

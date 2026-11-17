@@ -30,6 +30,8 @@
 (declare-function gptel--update-status "gptel")
 (declare-function gptel--update-wait "gptel")
 (declare-function gptel-mode "gptel")
+(declare-function gptel-tool-name "gptel-request")
+(declare-function gptel--accept-tool-calls "gptel")
 (declare-function gptel-runner--complete-restored-call "gptel-runner-flow")
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
 
@@ -44,6 +46,72 @@
   "Driver backed by `gptel-request'.")
 
 (defvar gptel-runner-gptel--cancelling nil)
+
+(defvar gptel-runner-headless nil
+  "Non-nil when runner interactions are handled without local UI.")
+
+(defvar gptel-runner-interaction-hook nil
+  "Hook receiving a call and a serializable pending interaction plist.
+Live tool callbacks remain private to the driver's call data.  Consumers
+must route replies back to that owning process.")
+
+(defun gptel-runner-gptel--tool-data (tools &optional results)
+  "Return data-only descriptions of TOOLS, optionally including RESULTS."
+  (mapcar
+   (lambda (entry)
+     (append (list :name (gptel-tool-name (car entry))
+                   :args (copy-tree (cadr entry) t))
+             (when results (list :result (copy-tree (nth 2 entry) t)))))
+   tools))
+
+(defun gptel-runner-gptel--pending-interaction (call tools)
+  "Retain TOOLS callbacks privately and publish CALL's pending approval."
+  (let ((interaction
+         (list :id (gptel-runner--id "interaction") :kind 'tool-approval
+               :call-id (gptel-runner-call-id call)
+               :generation (gptel-runner-call-generation call)
+               :tools (gptel-runner-gptel--tool-data tools))))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call)
+                     :pending-interaction
+                     (list :description interaction :tools tools)))
+    (run-hook-with-args 'gptel-runner-interaction-hook call
+                        (copy-tree interaction t))
+    interaction))
+
+(defun gptel-runner-gptel-answer-interaction (call interaction-id approve)
+  "Answer CALL's pending INTERACTION-ID, running tools when APPROVE is non-nil.
+Rejecting cancels the call.  Replies are accepted once and only while the
+interaction's generation is current."
+  (unless (gptel-runner-call-p call)
+    (user-error "Unknown runner call"))
+  (let* ((pending (plist-get (gptel-runner-call-driver-data call)
+                             :pending-interaction))
+         (description (plist-get pending :description)))
+    (unless (and pending
+                 (equal interaction-id (plist-get description :id))
+                 (= (gptel-runner-call-generation call)
+                    (plist-get description :generation))
+                 (eq (gptel-runner-call-state call) 'waiting-confirmation)
+                 (buffer-live-p (gptel-runner-call-buffer call)))
+      (user-error "Interaction %s is no longer pending" interaction-id))
+    ;; Consume before executing: synchronous tools may create a new gate.
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call)
+                     :pending-interaction nil))
+    (gptel-runner--emit
+     (gptel-runner-call-run call) 'interaction-answered
+     (gptel-runner-call-node call) call
+     (list :id interaction-id :approved (and approve t)))
+    (if approve
+        (with-current-buffer (gptel-runner-call-buffer call)
+          (gptel-runner-gptel--observe
+           call 'waiting-tool
+           (mapcar (lambda (tool) (plist-get tool :name))
+                   (plist-get description :tools)))
+          (gptel--accept-tool-calls (plist-get pending :tools)))
+      (gptel-runner-abort-call call 'tool-rejected))
+    call))
 
 (defun gptel-runner-gptel--compatibility-error (&rest missing)
   "Signal an actionable compatibility error listing MISSING API pieces."
@@ -203,12 +271,20 @@ RAW is gptel's internal flag for already formatted transcript content."
          (funcall observe 'reasoning (cdr response)))
        (gptel-runner-gptel--insert-response response info))
       ('tool-call
-       (funcall observe 'tool-calls (cdr response))
-       (funcall observe 'waiting-confirmation (cdr response))
-       ;; The normal gptel renderer adds its confirmation UI and callbacks.
-       (gptel-runner-gptel--insert-response response info))
+       (let ((data (if gptel-runner-headless
+                       (gptel-runner-gptel--tool-data (cdr response))
+                     (cdr response))))
+         (funcall observe 'tool-calls data)
+         (funcall observe 'waiting-confirmation data))
+       (if gptel-runner-headless
+           (gptel-runner-gptel--pending-interaction call (cdr response))
+         ;; The normal renderer adds its confirmation UI and callbacks.
+         (gptel-runner-gptel--insert-response response info)))
       ('tool-result
-       (funcall observe 'tool-results (cdr response))
+       (funcall observe 'tool-results
+                (if gptel-runner-headless
+                    (gptel-runner-gptel--tool-data (cdr response) t)
+                  (cdr response)))
        (gptel-runner-gptel--insert-response response info))
       (_ (funcall observe 'response-part response))))
    (t (funcall observe 'response-part response))))
@@ -247,7 +323,9 @@ RAW is gptel's internal flag for already formatted transcript content."
   (let* ((info (gptel-fsm-info fsm))
          (call (plist-get info :context))
          (names (gptel-runner-gptel--tool-names info)))
-    (when (and (gptel-runner-call-p call) names)
+    (when (and (gptel-runner-call-p call) names
+               (or (null (gptel-runner-call-fsm call))
+                   (eq fsm (gptel-runner-call-fsm call))))
       (gptel-runner-gptel--observe call 'waiting-tool names))))
 
 (defun gptel-runner-gptel--update-status (info message face)
@@ -300,8 +378,9 @@ RAW is gptel's internal flag for already formatted transcript content."
       (funcall (gptel-runner-gptel--complete-function call)
                'cancelled nil nil))))
 
-(defun gptel-runner-gptel--make-fsm ()
-  "Create a per-call FSM with runner terminals and gptel status handlers."
+(defun gptel-runner-gptel--make-fsm (&optional terminal-handler)
+  "Create a per-call FSM with runner terminals and gptel status handlers.
+When supplied, TERMINAL-HANDLER handles all three terminal states."
   (let ((handlers (copy-tree gptel-request--handlers))
         (table (copy-tree gptel-request--transitions)))
     ;; Streaming enters TYPE on the HTTP headers, before tool chunks arrive.
@@ -322,9 +401,12 @@ RAW is gptel's internal flag for already formatted transcript content."
                         #'gptel--update-tool-call)
                   (alist-get 'TOOL handlers)
                   (list #'gptel--update-tool-ask))
-          (alist-get 'DONE handlers) (list #'gptel-runner-gptel--done)
-          (alist-get 'ERRS handlers) (list #'gptel-runner-gptel--error)
-          (alist-get 'ABRT handlers) (list #'gptel-runner-gptel--aborted))
+          (alist-get 'DONE handlers)
+          (list (or terminal-handler #'gptel-runner-gptel--done))
+          (alist-get 'ERRS handlers)
+          (list (or terminal-handler #'gptel-runner-gptel--error))
+          (alist-get 'ABRT handlers)
+          (list (or terminal-handler #'gptel-runner-gptel--aborted)))
     (gptel-make-fsm :table table
                     :handlers handlers)))
 
@@ -342,6 +424,7 @@ RAW is gptel's internal flag for already formatted transcript content."
   (let* ((buffer (gptel-runner-gptel--worker-buffer call))
          (agent (gptel-runner-call-agent call))
          (schema (gptel-runner-agent-schema agent))
+         (generation (gptel-runner-call-generation call))
          (completed nil)
          (wrapped
           (lambda (status &optional value metadata)
@@ -378,12 +461,17 @@ RAW is gptel's internal flag for already formatted transcript content."
             :context call :schema schema :fsm fsm
             :callback
             (lambda (response info &optional raw)
-              (gptel-runner-gptel--callback
-               call observe response info raw))))))))
+              (when (and (= generation (gptel-runner-call-generation call))
+                         (not (gptel-runner--call-terminal-p call)))
+                (gptel-runner-gptel--callback
+                 call observe response info raw)))))))))
 
 (cl-defmethod gptel-runner-driver-cancel
   ((_driver gptel-runner-gptel-driver) call)
   "Cancel CALL using its unique worker buffer."
+  (setf (gptel-runner-call-driver-data call)
+        (plist-put (gptel-runner-call-driver-data call)
+                   :pending-interaction nil))
   (when (buffer-live-p (gptel-runner-call-buffer call))
     (let ((gptel-runner-gptel--cancelling t))
       (gptel-abort (gptel-runner-call-buffer call)))
@@ -399,6 +487,9 @@ RAW is gptel's internal flag for already formatted transcript content."
 (cl-defmethod gptel-runner-driver-pause
   ((_driver gptel-runner-gptel-driver) call)
   "Stop CALL's provider work while retaining its transcript for feedback."
+  (setf (gptel-runner-call-driver-data call)
+        (plist-put (gptel-runner-call-driver-data call)
+                   :pending-interaction nil))
   (setf (gptel-runner-call-driver-data call)
         (plist-put (gptel-runner-call-driver-data call) :pausing t))
   (when (buffer-live-p (gptel-runner-call-buffer call))
@@ -419,11 +510,18 @@ RAW is gptel's internal flag for already formatted transcript content."
         (insert
          (concat
           "\n\nRunner intervention\n===================\n\n"
-          "This workflow call is waiting for your feedback.  Add feedback "
-          "and continue with ordinary gptel commands in this buffer.  When "
-          "the response should be returned to the workflow, select it or "
-          "leave point after the latest response and run M-x "
-          "gptel-runner-complete-call-from-buffer.\n"))))))
+          (if gptel-runner-headless
+              (concat
+               "This workflow call is waiting for your feedback.  Select "
+               "the call in the background dashboard and use Feedback to "
+               "request a revision.  Use Accept to return the latest or "
+               "your edited response to the workflow.\n")
+            (concat
+             "This workflow call is waiting for your feedback.  Add feedback "
+             "and continue with ordinary gptel commands in this buffer.  When "
+             "the response should be returned to the workflow, select it or "
+             "leave point after the latest response and run M-x "
+             "gptel-runner-complete-call-from-buffer.\n"))))))))
 
 (cl-defmethod gptel-runner-driver-await-feedback
   ((_driver gptel-runner-gptel-driver) call)
@@ -439,6 +537,96 @@ RAW is gptel's internal flag for already formatted transcript content."
                          'gptel 'response t)))
         (buffer-substring-no-properties
          (prop-match-beginning match) (prop-match-end match))))))
+
+(defun gptel-runner-gptel--feedback-finished (call generation state fsm)
+  "Finish CALL's feedback request at GENERATION in STATE using FSM."
+  (unless (plist-get (gptel-fsm-info fsm) :runner-feedback-posted)
+    (plist-put (gptel-fsm-info fsm) :runner-feedback-posted t)
+    (gptel--handle-post fsm))
+  (when (eq fsm (gptel-runner-call-fsm call))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call) :feedback-active nil)))
+  (when (and (= generation (gptel-runner-call-generation call))
+             (not (gptel-runner--call-terminal-p call)))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call) :feedback-active nil))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call)
+                     :pending-interaction nil))
+    (setf (gptel-runner-call-state call) 'waiting-feedback
+          (gptel-runner-call-tool-names call) nil)
+    (gptel-runner--deactivate-call call)
+    (gptel-runner--emit
+     (gptel-runner-call-run call)
+     (if (eq state 'succeeded) 'feedback-completed 'feedback-failed)
+     (gptel-runner-call-node call) call
+     (list :state state
+           :error (plist-get (gptel-fsm-info fsm) :error)))
+    (gptel-runner--checkpoint (gptel-runner-call-run call) t)
+    (gptel-runner--drain-queue (gptel-runner-call-run call))))
+
+(defun gptel-runner-gptel-feedback (call text)
+  "Asynchronously ask paused CALL to respond to feedback TEXT.
+The conversation continues in its real worker buffer.  The new response
+still requires explicit acceptance using
+`gptel-runner-complete-call-from-buffer'."
+  (unless (and (gptel-runner-call-p call)
+               (memq (gptel-runner-call-state call) '(paused waiting-feedback))
+               (buffer-live-p (gptel-runner-call-buffer call)))
+    (user-error "Call is not available for feedback"))
+  (unless (and (stringp text) (not (string-blank-p text)))
+    (user-error "Feedback must be a non-empty string"))
+  (when (plist-get (gptel-runner-call-driver-data call) :feedback-active)
+    (user-error "A feedback request is already active"))
+  (gptel-runner-gptel--check-api)
+  (unless (gptel-runner--can-start-p (gptel-runner-call-run call) call)
+    (user-error "Feedback cannot start while its workspace or concurrency slot is busy"))
+  (push call (gptel-runner-run-active-calls (gptel-runner-call-run call)))
+  (cl-incf (gptel-runner-run-active-count (gptel-runner-call-run call)))
+  (when (gptel-runner--writer-p call)
+    (cl-incf (gptel-runner-run-writer-active (gptel-runner-call-run call))))
+  (let* ((generation (cl-incf (gptel-runner-call-generation call)))
+         (fsm (gptel-runner-gptel--make-fsm
+               (lambda (finished-fsm)
+                 (gptel-runner-gptel--feedback-finished
+                  call generation
+                  (pcase (gptel-fsm-state finished-fsm)
+                    ('DONE 'succeeded) ('ABRT 'cancelled) (_ 'failed))
+                  finished-fsm))))
+         (observe (lambda (type &optional data)
+                    (gptel-runner--call-observe call generation type data))))
+    ;; Use the ordinary request machinery and transcript parser, but never
+    ;; release the workflow continuation until the user accepts the response.
+    (setf (gptel-runner-call-fsm call) fsm
+          (gptel-runner-call-state call) 'running
+          (gptel-runner-call-driver-data call)
+          (plist-put (plist-put (gptel-runner-call-driver-data call)
+                                :observe observe)
+                     :feedback-active t))
+    (with-current-buffer (gptel-runner-call-buffer call)
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "\n\n" (substring-no-properties text) "\n"))
+      (gptel-runner--emit (gptel-runner-call-run call) 'feedback-started
+                          (gptel-runner-call-node call) call
+                          (list :text text))
+      (condition-case err
+          (gptel-request
+           nil :buffer (current-buffer) :stream gptel-stream
+           :context call :fsm fsm
+           :callback
+           (lambda (response info &optional raw)
+             (when (and (= generation (gptel-runner-call-generation call))
+                        (not (gptel-runner--call-terminal-p call)))
+               (gptel-runner-gptel--callback call observe response info raw))))
+        (error
+         (setf (gptel-runner-call-state call) 'waiting-feedback)
+         (gptel-runner--deactivate-call call)
+         (setf (gptel-runner-call-driver-data call)
+               (plist-put (gptel-runner-call-driver-data call)
+                          :feedback-active nil))
+         (signal (car err) (cdr err)))))
+    call))
 
 (defun gptel-runner-complete-call-from-buffer (&optional result call)
   "Complete paused CALL with RESULT from its gptel worker buffer.
@@ -457,6 +645,8 @@ node result and reconstructs the continuation from the workflow AST."
     (user-error "No runner call is associated with this buffer"))
   (unless (memq (gptel-runner-call-state call) '(waiting-feedback paused))
     (user-error "Call %s is not waiting for feedback" (gptel-runner-call-id call)))
+  (when (plist-get (gptel-runner-call-driver-data call) :feedback-active)
+    (user-error "Wait for the active feedback request before accepting"))
   (setq result
         (or result
             (and (buffer-live-p (gptel-runner-call-buffer call))

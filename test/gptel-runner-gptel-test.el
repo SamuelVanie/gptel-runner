@@ -679,5 +679,158 @@
             (should (eq (gptel-runner-call-state call) 'running))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
+(ert-deftest gptel-runner-gptel-headless-approval-is-data-and-consumed-once ()
+  (gptel-runner-gptel-test--with-transport
+    (let* ((gptel-runner-headless t)
+           (gptel-confirm-tool-calls t)
+           interaction
+           (gptel-runner-interaction-hook
+            (list (lambda (_call pending) (setq interaction pending)))))
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read")
+                   :driver (gptel-runner-gptel-driver-create)))
+             (call (car (gptel-runner-run-calls run)))
+             (fsm (pop requests)))
+        (cl-letf (((symbol-function 'gptel--display-tool-calls)
+                   (lambda (&rest _) (error "Unexpected local tool UI"))))
+          (gptel-runner-gptel-test--reply
+           fsm nil "tool_calls"
+           [(:id "read-1" :type "function"
+                 :function (:name "runner_read" :arguments "{}"))]))
+        (should (eq (gptel-runner-call-state call) 'waiting-confirmation))
+        (should (eq (plist-get interaction :kind) 'tool-approval))
+        (should (equal (plist-get interaction :tools)
+                       '((:name "runner_read" :args nil))))
+        (should (equal interaction (read (prin1-to-string interaction))))
+        (gptel-runner-gptel-answer-interaction call (plist-get interaction :id) t)
+        (should (eq (pop requests) fsm))
+        (should-error
+         (gptel-runner-gptel-answer-interaction call (plist-get interaction :id) t)
+         :type 'user-error)
+        (gptel-runner-gptel-test--reply fsm "Reviewed" "stop")
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
+(ert-deftest gptel-runner-gptel-headless-rejection-and-stale-approval ()
+  (dolist (action '(reject pause stale))
+    (gptel-runner-gptel-test--with-transport
+      (let* ((gptel-runner-headless t)
+             (gptel-confirm-tool-calls t)
+             interaction
+             (gptel-runner-interaction-hook
+              (list (lambda (_call pending) (setq interaction pending)))))
+        (gptel-runner-register-agent 'reader :preset nil)
+        (let* ((run (gptel-runner-start
+                     (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read")
+                     :driver (gptel-runner-gptel-driver-create)))
+               (call (car (gptel-runner-run-calls run)))
+               (fsm (pop requests)))
+          (gptel-runner-gptel-test--reply
+           fsm nil "tool_calls"
+           [(:id "read-1" :type "function"
+                 :function (:name "runner_read" :arguments "{}"))])
+          (pcase action
+            ('reject
+             (gptel-runner-gptel-answer-interaction call (plist-get interaction :id) nil)
+             (should (eq (gptel-runner-run-state run) 'cancelled)))
+            ('pause (gptel-runner-pause-call call))
+            ('stale (cl-incf (gptel-runner-call-generation call))))
+          (should-error
+           (gptel-runner-gptel-answer-interaction call (plist-get interaction :id) t)
+           :type 'user-error)
+          (should-not requests))))))
+
+(ert-deftest gptel-runner-gptel-headless-feedback-waits-for-explicit-accept ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-runner-headless t))
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                            :pause-after t :save-as 'answer)
+                   :driver (gptel-runner-gptel-driver-create)))
+             (call (car (gptel-runner-run-calls run))))
+        (gptel-runner-gptel-test--reply (pop requests) "Initial answer" "stop")
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (with-current-buffer (gptel-runner-call-buffer call)
+          (should (string-match-p "background dashboard" (buffer-string)))
+          (should (string-match-p "use Feedback" (buffer-string)))
+          (should (string-match-p "Use Accept" (buffer-string)))
+          (should-not (string-match-p "ordinary gptel commands" (buffer-string))))
+        (gptel-runner-gptel-feedback call "Please check the cancellation path")
+        (let ((fsm (pop requests)))
+          (should fsm)
+          (should (string-match-p
+                   "Please check the cancellation path"
+                   (prin1-to-string (plist-get (gptel-fsm-info fsm) :data))))
+          (should-error (gptel-runner-complete-call-from-buffer "Too early" call)
+                        :type 'user-error)
+          (gptel-runner-gptel-test--reply fsm "Corrected answer" "stop"))
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (should (eq (gptel-runner-run-state run) 'running))
+        (should-not (gptel-runner-get run 'answer))
+        (should (= (gptel-runner-run-active-count run) 0))
+        (gptel-runner-complete-call-from-buffer nil call)
+        (should (equal (gptel-runner-get run 'answer) "Corrected answer"))
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
+(ert-deftest gptel-runner-gptel-headless-feedback-can-pause-and-restart ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-runner-headless t))
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                            :pause-after t)
+                   :driver (gptel-runner-gptel-driver-create)))
+             (call (car (gptel-runner-run-calls run))))
+        (gptel-runner-gptel-test--reply (pop requests) "Initial" "stop")
+        (gptel-runner-gptel-feedback call "First correction")
+        (let ((old-fsm (pop requests)))
+          (gptel-runner-pause-call call)
+          (should-not (plist-get (gptel-runner-call-driver-data call) :feedback-active))
+          (should (= (gptel-runner-run-active-count run) 0))
+          (gptel-runner-gptel-feedback call "Second correction")
+          ;; A stale terminal callback cannot consume the new feedback request.
+          (gptel-runner-gptel--feedback-finished call 0 'succeeded old-fsm)
+          (should (plist-get (gptel-runner-call-driver-data call) :feedback-active))
+          (gptel-runner-gptel-test--reply (pop requests) "Revised" "stop"))
+        (gptel-runner-complete-call-from-buffer nil call)
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
+(ert-deftest gptel-runner-gptel-headless-feedback-tools-keep-approval-gate ()
+  (gptel-runner-gptel-test--with-transport
+    (let* ((gptel-runner-headless t)
+           (gptel-confirm-tool-calls t)
+           interaction
+           (gptel-runner-interaction-hook
+            (list (lambda (_call pending) (setq interaction pending)))))
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                            :pause-after t)
+                   :driver (gptel-runner-gptel-driver-create)))
+             (call (car (gptel-runner-run-calls run)))
+             (initial-fsm (pop requests))
+             (initial-info (gptel-fsm-info initial-fsm))
+             (stale-callback (plist-get initial-info :callback)))
+        (gptel-runner-gptel-test--reply initial-fsm "Initial" "stop")
+        (gptel-runner-gptel-feedback call "Inspect the evidence")
+        (let ((fsm (pop requests)))
+          (gptel-runner-gptel-test--reply
+           fsm nil "tool_calls"
+           [(:id "read-2" :type "function"
+                 :function (:name "runner_read" :arguments "{}"))])
+          (should (eq (gptel-runner-call-state call) 'waiting-confirmation))
+          (let ((current-id (plist-get interaction :id)))
+            (funcall stale-callback
+                     (cons 'tool-call (list (list (car gptel-tools) nil #'ignore)))
+                     initial-info)
+            (should (equal (plist-get interaction :id) current-id)))
+          (gptel-runner-gptel-answer-interaction call (plist-get interaction :id) t)
+          (should (eq (pop requests) fsm))
+          (gptel-runner-gptel-test--reply fsm "Revised" "stop"))
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (gptel-runner-complete-call-from-buffer nil call)
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
 (provide 'gptel-runner-gptel-test)
 ;;; gptel-runner-gptel-test.el ends here

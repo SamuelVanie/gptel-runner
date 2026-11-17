@@ -1,11 +1,11 @@
 EMACS ?= emacs
 ELFILES := $(wildcard gptel-runner*.el)
-TESTFILES := $(wildcard test/*-test.el)
+TESTFILES := $(filter-out test/gptel-runner-gptel-test.el,$(wildcard test/*-test.el))
 
 .PHONY: test compile checkdoc package-lint clean release-check
 
 test: clean
-	$(EMACS) -Q --batch -L . -L test -l test/gptel-runner-test.el \
+	$(EMACS) -Q --batch -L . -L test $(foreach file,$(TESTFILES),-l $(file)) \
 	  -f ert-run-tests-batch-and-exit
 
 compile: clean

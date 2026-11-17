@@ -21,6 +21,8 @@
 (require 'gptel-runner-ui)
 (require 'gptel-runner-store)
 (require 'gptel-runner-review)
+(require 'gptel-runner-jobs)
+(require 'gptel-runner-jobs-ui)
 
 (provide 'gptel-runner)
 ;;; gptel-runner.el ends here

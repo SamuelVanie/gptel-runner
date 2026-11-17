@@ -36,6 +36,18 @@ Set this to nil to kill a worker buffer as soon as its call terminalizes."
 (defvar gptel-runner-event-hook nil
   "Hook run with one argument, the newly appended runner event.")
 
+(defvar gptel-runner-call-admission-functions nil
+  "Functions deciding whether a queued call may start.
+Each function receives the call and must return non-nil to admit it.  They
+run after the ordinary concurrency and workspace checks, and may acquire
+external resources.  A refusal leaves the call queued.  Release functions
+must tolerate a refusal after another admission function acquired a resource.")
+
+(defvar gptel-runner-call-release-hook nil
+  "Hook receiving a call when its admission resources must be released.
+Functions must be idempotent.  This hook runs when an active call is
+deactivated, and to roll back a refused or failed admission attempt.")
+
 (defvar-local gptel-runner--call nil
   "Runner call associated with the current worker buffer.")
 
@@ -589,6 +601,7 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
       (cl-decf (gptel-runner-run-active-count run))
       (when (gptel-runner--writer-p call)
         (cl-decf (gptel-runner-run-writer-active run)))
+      (run-hook-with-args 'gptel-runner-call-release-hook call)
       t)))
 
 (defun gptel-runner--schedule-request-retry (call metadata)
@@ -705,6 +718,18 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
       (gptel-runner--checkpoint run)
       t)))
 
+(defun gptel-runner--admit-call (call)
+  "Acquire optional external admission resources for CALL.
+Roll back acquisitions if any admission function refuses or signals."
+  (let (admitted)
+    (unwind-protect
+        (setq admitted
+              (run-hook-with-args-until-failure
+               'gptel-runner-call-admission-functions call))
+      (unless admitted
+        (run-hook-with-args 'gptel-runner-call-release-hook call)))
+    admitted))
+
 (defun gptel-runner--can-start-p (run call)
   "Return non-nil when RUN can start queued CALL now."
   (and (< (gptel-runner-run-active-count run)
@@ -715,7 +740,8 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
                    (and (gptel-runner--writer-p active)
                         (equal (gptel-runner-call-workspace active)
                                (gptel-runner-call-workspace call))))
-                 (gptel-runner-run-active-calls run))))))
+                 (gptel-runner-run-active-calls run))))
+       (gptel-runner--admit-call call)))
 
 (defun gptel-runner--drain-queue (run)
   "Process queued work in RUN as budgets and locks permit."

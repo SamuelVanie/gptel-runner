@@ -850,15 +850,35 @@ Return the new history entry, or nil when NODE does not collect history."
         ((plist-member defaults key) (plist-get defaults key))
         (t fallback)))
 
+(defun gptel-runner--input-blackboard (inputs)
+  "Validate INPUTS and return a fresh blackboard containing their values.
+INPUTS is an alist or hash table.  Runner-owned history keys are reserved."
+  (let ((table (make-hash-table :test #'equal)))
+    (cl-labels
+        ((add (key value)
+           (when (memq key (list gptel-runner-decisions-key
+                                gptel-runner-continuations-key))
+             (user-error "Input key %S is reserved by gptel-runner" key))
+           (puthash (copy-tree key t) (copy-tree value t) table)))
+      (cond
+       ((hash-table-p inputs) (maphash #'add inputs))
+       ((and (proper-list-p inputs) (cl-every #'consp inputs))
+        (dolist (entry inputs) (add (car entry) (cdr entry))))
+       (t (user-error ":inputs must be an alist or hash table"))))
+    table))
+
 (cl-defun gptel-runner-start
     (workflow &rest arguments
-              &key goal workspace driver max-requests max-calls
+              &key goal workspace inputs driver max-requests max-calls
               max-concurrency max-duration allow-writes
               allow-unconfirmed-tools decision-memory persist context callback
               &allow-other-keys)
   "Start WORKFLOW with keyword ARGUMENTS and return its run immediately.
 GOAL and WORKSPACE describe the stateless task.  Agent nodes may override
-WORKSPACE with their own `:workspace' property.  DRIVER defaults to
+WORKSPACE with their own `:workspace' property.  An omitted WORKSPACE uses
+the workflow's `:workspace' default, or `default-directory'.  INPUTS is an
+alist or hash table copied into the run blackboard before any node starts.
+DRIVER defaults to
 `gptel-runner-default-driver'.  MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
 MAX-DURATION override workflow defaults.  ALLOW-WRITES must be explicitly
 non-nil for any workflow containing a write agent.
@@ -868,7 +888,7 @@ defaults to non-nil.
 CONTEXT adds run-wide starting context to the workflow's own context.
 PERSIST enables versioned snapshots at workflow checkpoints.
 CALLBACK runs exactly once with the terminal run."
-  (ignore max-requests max-calls max-concurrency max-duration
+  (ignore workspace max-requests max-calls max-concurrency max-duration
           allow-unconfirmed-tools decision-memory)
   (let* ((definition
           (cond ((gptel-runner-workflow-p workflow) workflow)
@@ -883,8 +903,17 @@ CALLBACK runs exactly once with the terminal run."
          (root (gptel-runner-workflow-root definition))
          (selected-driver (or driver gptel-runner-default-driver
                               (user-error "No gptel-runner driver configured")))
-         (directory (file-name-as-directory
-                     (file-truename (or workspace default-directory))))
+         (selected-workspace
+          (gptel-runner--option :workspace arguments defaults default-directory))
+         (directory
+          (progn
+            (unless (or (null selected-workspace)
+                        (and (stringp selected-workspace)
+                             (not (string-empty-p selected-workspace))))
+              (user-error ":workspace must be a non-empty directory name"))
+            (file-name-as-directory
+             (file-truename (or selected-workspace default-directory)))))
+         (blackboard (gptel-runner--input-blackboard inputs))
          (options
           (list :max-requests
                 (gptel-runner--option :max-requests arguments defaults nil)
@@ -901,6 +930,8 @@ CALLBACK runs exactly once with the terminal run."
                 :context context
                 :persist (gptel-runner--option
                           :persist arguments defaults persist))))
+    (unless (file-directory-p directory)
+      (user-error "Run workspace is not a directory: %s" directory))
     (when (and (plist-get options :persist)
                (null (gptel-runner-workflow-name definition)))
       (user-error "Persistent runs require a named workflow"))
@@ -918,7 +949,7 @@ CALLBACK runs exactly once with the terminal run."
            (run (gptel-runner-run-create
                  :id (gptel-runner--id "run") :workflow definition
                  :goal goal :workspace directory :state 'running
-                 :blackboard (make-hash-table :test #'equal)
+                 :blackboard blackboard
                  :node-states (make-hash-table :test #'equal)
                  :iterations (make-hash-table :test #'equal)
                  :repeat-limits (gptel-runner--workflow-repeat-limits root)

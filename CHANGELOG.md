@@ -2,6 +2,16 @@
 
 ## 0.1.0 - unreleased
 
+- Preload gptel and gptel-agent in background workers before each job init,
+  capture external library paths for fresh processes, and initialize agent
+  definitions, with an opt-out for standalone jobs.
+- Add generic isolated background jobs, durable invocation/agent history,
+  published file artifacts, command receipts, and remote lifecycle controls.
+- Add start-time `:inputs` and workflow-level default workspaces.
+- Add macOS user LaunchAgent schedules and separate invocation services, with
+  Emacs job management and external runs in the dashboard.
+- Add headless feedback and exact-interaction tool approval, cross-process
+  writer coordination, and a network-free parallel background example.
 - Add per-agent-step `:workspace` overrides with run-workspace fallback,
   node-relative context files, and writer serialization per directory.
 - Honor gptel's streaming setting instead of forcing non-streaming requests,
