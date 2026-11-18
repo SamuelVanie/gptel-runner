@@ -213,7 +213,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (defun gptel-runner-store-save-status (run)
   "Return the persistence status of RUN.
 The result is one of `clean', `pending', `writing', or `error'."
-  (if-let ((coordinator
+  (if-let* ((coordinator
             (gethash run gptel-runner-store--coordinators)))
       (gptel-runner-store--coordinator-state coordinator)
     'clean))
@@ -234,7 +234,7 @@ The result is one of `clean', `pending', `writing', or `error'."
 
 (defun gptel-runner-store-cancel-save (run)
   "Cancel pending persistence work for RUN and remove temporary data."
-  (when-let ((coordinator
+  (when-let* ((coordinator
               (gethash run gptel-runner-store--coordinators)))
     (gptel-runner-store--cancel-timer coordinator)
     (gptel-runner-store--delete-temporary

@@ -151,7 +151,7 @@ An elided value retains its complete unpropertized text as hover help."
     (if (eq state 'waiting-tool)
         (propertize
          (format "Calling %s..."
-                 (if-let ((names (gptel-runner-call-tool-names call)))
+                 (if-let* ((names (gptel-runner-call-tool-names call)))
                      (mapconcat (lambda (name) (format "%s" name))
                                 (ensure-list names) ", ")
                    "tool"))
@@ -442,7 +442,7 @@ An elided value retains its complete unpropertized text as hover help."
   "Return runner run represented by the current dashboard row."
   (pcase (tabulated-list-get-id)
     (`(run ,id) (gethash id gptel-runner--runs))
-    (`(call ,_) (when-let ((call (gptel-runner-ui--call-at-point)))
+    (`(call ,_) (when-let* ((call (gptel-runner-ui--call-at-point)))
                   (gptel-runner-call-run call)))))
 
 (defun gptel-runner-ui--decision-context ()
@@ -453,7 +453,7 @@ An elided value retains its complete unpropertized text as hover help."
     (cons (gptel-runner-call-run gptel-runner--call) gptel-runner--call))
    ((derived-mode-p 'gptel-runner-dashboard-mode)
     (let ((call (gptel-runner-ui--call-at-point)))
-      (when-let ((run (or (and call (gptel-runner-call-run call))
+      (when-let* ((run (or (and call (gptel-runner-call-run call))
                           (gptel-runner-ui--run-at-point))))
         (cons run call))))))
 
@@ -494,7 +494,7 @@ CALL may supply explicit provenance when this function is called from Lisp."
   "Return the workflow name represented by the current dashboard row."
   (pcase (tabulated-list-get-id)
     (`(workflow ,name) name)
-    (_ (when-let ((run (gptel-runner-ui--run-at-point)))
+    (_ (when-let* ((run (gptel-runner-ui--run-at-point)))
          (gptel-runner-ui--workflow-name run)))))
 
 (defun gptel-runner-ui--run-at-point-p ()

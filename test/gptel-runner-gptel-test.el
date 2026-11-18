@@ -326,6 +326,66 @@
         (gptel-runner-gptel-test--reply repair-fsm "Complete proposal" "stop"))
       (should (equal (gptel-runner-get run 'proposal) "Complete proposal")))))
 
+(ert-deftest gptel-runner-gptel-rejected-tool-preserves-steering ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-confirm-tool-calls t)
+          pending cleaned)
+      (gptel-runner-register-agent 'plan :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'plan :agent 'plan :prompt "Research")
+                   :driver (gptel-runner-gptel-driver-create)))
+             (fsm (pop requests))
+             (info (gptel-fsm-info fsm)))
+        (cl-letf (((symbol-function 'gptel--display-tool-calls)
+                   (lambda (calls _info) (setq pending calls))))
+          (gptel-runner-gptel-test--reply
+           fsm nil "tool_calls"
+           [(:id "read-1" :type "function"
+                 :function (:name "runner_read" :arguments "{}"))]))
+        (should pending)
+        (plist-put info :post-tool (list (lambda (_info) (push 'cleaned cleaned))))
+        (with-current-buffer (plist-get info :buffer)
+          (cl-letf (((symbol-function 'read-string)
+                     (lambda (&rest _) "Use the evidence already available")))
+            (gptel--steer-tool-calls pending nil info)))
+        (should (eq (pop requests) fsm))
+        (let ((messages (append (plist-get (plist-get info :data) :messages) nil)))
+          (should (equal (plist-get (car (last messages)) :content)
+                         "Use the evidence already available"))
+          (should (equal (plist-get (car (last messages 2)) :content)
+                         "Tool call rejected by user.")))
+        (should (equal cleaned '(cleaned)))
+        (should-not (plist-get info :post-tool))
+        (should-not (plist-get info :steering-message))
+        (gptel-runner-gptel-test--reply fsm "Final report" "stop")
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-call-result (car (gptel-runner-run-calls run)))
+                       "Final report"))))))
+
+(ert-deftest gptel-runner-gptel-tool-hooks-can-replace-results ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-pre-tool-call-functions
+           (list (lambda (_call) '(:result "Cached evidence"))))
+          (gptel-post-tool-call-functions
+           (list (lambda (call)
+                   (should (equal (plist-get call :result) "Cached evidence"))
+                   '(:result "Reviewed evidence")))))
+      (gptel-runner-register-agent 'plan :preset nil)
+      (gptel-runner-start
+       (gptel-runner-agent-step :id 'plan :agent 'plan :prompt "Research")
+       :driver (gptel-runner-gptel-driver-create))
+      (let* ((fsm (pop requests))
+             (info (gptel-fsm-info fsm)))
+        (gptel-runner-gptel-test--reply
+         fsm nil "tool_calls"
+         [(:id "read-1" :type "function"
+               :function (:name "runner_read" :arguments "{}"))])
+        (should (eq (pop requests) fsm))
+        (should (equal (plist-get (car (last (append
+                                            (plist-get (plist-get info :data) :messages)
+                                            nil))) :content)
+                       "Reviewed evidence"))))))
+
 (ert-deftest gptel-runner-gptel-supported-api-shape ()
   (should (gptel-runner-gptel--check-api))
   (should (fboundp 'gptel--apply-preset))

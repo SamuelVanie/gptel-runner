@@ -739,7 +739,7 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
                     (when (= generation (gptel-runner-run-generation run))
                       (if (car parsed)
                           (progn
-                            (when-let ((key (plist-get props :save-as)))
+                            (when-let* ((key (plist-get props :save-as)))
                               (gptel-runner-put run key (cdr parsed)))
                             (finish 'succeeded (cdr parsed)))
                         (cond
@@ -971,7 +971,7 @@ Return the new history entry, or nil when NODE does not collect history."
           (state value)
           (unless finalized
             (setq finalized t)
-            (when-let ((key (plist-get props :save-as)))
+            (when-let* ((key (plist-get props :save-as)))
               (gptel-runner-put run key value))
             (gptel-runner--set-node-state run node state value)
             (funcall done state value)))
@@ -1243,7 +1243,7 @@ Return the new history entry, or nil when NODE does not collect history."
                                    run (list 'gptel-runner-try
                                              (gptel-runner-node-id node))) :value)
                      (when (memq (gptel-runner-node-kind node) '(agent elisp))
-                       (when-let ((key (plist-get
+                       (when-let* ((key (plist-get
                                         (gptel-runner-node-properties node)
                                         :save-as)))
                          (gptel-runner-get run key))))))))
@@ -1384,7 +1384,7 @@ CALLBACK runs exactly once with the terminal run."
       (puthash (gptel-runner-run-id run) run gptel-runner--runs)
       (gptel-runner--emit run 'run-started nil nil
                           (list :goal goal :workspace directory))
-      (when-let ((duration (gptel-runner-budget-max-duration budget)))
+      (when-let* ((duration (gptel-runner-budget-max-duration budget)))
         (unless (and (numberp duration) (> duration 0))
           (user-error ":max-duration must be positive")))
       (gptel-runner--start-duration-clock run)
@@ -1540,7 +1540,7 @@ Require an integer when INTEGER-ONLY is non-nil."
 (defun gptel-runner--terminal-failure-data (run)
   "Return RUN's retained or session-local terminal failure data."
   (or (gptel-runner-run-terminal-data run)
-      (when-let ((event
+      (when-let* ((event
                   (cl-find-if
                    (lambda (candidate)
                      (eq (gptel-runner-event-type candidate) 'run-failed))
@@ -2144,7 +2144,7 @@ for the extended run's next terminal transition."
     (unless (car parsed)
       (user-error "Manual response is invalid: %S" (cdr parsed)))
     (gptel-runner--finish-call call 'succeeded (cdr parsed))
-    (when-let ((key (plist-get (gptel-runner-node-properties node) :save-as)))
+    (when-let* ((key (plist-get (gptel-runner-node-properties node) :save-as)))
       (gptel-runner-put run key (cdr parsed)))
     (gptel-runner--set-node-state run node 'succeeded (cdr parsed))
     (if (eq (gptel-runner-run-state run) 'paused)

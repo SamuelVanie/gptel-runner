@@ -557,7 +557,7 @@ When DELETE-SNAPSHOT is non-nil, also delete its durable snapshot file."
     (when (buffer-live-p (gptel-runner-call-buffer call))
       (kill-buffer (gptel-runner-call-buffer call))
       (setf (gptel-runner-call-buffer call) nil)))
-  (when-let ((events-buffer
+  (when-let* ((events-buffer
               (get-buffer (format "*gptel-runner events:%s*"
                                   (gptel-runner-run-id run)))))
     (kill-buffer events-buffer))
@@ -641,7 +641,7 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
 
 (defun gptel-runner--start-duration-clock (run)
   "Start or resume RUN's active-duration clock."
-  (when-let ((remaining (gptel-runner-run-duration-remaining run)))
+  (when-let* ((remaining (gptel-runner-run-duration-remaining run)))
     (if (<= remaining 0)
         (gptel-runner--duration-expired
          run (gptel-runner-run-generation run))
@@ -683,7 +683,7 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
                         nil nil data)
     (unless (gptel-runner-run-callback-called run)
       (setf (gptel-runner-run-callback-called run) t)
-      (when-let ((callback (gptel-runner-run-callback run)))
+      (when-let* ((callback (gptel-runner-run-callback run)))
         (funcall callback run)))
     (gptel-runner--checkpoint run t)
     t))
@@ -1011,7 +1011,7 @@ are never attributed to this function."
       (gptel-runner--deactivate-call call)
       (gptel-runner--emit run (intern (format "call-%s" state))
                           (gptel-runner-call-node call) call value)
-      (when-let ((done (gptel-runner-call-on-complete call)))
+      (when-let* ((done (gptel-runner-call-on-complete call)))
         (setf (gptel-runner-call-on-complete call) nil)
         (funcall done call state value))
       (gptel-runner--drain-queue run)

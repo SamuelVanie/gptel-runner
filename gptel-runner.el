@@ -1,7 +1,7 @@
 ;;; gptel-runner.el --- Deterministic stateless agent workflows -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (gptel "0.9.9.4"))
+;; Package-Requires: ((emacs "29.1") (gptel "0.9.9.6"))
 ;; Keywords: tools, convenience
 
 ;;; Commentary:

@@ -28,7 +28,7 @@ jobs:
         with:
           version: '30.2'
       - run: mkdir -p .packages
-      - run: git clone --depth 1 --branch v0.9.9.4 https://github.com/karthink/gptel.git .packages/gptel
+      - run: git clone --depth 1 --branch v0.9.9.6 https://github.com/karthink/gptel.git .packages/gptel
       - run: emacs -Q --batch -L . -L .packages/gptel -l test/gptel-runner-gptel-test.el -f ert-run-tests-batch-and-exit
 
   gptel-master-warning:

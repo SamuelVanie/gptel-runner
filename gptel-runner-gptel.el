@@ -1,7 +1,7 @@
 ;;; gptel-runner-gptel.el --- gptel compatibility driver -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (gptel "0.9.9.4"))
+;; Package-Requires: ((emacs "29.1") (gptel "0.9.9.6"))
 
 ;;; Commentary:
 
@@ -37,6 +37,8 @@
 
 (defvar gptel-request--transitions)
 (defvar gptel-request--handlers)
+(defvar gptel-send--transitions)
+(defvar gptel-send--handlers)
 (defvar gptel-confirm-tool-calls)
 (defvar gptel-default-mode)
 (defvar gptel-stream)
@@ -185,7 +187,7 @@ interaction's generation is current."
 (defun gptel-runner-gptel--compatibility-error (&rest missing)
   "Signal an actionable compatibility error listing MISSING API pieces."
   (error (concat "gptel-runner compatibility failure: missing or unsupported "
-                 "%S.  Install gptel >= 0.9.9.4 or update "
+                 "%S.  Install gptel >= 0.9.9.6 or update "
                  "gptel-runner-gptel.el for this gptel version")
          missing))
 
@@ -240,7 +242,9 @@ interaction's generation is current."
                       gptel-curl--stream-insert-response
                       gptel--update-tool-ask gptel--update-tool-call
                       gptel--update-status gptel--update-wait
-                      gptel--accept-tool-calls))
+                      gptel--accept-tool-calls gptel--handle-pre-tool
+                      gptel--handle-post-tool gptel--handle-tool-steer
+                      gptel--tool-steer-p))
     (unless (fboundp function)
       (gptel-runner-gptel--compatibility-error function)))
   t)
@@ -412,7 +416,7 @@ RAW is gptel's internal flag for already formatted transcript content."
 
 (defun gptel-runner-gptel--observe (call type &optional data)
   "Report a TYPE observation with DATA for CALL's current attempt."
-  (when-let ((observe
+  (when-let* ((observe
               (plist-get (gptel-runner-call-driver-data call) :observe)))
     (funcall observe type data)))
 
@@ -492,7 +496,7 @@ RAW is gptel's internal flag for already formatted transcript content."
   "Create a per-call FSM with runner terminals and gptel status handlers.
 When supplied, TERMINAL-HANDLER handles all three terminal states."
   (let ((handlers (copy-tree gptel-request--handlers))
-        (table (copy-tree gptel-request--transitions)))
+        (table (copy-tree gptel-send--transitions)))
     ;; Streaming enters TYPE on the HTTP headers, before tool chunks arrive.
     ;; Validate when leaving TYPE so both transports have parsed the payload.
     (push (cons #'gptel-runner-gptel--incomplete-tool-response-p 'ERRS)
@@ -503,6 +507,12 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
     ;; TOOL state tracking and status must run before tool execution because a
     ;; synchronous tool can transition the FSM recursively before its handler
     ;; returns.
+    ;; Use the send transition table and tool handlers so pre/post-tool hooks,
+    ;; request-local cleanup and steering retain gptel's normal ordering.
+    ;; Response insertion and terminal completion remain owned by the runner.
+    (dolist (state '(TPRE TRET TSTR))
+      (setf (alist-get state handlers)
+            (copy-sequence (alist-get state gptel-send--handlers))))
     (setf (alist-get 'WAIT handlers)
           (append (list #'gptel-runner-gptel--prepare-request)
                   (alist-get 'WAIT handlers) (list #'gptel--update-wait))
@@ -646,7 +656,7 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
   (with-current-buffer buffer
     (save-excursion
       (goto-char (point-max))
-      (when-let ((match (text-property-search-backward
+      (when-let* ((match (text-property-search-backward
                          'gptel 'response t)))
         (buffer-substring-no-properties
          (prop-match-beginning match) (prop-match-end match))))))

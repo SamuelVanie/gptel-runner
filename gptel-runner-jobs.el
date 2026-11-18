@@ -83,7 +83,6 @@ executes directly and does not need this launcher."
 (defvar gptel-runner-call-release-hook nil)
 (defvar native-comp-enable-subr-trampolines)
 (defvar native-comp-jit-compilation)
-(defvar native-comp-deferred-compilation)
 (defvar gptel-runner-jobs--invocation nil)
 (defvar gptel-runner-jobs--run nil)
 (defvar gptel-runner-jobs--dirty nil)
@@ -1200,7 +1199,6 @@ initialization or persistence error.  This function does not call `kill-emacs'."
          ;; configuration.  Already installed native code remains usable.
          (native-comp-enable-subr-trampolines nil)
          (native-comp-jit-compilation nil)
-         (native-comp-deferred-compilation nil)
          (last-publish 0) (exit-code 2) finished)
     (unless (and (eq (plist-get gptel-runner-jobs--invocation :phase) 'starting)
                  (file-exists-p (expand-file-name "owner.el" lock))

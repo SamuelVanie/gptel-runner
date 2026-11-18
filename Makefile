@@ -29,7 +29,7 @@ checkdoc:
 
 package-lint:
 	$(EMACS) -Q --batch -L . -l package-lint \
-	  --eval "(progn (package-initialize) (add-to-list 'package-alist (cons 'gptel (list (package-desc-create :name 'gptel :version '(0 9 9 4) :summary \"gptel\" :kind 'single :dir default-directory)))) (cl-letf (((symbol-function 'package-initialize) #'ignore)) (kill-emacs (if (package-lint-batch-and-exit-1 '(\"gptel-runner.el\")) 0 1))))"
+	  --eval "(progn (package-initialize) (add-to-list 'package-alist (cons 'gptel (list (package-desc-create :name 'gptel :version '(0 9 9 6) :summary \"gptel\" :kind 'single :dir default-directory)))) (cl-letf (((symbol-function 'package-initialize) #'ignore)) (kill-emacs (if (package-lint-batch-and-exit-1 '(\"gptel-runner.el\")) 0 1))))"
 
 clean:
 	find . -name '*.elc' -delete

@@ -68,7 +68,7 @@
 
 (defun example/natural-review-progress-key (run)
   "Hash RUN's latest natural-language reviewer response for stall detection."
-  (when-let ((response (gptel-runner-get run 'latest-review-response)))
+  (when-let* ((response (gptel-runner-get run 'latest-review-response)))
     (secure-hash 'sha256
                  (string-trim (downcase response)))))
 

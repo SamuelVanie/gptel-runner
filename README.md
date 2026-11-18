@@ -7,7 +7,7 @@ composes registered gptel presets into sequences,
 branches, bounded review loops, and parallel fan-out/synthesis workflows while
 keeping budgets, retries, cancellation, and terminal decisions in Emacs Lisp.
 
-The package requires Emacs 29.1 or newer and, for live calls, gptel 0.9.9.4 or
+The package requires Emacs 29.1 or newer and, for live calls, gptel 0.9.9.6 or
 newer.  Tests use the included fake driver and make no network requests.
 
 > **Release status:** the implementation is pre-release.  A project license
@@ -1375,7 +1375,9 @@ authority.
 All private gptel references live in `gptel-runner-gptel.el`.  The adapter
 checks required entry points before dispatch and reports a `compatibility`
 failure with actionable details.  gptel's private preset and request machinery
-can change; CI checks v0.9.9.4 and uses current master as an early-warning job.
+can change; CI checks v0.9.9.6 and uses current master as an early-warning job.
+Worker requests honor gptel's pre/post-tool hooks, request-local tool cleanup,
+and steering when a tool call is rejected with new instructions.
 
 | Symptom | Action |
 | --- | --- |

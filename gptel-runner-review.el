@@ -86,7 +86,7 @@ therefore it can never be interpreted as `pass'."
 
 (defun gptel-runner-review-progress-key (run &optional review-key)
   "Hash normalized review in RUN at REVIEW-KEY, defaulting to `review'."
-  (when-let ((review (gptel-runner-get run (or review-key 'review))))
+  (when-let* ((review (gptel-runner-get run (or review-key 'review))))
     (secure-hash 'sha256
                  (prin1-to-string (gptel-runner-normalize-review review)))))
 
@@ -102,7 +102,7 @@ therefore it can never be interpreted as `pass'."
 
 (defun gptel-runner-review-diff-progress-key (run &optional review-key)
   "Hash review and optional Git diff progress for RUN at REVIEW-KEY."
-  (when-let ((review (gptel-runner-get run (or review-key 'review))))
+  (when-let* ((review (gptel-runner-get run (or review-key 'review))))
     (secure-hash
      'sha256
      (prin1-to-string
