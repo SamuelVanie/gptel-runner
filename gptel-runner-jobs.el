@@ -358,6 +358,39 @@ An interrupted or corrupt manifest does not hide other invocations."
   (when-let* ((file (plist-get invocation :outputs-file)))
     (gptel-runner-jobs--read (gptel-runner-jobs--artifact-path invocation file))))
 
+(defun gptel-runner-jobs--inspection-record (source)
+  "Validate SOURCE as a background invocation inspection record."
+  (unless (eq (plist-get source :format) 'runner-invocation)
+    (user-error "Not a runner invocation record: %S" source))
+  source)
+
+(cl-defmethod gptel-runner-outputs ((source list))
+  "Read named values from background invocation SOURCE."
+  (gptel-runner-invocation-outputs
+   (gptel-runner-jobs--inspection-record source)))
+
+(cl-defmethod gptel-runner-artifacts ((source list))
+  "Return the descriptors published by background invocation SOURCE."
+  (copy-tree (plist-get (gptel-runner-jobs--inspection-record source) :artifacts)))
+
+(cl-defmethod gptel-runner--artifact-root ((source list))
+  "Return the storage directory of background invocation SOURCE."
+  (plist-get (gptel-runner-jobs--inspection-record source) :directory))
+
+(cl-defmethod gptel-runner-node-outcome ((run list) node)
+  "Read NODE's exported outcome from invocation RUN without restoring it."
+  (gptel-runner-jobs--inspection-record run)
+  (let* ((id (if (gptel-runner-node-p node) (gptel-runner-node-id node) node))
+         (file (plist-get run :nodes-file))
+         (outcomes (when file
+                     (gptel-runner-jobs--read
+                      (gptel-runner-jobs--artifact-path run file)))))
+    (unless file
+      (user-error "This invocation has no exported node outcomes"))
+    (or (cl-find id outcomes :key (lambda (entry) (plist-get entry :node))
+                 :test #'equal)
+        (user-error "Unknown node %S in invocation %s" id (plist-get run :id)))))
+
 (defun gptel-runner-invocation-call (invocation call)
   "Read the complete CALL inspection record for INVOCATION on demand."
   (if-let* ((file (plist-get call :record)))
@@ -822,7 +855,18 @@ Opaque runtime objects and circular references are represented by type."
     (when gptel-runner-jobs--run
       (setf (gptel-runner-run-snapshot-file gptel-runner-jobs--run)
             (expand-file-name "checkpoint.el"
-                              (plist-get gptel-runner-jobs--invocation :directory)))))
+                              (plist-get gptel-runner-jobs--invocation :directory))
+            (gptel-runner-run-output-directory gptel-runner-jobs--run)
+            (plist-get gptel-runner-jobs--invocation :directory)
+            (gptel-runner-run-output-epoch gptel-runner-jobs--run)
+            (plist-get gptel-runner-jobs--invocation :epoch)
+            (gptel-runner-run-artifacts gptel-runner-jobs--run)
+            ;; Old checkpoints did not retain the artifact registry.  Merge
+            ;; history as well as any newer checkpoint committed before exit.
+            (cl-remove-duplicates
+             (append (plist-get gptel-runner-jobs--invocation :artifacts)
+                     (gptel-runner-run-artifacts gptel-runner-jobs--run))
+             :key (lambda (item) (plist-get item :file)) :test #'equal))))
   (push (list :time (gptel-runner-event-time event)
               :epoch (plist-get gptel-runner-jobs--invocation :epoch)
               :run (gptel-runner-event-run-id event)
@@ -921,9 +965,13 @@ Opaque runtime objects and circular references are represented by type."
                                 :error (gptel-runner-jobs--safe-value (gptel-runner-call-error call)))))
           (gptel-runner-jobs--export-transcript call transcript)
           (push record calls)))
-      (maphash (lambda (key value) (push (cons key value) outputs))
-               (gptel-runner-run-blackboard run))
+      (setq outputs (gptel-runner-outputs run))
       (gptel-runner-jobs--export-file "outputs.el" outputs)
+      (gptel-runner-jobs--export-file
+       "nodes.el"
+       (gptel-runner-map-nodes
+        (lambda (node) (gptel-runner-node-outcome run node))
+        run))
       (when gptel-runner-jobs--pending-events
         (let ((file (expand-file-name "events.el" directory))
               (coding-system-for-write 'utf-8-unix))
@@ -944,38 +992,14 @@ Opaque runtime objects and circular references are represented by type."
                           (cons :calls (append previous (nreverse calls)))
                           (cons :outputs (mapcar #'car outputs))
                           (cons :outputs-file "outputs.el")
+                          (cons :nodes-file "nodes.el")
+                          (cons :artifacts (gptel-runner-artifacts run))
                           (cons :interactions gptel-runner-jobs--interactions)))
         (setq gptel-runner-jobs--invocation
               (plist-put gptel-runner-jobs--invocation (car pair) (cdr pair))))
       (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file gptel-runner-jobs--invocation)
 				gptel-runner-jobs--invocation)
       (setq gptel-runner-jobs--dirty nil))))
-
-(defun gptel-runner-publish-artifact (run name file &optional media-type)
-  "Publish RUN output FILE as NAME, optionally with MEDIA-TYPE.
-Copy the file into durable invocation history and return its descriptor.
-This API is available inside a background worker; ordinary runs can keep
-file paths on their blackboard instead."
-  (unless (and gptel-runner-jobs--invocation (gptel-runner-run-p run))
-    (error "Artifact publication requires a background invocation"))
-  (unless (and (stringp name) (not (string-empty-p name))
-               (file-regular-p file) (file-readable-p file))
-    (error "An artifact needs a name and a readable regular file"))
-  (let* ((relative (concat "artifacts/" (gptel-runner-jobs--id) "-"
-                           (file-name-nondirectory file)))
-         (target (expand-file-name relative (plist-get gptel-runner-jobs--invocation :directory)))
-         (descriptor (list :name name :file relative :media-type media-type
-                           :epoch (plist-get gptel-runner-jobs--invocation :epoch)
-                           :published-at (float-time))))
-    (gptel-runner-jobs--mkdir (file-name-directory target))
-    (copy-file file target nil)
-    (set-file-modes target #o600)
-    (setq gptel-runner-jobs--invocation
-          (plist-put gptel-runner-jobs--invocation :artifacts
-                     (append (plist-get gptel-runner-jobs--invocation :artifacts)
-                             (list descriptor)))
-          gptel-runner-jobs--dirty t)
-    descriptor))
 
 (defun gptel-runner-jobs--admit (call)
   "Acquire CALL's external writer lock without blocking other work."

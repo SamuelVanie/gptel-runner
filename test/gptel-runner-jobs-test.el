@@ -382,6 +382,9 @@
           (gptel-runner-jobs--invocation invocation)
           (gptel-runner-jobs--run
            (gptel-runner-run-create :id "test-run" :state 'running
+                                    :workflow (gptel-runner-workflow-create
+                                               :root (gptel-runner-sequence :id 'root))
+                                    :node-states (make-hash-table :test #'equal)
                                     :blackboard (make-hash-table :test #'equal)))
           (gptel-runner-jobs--exports (make-hash-table :test #'equal))
           (gptel-runner-jobs--pending-events '((:type third) (:type second) (:type first)))
@@ -503,6 +506,47 @@
         (should (equal (alist-get 'report (gptel-runner-invocation-outputs invocation))
                        "PARALLEL PROCESSES"))
         (should (= (length (plist-get invocation :artifacts)) 1))))))
+
+(ert-deftest gptel-runner-jobs-finalizer-publishes-after-duration-exhaustion ()
+  (gptel-runner-jobs-test--isolated
+    (let ((init (expand-file-name "finalize-init.el" gptel-runner-job-directory)))
+      (gptel-runner-jobs--write
+       init
+       '(progn
+          (require 'gptel-runner)
+          (gptel-runner-defworkflow job-finalizer ()
+            (gptel-runner-finalize
+             :id 'run :max-duration 5 :max-calls 0 :max-requests 0
+             :body (gptel-runner-sequence
+                    :id 'body
+                    (gptel-runner-elisp-step
+                     :id 'prepare :save-as 'partial
+                     :function (lambda (&rest _) "partial findings"))
+                    (gptel-runner-elisp-step
+                     :id 'wait :async t :function (lambda (&rest _) nil)))
+             :finally
+             (gptel-runner-elisp-step
+              :id 'publish :workspace-mode 'write :save-as 'artifact
+              :function (lambda (run _node)
+                          (with-temp-file "report.txt"
+                            (insert (gptel-runner-get run 'partial)))
+                          (gptel-runner-publish-artifact
+                           run "report" "report.txt" "text/plain")))))))
+      (let* ((job (gptel-runner-jobs-test--job
+                   'job-finalizer "Partial report" init
+                   '(:allow-writes t :max-duration 0.1)))
+             (invocation (gptel-runner-jobs-test--finished (gptel-runner-job-run job))))
+        (should (eq (plist-get invocation :state) 'failed))
+        (should (= (length (plist-get invocation :artifacts)) 1))
+        (should (alist-get 'artifact (gptel-runner-invocation-outputs invocation)))
+        (should (equal
+                 (with-temp-buffer
+                   (insert-file-contents
+                    (expand-file-name
+                     (plist-get (car (plist-get invocation :artifacts)) :file)
+                     (plist-get invocation :directory)))
+                   (buffer-string))
+                 "partial findings"))))))
 
 (ert-deftest gptel-runner-jobs-bootstrap-captures-and-preserves-library-paths ()
   (gptel-runner-jobs-test--isolated
@@ -667,6 +711,51 @@
          (should-not (file-exists-p marker))
          (should-not (file-exists-p (gptel-runner-jobs--job-lock
                                      (plist-get job :id)))))))))
+
+(ert-deftest gptel-runner-jobs-public-output-contract-matches-local-and-restored ()
+  (gptel-runner-jobs-test--isolated
+    (let* ((init (expand-file-name "examples/artifact-pipeline.el"
+                                   gptel-runner-jobs--package-directory))
+           (gptel-runner-output-directory
+            (expand-file-name "local/" gptel-runner-job-directory))
+           (_loaded (load init nil t))
+           (local (gptel-runner-start 'artifact-pipeline
+                                      :inputs '((subject . "parallel processes"))))
+           (invocation (gptel-runner-jobs-test--finished
+                        (gptel-runner-job-run
+                         (gptel-runner-jobs-test--job 'artifact-pipeline nil init))))
+           (local-artifact (gptel-runner-get local 'report))
+           (remote-artifact (gptel-runner-get invocation 'report)))
+      (unwind-protect
+          (progn
+            (should (eq (plist-get invocation :state) 'succeeded))
+            (should (equal (cl-loop for (key _value) on local-artifact by #'cddr collect key)
+                           (cl-loop for (key _value) on remote-artifact by #'cddr collect key)))
+            (dolist (source (list local invocation))
+              (let ((artifact (gptel-runner-get source 'report)))
+                (should (equal (gptel-runner-read-artifact source artifact)
+                               "Report for parallel processes\n"))
+                (should (equal (gptel-runner-artifacts source) (list artifact)))
+                (should (equal (gptel-runner-node-result source 'report) artifact))
+                (should (equal (gptel-runner-node-outcome source 'empty)
+                               '(:node empty :state succeeded :value nil)))
+                (should-not (gptel-runner-get source 'empty 'missing))
+                (should (eq (gptel-runner-get source 'absent 'missing) 'missing))
+                (should (eq (gptel-runner-node-state source 'read-report) 'succeeded))
+                (should (eq (gptel-runner-node-error source 'report 'none) 'none))
+                (should-error (gptel-runner-node-outcome source 'absent) :type 'user-error)))
+            ;; Continuation starts a fresh worker from a checkpoint.  Keep the
+            ;; original artifact and append a new version in the same storage.
+            (gptel-runner-jobs-test--command invocation 'continue '(:observation "Again"))
+            (setq invocation (gptel-runner-jobs-test--finished invocation))
+            (should (= (plist-get invocation :epoch) 2))
+            (should (= (length (gptel-runner-artifacts invocation)) 2))
+            (should (equal (gptel-runner-read-artifact invocation remote-artifact)
+                           "Report for parallel processes\n"))
+            (should (= (plist-get (gptel-runner-get invocation 'report) :epoch) 2))
+            (should (equal (gptel-runner-node-result invocation 'report)
+                           (gptel-runner-get invocation 'report))))
+        (gptel-runner-forget-run local)))))
 
 (provide 'gptel-runner-jobs-test)
 ;;; gptel-runner-jobs-test.el ends here

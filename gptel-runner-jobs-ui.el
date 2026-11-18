@@ -153,7 +153,7 @@
   (pcase-let ((`(,run ,_call ,target) (gptel-runner-jobs-ui--selection)))
     (gptel-runner-jobs-ui--display
      (format "*gptel-runner outputs:%s*" (plist-get run :id))
-     (gptel-runner-invocation-outputs run) target)))
+     (gptel-runner-outputs run) target)))
 
 (defun gptel-runner-background-commands ()
   "Inspect submitted command receipts for the selected invocation."
@@ -196,11 +196,11 @@
                 (mapcar (lambda (item)
                           (cons (or (plist-get item :name)
                                     (plist-get item :file)) item))
-                        (plist-get run :artifacts))))
+                        (gptel-runner-artifacts run))))
     (unless choices (user-error "This invocation has no artifacts"))
     (let* ((choice (completing-read "Artifact: " choices nil t))
-           (path (gptel-runner-jobs-ui--artifact-path
-                  run (plist-get (cdr (assoc choice choices)) :file))))
+           (path (gptel-runner-artifact-file
+                  run (cdr (assoc choice choices)))))
       (let ((enable-local-variables nil) (enable-local-eval nil))
         (pop-to-buffer (find-file-noselect path)))
       (read-only-mode 1)

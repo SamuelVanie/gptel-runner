@@ -16,6 +16,7 @@
 ;;; Code:
 
 (require 'gptel-runner-core)
+(require 'gptel-runner-output)
 (require 'gptel-runner-flow)
 (require 'gptel-runner-fake)
 (require 'gptel-runner-gptel)

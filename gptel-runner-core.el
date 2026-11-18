@@ -17,6 +17,7 @@
 (declare-function gptel-runner-save-run "gptel-runner-store")
 (declare-function gptel-runner-schedule-save "gptel-runner-store")
 (declare-function gptel-runner-store-cancel-save "gptel-runner-store")
+(declare-function gptel-runner--finalize-run "gptel-runner-flow")
 
 (defgroup gptel-runner nil
   "Deterministic workflows over stateless agent calls."
@@ -125,7 +126,8 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   iterations repeat-limits active-calls calls events budget driver queue
   (active-count 0)
   (writer-active 0) started-at finished-at terminal-data
-  extension-context
+  extension-context finalization
+  output-directory artifacts output-epoch
   callback callback-called
   duration-timer duration-remaining active-started-at
   paused-at snapshot-file (generation 0) options)
@@ -195,15 +197,20 @@ the same forms as `gptel-runner-map-nodes'."
     (or (gptel-runner-find-node run id)
         (user-error "Unknown node %S in run %s" id (gptel-runner-run-id run)))))
 
-(defun gptel-runner-node-state (run node)
+(cl-defgeneric gptel-runner-node-state (run node)
   "Return NODE's current workflow state in RUN.
 NODE is a node object or ID; an unknown ID signals a user error.  Nodes not
 yet reached are `pending'.  This is workflow state, not the more detailed
-state of an individual call, such as retry-wait or waiting-feedback."
+state of an individual call, such as retry-wait or waiting-feedback.
+RUN may also be a background invocation record for read-only inspection."
+  (plist-get (gptel-runner-node-outcome run node) :state))
+
+(cl-defmethod gptel-runner-node-state ((run gptel-runner-run) node)
+  "Return the current workflow state of NODE in live RUN."
   (gethash (gptel-runner-node-id (gptel-runner--resolve-node run node))
            (gptel-runner-run-node-states run) 'pending))
 
-(defun gptel-runner-node-outcome (run node)
+(cl-defgeneric gptel-runner-node-outcome (run node)
   "Return NODE's current outcome in RUN as a fresh plist.
 NODE is a node object or ID; an unknown ID signals a user error.
 The plist contains `:node' and `:state'.  A known terminal outcome also has
@@ -214,7 +221,11 @@ nodes loaded from older snapshots can also lack it.
 Outcomes are independent of calls and `:save-as', and survive checkpoints.
 They describe the current execution, not history: resetting a node for a
 repeat iteration, retry, or continuation clears its previous outcome.
-The value itself is shared with the run and should be treated as read-only."
+The value itself is shared with the run and should be treated as read-only.
+RUN may also be a background invocation record for read-only inspection.")
+
+(cl-defmethod gptel-runner-node-outcome ((run gptel-runner-run) node)
+  "Return the outcome of NODE in live RUN."
   (let* ((id (gptel-runner-node-id (gptel-runner--resolve-node run node)))
          (state (gethash id (gptel-runner-run-node-states run) 'pending))
          (outcome (gethash id (gptel-runner-run-node-outcomes run))))
@@ -227,7 +238,8 @@ The value itself is shared with the run and should be treated as read-only."
 (defun gptel-runner-node-result (run node &optional default)
   "Return NODE's successful output in RUN, or DEFAULT if unavailable.
 NODE is a node object or ID.  A successful nil output returns nil even when
-DEFAULT is non-nil.  Use `gptel-runner-node-outcome' for state and failure data."
+DEFAULT is non-nil.  RUN may also be a background invocation record.
+Use `gptel-runner-node-outcome' for state and failure data."
   (let ((outcome (gptel-runner-node-outcome run node)))
     (if (and (eq (plist-get outcome :state) 'succeeded)
              (plist-member outcome :value))
@@ -238,7 +250,8 @@ DEFAULT is non-nil.  Use `gptel-runner-node-outcome' for state and failure data.
   "Return NODE's unsuccessful outcome data in RUN, or DEFAULT.
 NODE is a node object or ID.  Unsuccessful states are failed, blocked,
 stalled, and cancelled.  Successful, skipped, unfinished, and unavailable
-outcomes return DEFAULT.  Known nil error data returns nil."
+outcomes return DEFAULT.  Known nil error data returns nil.
+RUN may also be a background invocation record."
   (let ((outcome (gptel-runner-node-outcome run node)))
     (if (and (memq (plist-get outcome :state) '(failed blocked stalled cancelled))
              (plist-member outcome :value))
@@ -267,8 +280,10 @@ An absent or nil override falls back to WORKSPACE."
   "Return the effective workspace for agent or Elisp NODE in RUN.
 NODE's non-nil `:workspace' overrides the run workspace.  Relative paths
 are resolved from the run workspace, and symbolic links are canonicalized.
-Use this function in prompts and context functions that need NODE's directory."
-  (gptel-runner--node-workspace node (gptel-runner-run-workspace run)))
+NODE is a node object or ID.  Use this function in prompts and context
+functions that need NODE's directory."
+  (gptel-runner--node-workspace (gptel-runner--resolve-node run node)
+                                (gptel-runner-run-workspace run)))
 
 (cl-defgeneric gptel-runner-driver-start (driver call complete observe)
   "Start CALL with DRIVER.
@@ -376,8 +391,27 @@ Recognized properties include `:preset', `:workspace-mode', `:schema',
   (or (gethash name gptel-runner--agents)
       (user-error "Unknown gptel-runner agent: %S" name)))
 
-(defun gptel-runner-get (run key &optional default)
-  "Return RUN blackboard value for KEY, or DEFAULT."
+(cl-defgeneric gptel-runner-outputs (source)
+  "Return SOURCE's named values as a fresh alist.
+SOURCE is a run or background invocation record.  Include inputs and runner
+history as well as values saved with `:save-as' or `gptel-runner-put'.
+Values are shared with live runs and should be treated as read-only.")
+
+(cl-defmethod gptel-runner-outputs ((source gptel-runner-run))
+  "Return the named values of live SOURCE."
+  (let (entries)
+    (maphash (lambda (key value) (push (cons key value) entries))
+             (gptel-runner-run-blackboard source))
+    (nreverse entries)))
+
+(cl-defgeneric gptel-runner-get (run key &optional default)
+  "Return RUN's named value for KEY, or DEFAULT if absent.
+RUN is a live run or background invocation record.  A stored nil value
+returns nil even when DEFAULT is non-nil."
+  (alist-get key (gptel-runner-outputs run) default nil #'equal))
+
+(cl-defmethod gptel-runner-get ((run gptel-runner-run) key &optional default)
+  "Return live RUN's blackboard value for KEY, or DEFAULT."
   (gethash key (gptel-runner-run-blackboard run) default))
 
 (defun gptel-runner-put (run key value)
@@ -617,6 +651,15 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
                          run (gptel-runner-run-generation run))))))
 
 (defun gptel-runner--finish-run (run state &optional data)
+  "Finish RUN as STATE with DATA, allowing explicit run finalization."
+  (unless (gptel-runner--run-terminal-p run)
+    (if (and (gptel-runner-run-workflow run)
+             (eq (gptel-runner-node-kind (gptel-runner--source-root run))
+                 'finalize))
+        (gptel-runner--finalize-run run state data)
+      (gptel-runner--terminalize-run run state data))))
+
+(defun gptel-runner--terminalize-run (run state &optional data)
   "Terminalize RUN as STATE once, recording DATA."
   (unless (gptel-runner--run-terminal-p run)
     (setf (gptel-runner-run-state run) state
@@ -1160,7 +1203,9 @@ snapshot is committed asynchronously after this function returns."
     run))
 
 (defun gptel-runner-abort-run (run &optional reason)
-  "Cancel RUN for REASON, including queued and active work."
+  "Cancel RUN for REASON, including queued and active work.
+An explicit run finalizer with `:on-cancel' set to `finalize' may then run.
+Aborting again during finalization stops it immediately."
   (unless (gptel-runner--run-terminal-p run)
     (cl-incf (gptel-runner-run-generation run))
     (setf (gptel-runner-run-state run) 'cancelling)

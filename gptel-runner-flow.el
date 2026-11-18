@@ -12,6 +12,7 @@
 
 (require 'cl-lib)
 (require 'gptel-runner-core)
+(require 'gptel-runner-output)
 
 (defun gptel-runner--node-id (properties kind)
   "Find an ID in PROPERTIES or make one based on KIND."
@@ -112,6 +113,34 @@ Optional `:id' and inherited `:context' work as on other composite nodes."
                              (plist-get properties :catch)
                              (plist-get properties :finally)))))
 
+(defun gptel-runner-finalize (&rest properties)
+  "Return a run finalization wrapper described by PROPERTIES.
+This node must be the workflow root.  `:body' and `:finally' are required
+workflow nodes.  The finalizer runs after success, failure, blocked/stalled
+outcomes, and budget exhaustion, with access to the same run and blackboard.
+It has its own required positive finite `:max-duration', plus finite
+`:max-calls' and `:max-requests' allowances, each defaulting to 1 (0 is valid).
+`:on-cancel' is `skip' by default; `finalize' explicitly enables finalization
+after cancellation.  Cancelling during finalization always stops it.
+The run retains the body's terminal outcome, even if finalization fails.
+Inspect `gptel-runner-finalization-outcome' for both outcomes and accounting.
+The terminal callback runs after finalization.  Pause/resume checkpoints the
+current phase.  Timers cannot preempt Lisp that does not yield to Emacs."
+  (gptel-runner-node-create
+   :id (gptel-runner--node-id properties 'finalize)
+   :kind 'finalize :properties properties
+   :children (list (plist-get properties :body)
+                   (plist-get properties :finally))))
+
+(defun gptel-runner-finalization-outcome (run)
+  "Return RUN's finalization record, or nil before its body finishes.
+The fresh plist has `:phase' (finalizing or complete), `:body' containing
+a (:state STATE :value VALUE) plist, and, after finalization, `:result' in
+the same format.  `:body-budget' and `:body-duration' retain the main allowance;
+`:budget' and `:duration-remaining' record finalizer accounting on completion.
+Values are shared with RUN and should be treated as read-only."
+  (copy-sequence (gptel-runner-run-finalization run)))
+
 (defun gptel-runner-parallel (&rest arguments)
   "Return a parallel node from ARGUMENTS.
 Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
@@ -144,6 +173,19 @@ effective workspace of the agent node receiving the context."
     (user-error "Context file must be a string: %S" file))
   (list :file file))
 
+(defun gptel-runner-context-artifact (key)
+  "Return a context source reading the artifact saved at blackboard KEY.
+Resolve KEY before each agent call, so a preceding pipeline step can publish
+the file with either artifact API and `:save-as'.  Missing values and
+unreadable artifacts are context errors, just like missing context files."
+  (list :artifact key))
+
+(defun gptel-runner--context-artifact-p (source)
+  "Return non-nil when SOURCE is a named artifact context descriptor."
+  (and (proper-list-p source)
+       (= (length source) 2)
+       (eq (car source) :artifact)))
+
 (defun gptel-runner--context-function (source)
   "Return the callable represented by context SOURCE, or nil."
   (cond
@@ -166,6 +208,7 @@ effective workspace of the agent node receiving the context."
    ((null context) nil)
    ((or (stringp context)
         (gptel-runner--context-function context)
+        (gptel-runner--context-artifact-p context)
         (gptel-runner--context-file-p context))
     (list context))
    ((proper-list-p context) context)
@@ -177,7 +220,8 @@ When WORKSPACE is non-nil, also require every declared file to be readable."
   (dolist (source (gptel-runner--context-sources context))
     (cond
      ((or (null source) (stringp source)
-          (gptel-runner--context-function source)))
+          (gptel-runner--context-function source)
+          (gptel-runner--context-artifact-p source)))
      ((gptel-runner--context-file-p source)
       (unless (stringp (cadr source))
         (user-error "Invalid context source for %s: %S" owner source))
@@ -208,6 +252,10 @@ Return a cons of label and text, or nil when a function omits its context."
   (cond
    ((null source) nil)
    ((stringp source) (cons owner source))
+   ((gptel-runner--context-artifact-p source)
+    (cons (format "%s (artifact %s)" owner (cadr source))
+          (gptel-runner-read-artifact
+           run (gptel-runner-get run (cadr source)))))
    ((gptel-runner--context-file-p source)
     (let ((file (cadr source)))
       (cons (format "%s (file %s)" owner file)
@@ -356,6 +404,24 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
                 (unless (and (integerp retries) (>= retries 0))
                   (user-error "Node %S has invalid :retries" id))))
             (pcase kind
+              ('finalize
+               (unless (eq node root)
+                 (user-error "Finalization node %S must be the workflow root" id))
+               (dolist (key '(:body :finally))
+                 (unless (gptel-runner-node-p (plist-get props key))
+                   (user-error "Finalization node %S needs a %S node" id key)))
+               (let ((duration (plist-get props :max-duration)))
+                 (unless (and (numberp duration) (> duration 0)
+                              (< duration 1.0e+INF))
+                   (user-error "Finalization node %S needs a positive finite :max-duration" id)))
+               (dolist (key '(:max-calls :max-requests))
+                 (let ((limit (if (plist-member props key)
+                                  (plist-get props key) 1)))
+                   (unless (and (integerp limit) (>= limit 0))
+                     (user-error "Finalization node %S needs a finite nonnegative %S" id key))))
+               (unless (memq (or (plist-get props :on-cancel) 'skip)
+                             '(skip finalize))
+                 (user-error "Finalization node %S has invalid :on-cancel" id)))
               ('elisp
                (unless (functionp (plist-get props :function))
                  (user-error "Elisp node %S needs a :function" id))
@@ -634,13 +700,14 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
            (funcall done state value))
          (resolve-and-launch
           ()
-          (let ((resolved
-                 (condition-case err
-                     (cons t (gptel-runner--prompt run node))
-                   (error
-                    (finish 'failed (list :type 'prompt :error err))
-                    nil))))
-            (when resolved
+          (let* ((generation (gptel-runner-run-generation run))
+                 (resolved
+                  (condition-case err
+                      (cons t (gptel-runner--prompt run node))
+                    (error
+                     (finish 'failed (list :type 'prompt :error err))
+                     nil))))
+            (when (and resolved (= generation (gptel-runner-run-generation run)))
               (launch (cdr resolved) nil))))
          (repair-empty
           (call error-data)
@@ -664,20 +731,24 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
              (lambda (call state value)
                (pcase state
                  ('succeeded
-                  (let ((parsed (gptel-runner--parse-agent-result
-                                 agent node value)))
-                    (if (car parsed)
-                        (progn
-                          (when-let ((key (plist-get props :save-as)))
-                            (gptel-runner-put run key (cdr parsed)))
-                          (finish 'succeeded (cdr parsed)))
-                      (cond
-                       ((and (gptel-runner--empty-output-error-p (cdr parsed))
-                             (not repaired))
-                        (repair-empty call (cdr parsed)))
-                       ((and repair-allowed (not repaired))
-                        (repair-invalid value (cdr parsed)))
-                       (t (finish 'failed (cdr parsed)))))))
+                  (let* ((generation (gptel-runner-run-generation run))
+                         (parsed (gptel-runner--parse-agent-result
+                                  agent node value)))
+                    ;; Parsing may yield while the body expires and its run
+                    ;; finalizer starts.  Do not publish an obsolete result.
+                    (when (= generation (gptel-runner-run-generation run))
+                      (if (car parsed)
+                          (progn
+                            (when-let ((key (plist-get props :save-as)))
+                              (gptel-runner-put run key (cdr parsed)))
+                            (finish 'succeeded (cdr parsed)))
+                        (cond
+                         ((and (gptel-runner--empty-output-error-p (cdr parsed))
+                               (not repaired))
+                          (repair-empty call (cdr parsed)))
+                         ((and repair-allowed (not repaired))
+                          (repair-invalid value (cdr parsed)))
+                         (t (finish 'failed (cdr parsed))))))))
                  ('blocked (finish 'blocked value))
                  ('cancelled (finish 'cancelled value))
                  (_
@@ -700,24 +771,28 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
 (defun gptel-runner--execute-elisp (run node done)
   "Execute Elisp NODE in RUN and invoke DONE with state and result."
   (let* ((props (gptel-runner-node-properties node))
+         (generation (gptel-runner-run-generation run))
          (retries (or (plist-get props :retries) 0)))
     (cl-labels
         ((launch ()
-           (when (eq (gptel-runner-run-state run) 'running)
+           (when (and (= generation (gptel-runner-run-generation run))
+                      (eq (gptel-runner-run-state run) 'running))
              (gptel-runner--submit-call
               run node nil nil
               (lambda (_call state value)
-                (if (and (eq state 'failed) (> retries 0)
-                         (eq (gptel-runner-run-state run) 'running))
-                    (progn
-                      (cl-decf retries)
-                      (gptel-runner--emit run 'elisp-step-retry node nil value)
-                      (launch))
-                  (when (eq state 'succeeded)
-                    (when-let* ((key (plist-get props :save-as)))
-                      (gptel-runner-put run key value)))
-                  (gptel-runner--set-node-state run node state value)
-                  (funcall done state value)))))))
+                (when (or (not (eq state 'succeeded))
+                          (= generation (gptel-runner-run-generation run)))
+                  (if (and (eq state 'failed) (> retries 0)
+                           (eq (gptel-runner-run-state run) 'running))
+                      (progn
+                        (cl-decf retries)
+                        (gptel-runner--emit run 'elisp-step-retry node nil value)
+                        (launch))
+                    (when (eq state 'succeeded)
+                      (when-let* ((key (plist-get props :save-as)))
+                        (gptel-runner-put run key value)))
+                    (gptel-runner--set-node-state run node state value)
+                    (funcall done state value))))))))
       (gptel-runner--set-node-state run node 'running)
       (launch))))
 
@@ -1044,6 +1119,111 @@ Return the new history entry, or nil when NODE does not collect history."
          (remember (list :phase 'body))
          (gptel-runner--execute-node run body #'after-body))))))
 
+(defun gptel-runner--quiesce-finalization (run subtree state value)
+  "Stop RUN's current work and finish entered SUBTREE nodes as STATE/VALUE."
+  (setf (gptel-runner-run-state run) 'finishing)
+  (cl-incf (gptel-runner-run-generation run))
+  (gptel-runner--stop-duration-clock run)
+  (dolist (call (copy-sequence (gptel-runner-run-calls run)))
+    (unless (gptel-runner--call-terminal-p call)
+      ;; Teardown may invoke driver callbacks or Elisp process sentinels.
+      ;; They must never schedule more work in the phase being left.
+      (setf (gptel-runner-call-on-complete call) nil)
+      (gptel-runner-abort-call call 'run-finalization)))
+  (gptel-runner-map-nodes
+   (lambda (node)
+     (when (eq (gethash (gptel-runner-node-id node)
+                        (gptel-runner-run-node-states run)) 'running)
+       (gptel-runner--set-node-state run node state value)))
+   subtree))
+
+(defun gptel-runner--complete-finalization (run state value)
+  "Record finalizer STATE and VALUE, then publish RUN's original outcome."
+  (let* ((root (gptel-runner--source-root run))
+         (finalizer (plist-get (gptel-runner-node-properties root) :finally))
+         (record (gptel-runner-run-finalization run))
+         (body (plist-get record :body)))
+    (gptel-runner--quiesce-finalization run finalizer state value)
+    (setq record (plist-put record :phase 'complete)
+          record (plist-put record :result (list :state state :value value))
+          record (plist-put record :budget
+                            (copy-gptel-runner-budget (gptel-runner-run-budget run)))
+          record (plist-put record :duration-remaining
+                            (gptel-runner-run-duration-remaining run)))
+    (setf (gptel-runner-run-finalization run) record
+          (gptel-runner-run-budget run) (plist-get record :body-budget)
+          (gptel-runner-run-duration-remaining run) (plist-get record :body-duration))
+    (gptel-runner--set-node-state run root (plist-get body :state)
+                                (plist-get body :value))
+    (gptel-runner--emit run 'finalization-completed root nil
+                        (plist-get record :result))
+    (gptel-runner--terminalize-run run (plist-get body :state)
+                                 (plist-get body :value))))
+
+(defun gptel-runner--execute-finalizer (run)
+  "Execute or resume RUN's finalizer using its remaining private allowance."
+  (let ((generation (gptel-runner-run-generation run))
+        (finalizer (plist-get (gptel-runner-node-properties
+                              (gptel-runner--source-root run)) :finally)))
+    (gptel-runner--execute-node
+     run finalizer
+     (lambda (state value)
+       (when (and (= generation (gptel-runner-run-generation run))
+                  (eq (gptel-runner-run-state run) 'running))
+         (gptel-runner--complete-finalization run state value))))))
+
+(defun gptel-runner--finalize-run (run state value)
+  "Handle terminal STATE and VALUE for RUN's explicit finalization wrapper."
+  (pcase (plist-get (gptel-runner-run-finalization run) :phase)
+    ('complete nil)
+    ('finalizing (gptel-runner--complete-finalization run state value))
+    (_
+     (let* ((root (gptel-runner--source-root run))
+            (props (gptel-runner-node-properties root))
+            (finalizer (plist-get props :finally))
+            (skip (and (eq state 'cancelled)
+                       (not (eq (plist-get props :on-cancel) 'finalize)))))
+       (gptel-runner--quiesce-finalization run (plist-get props :body) state value)
+       (setf (gptel-runner-run-finalization run)
+             (list :phase (if skip 'complete 'finalizing)
+                   :body (list :state state :value value)
+                   :body-budget (gptel-runner-run-budget run)
+                   :body-duration (gptel-runner-run-duration-remaining run)))
+       (if skip
+           (progn
+             (gptel-runner--skip-subtree run finalizer 'run-cancelled)
+             (setf (gptel-runner-run-finalization run)
+                   (plist-put (gptel-runner-run-finalization run) :result
+                              '(:state skipped :value run-cancelled)))
+             (gptel-runner--set-node-state run root state value)
+             (gptel-runner--emit run 'finalization-skipped root nil 'run-cancelled)
+             (gptel-runner--terminalize-run run state value))
+         (setf (gptel-runner-run-budget run)
+               (gptel-runner-budget-create
+                :max-duration (plist-get props :max-duration)
+                :max-calls (gptel-runner--option :max-calls props nil 1)
+                :max-requests (gptel-runner--option :max-requests props nil 1))
+               (gptel-runner-run-duration-remaining run) (plist-get props :max-duration)
+               (gptel-runner-run-state run) 'running)
+         (let ((generation (gptel-runner-run-generation run)))
+           (gptel-runner--emit run 'finalization-started root nil
+                               (plist-get (gptel-runner-run-finalization run) :body))
+           (when (and (= generation (gptel-runner-run-generation run))
+                      (eq (gptel-runner-run-state run) 'running))
+             (gptel-runner--start-duration-clock run)
+             (gptel-runner--execute-finalizer run))))))))
+
+(defun gptel-runner--execute-finalize (run node done)
+  "Execute the body of finalization NODE in RUN, forwarding its result to DONE."
+  (let ((generation (gptel-runner-run-generation run)))
+    (gptel-runner--set-node-state run node 'running)
+    (gptel-runner--execute-node
+     run (plist-get (gptel-runner-node-properties node) :body)
+     (lambda (state value)
+       (when (and (= generation (gptel-runner-run-generation run))
+                  (eq (gptel-runner-run-state run) 'running))
+         (funcall done state value))))))
+
 (defun gptel-runner--execute-node (run node done)
   "Execute NODE in RUN, then call DONE with terminal state and value."
   (let ((saved-state
@@ -1079,6 +1259,7 @@ Return the new history entry, or nil when NODE does not collect history."
         ('repeat (gptel-runner--execute-repeat run node done))
         ('parallel (gptel-runner--execute-parallel run node done))
         ('try (gptel-runner--execute-try run node done))
+        ('finalize (gptel-runner--execute-finalize run node done))
         (_ (funcall done 'failed
                     (list :type 'invalid-node
                           :kind (gptel-runner-node-kind node)))))))))
@@ -1230,21 +1411,23 @@ CALLBACK runs exactly once with the terminal run."
                       ('finally '(:body :catch))
                       ('complete '(:body :catch :finally))))))))
 
-(defun gptel-runner--prepare-node-states-for-resume (run)
-  "Reset unfinished node states in RUN while preserving completed work."
-  (let ((completed (make-hash-table :test #'equal)))
+(defun gptel-runner--prepare-node-states-for-resume (run &optional subtree)
+  "Reset unfinished node states in RUN, retaining completed work in SUBTREE.
+SUBTREE defaults to the workflow root."
+  (let* ((root (or subtree (gptel-runner--source-root run)))
+         (completed (make-hash-table :test #'equal)))
     (cl-labels
         ((walk (node)
            (dolist (child (gptel-runner--try-completed-children run node))
              (dolist (id (gptel-runner--subtree-ids child))
                (puthash id t completed)))
            (mapc #'walk (gptel-runner-node-children node))))
-      (walk (gptel-runner-workflow-root (gptel-runner-run-workflow run))))
-    (maphash
-     (lambda (id state)
-       (unless (or (gethash id completed) (memq state '(succeeded skipped)))
-         (gptel-runner--reset-node-state run id)))
-     (gptel-runner-run-node-states run))))
+      (walk root))
+    (dolist (id (gptel-runner--subtree-ids root))
+      (let ((state (gethash id (gptel-runner-run-node-states run))))
+        (when (and state
+                   (not (or (gethash id completed) (memq state '(succeeded skipped)))))
+          (gptel-runner--reset-node-state run id))))))
 
 (defun gptel-runner--prepare-terminal-repeat-bodies (run root)
   "Reset completed repeat bodies in RUN that made ROOT blocked or stalled.
@@ -1287,9 +1470,18 @@ When CALLBACK is non-nil, replace the previous terminal callback with it."
     (setf (gptel-runner-run-callback run) callback
           (gptel-runner-run-callback-called run) nil))
   (gptel-runner--supersede-paused-calls run)
-  (gptel-runner--prepare-terminal-repeat-bodies
-   run (gptel-runner-workflow-root (gptel-runner-run-workflow run)))
-  (gptel-runner--prepare-node-states-for-resume run)
+  (let* ((root (gptel-runner--source-root run))
+         (phase (plist-get (gptel-runner-run-finalization run) :phase))
+         (finalizer (and (eq (gptel-runner-node-kind root) 'finalize)
+                         (plist-get (gptel-runner-node-properties root) :finally)))
+         (subtree (if (eq phase 'finalizing) finalizer root)))
+    (when (eq phase 'complete)
+      (gptel-runner--clear-workflow-results run finalizer)
+      (gptel-runner--reset-subtree run finalizer)
+      (gptel-runner--clear-repeat-progress run finalizer)
+      (setf (gptel-runner-run-finalization run) nil))
+    (gptel-runner--prepare-terminal-repeat-bodies run subtree)
+    (gptel-runner--prepare-node-states-for-resume run subtree))
   (cl-incf (gptel-runner-run-generation run))
   (setf (gptel-runner-run-state run) 'running
         (gptel-runner-run-paused-at run) nil
@@ -1300,13 +1492,19 @@ When CALLBACK is non-nil, replace the previous terminal callback with it."
         (gptel-runner-run-active-count run) 0
         (gptel-runner-run-writer-active run) 0)
   (gptel-runner--emit run event nil nil data)
-  (gptel-runner--start-duration-clock run)
-  (when (eq (gptel-runner-run-state run) 'running)
-    (gptel-runner--execute-node
-     run (gptel-runner-workflow-root (gptel-runner-run-workflow run))
-     (lambda (state value)
-       (when (eq (gptel-runner-run-state run) 'running)
-         (gptel-runner--finish-run run state value)))))
+  (let ((generation (gptel-runner-run-generation run)))
+    (gptel-runner--start-duration-clock run)
+    ;; An already exhausted body may have entered finalization while starting
+    ;; the clock.  That transition has dispatched its finalizer itself.
+    (when (and (= generation (gptel-runner-run-generation run))
+               (eq (gptel-runner-run-state run) 'running))
+      (if (eq (plist-get (gptel-runner-run-finalization run) :phase) 'finalizing)
+          (gptel-runner--execute-finalizer run)
+        (gptel-runner--execute-node
+         run (gptel-runner-workflow-root (gptel-runner-run-workflow run))
+         (lambda (state value)
+           (when (eq (gptel-runner-run-state run) 'running)
+             (gptel-runner--finish-run run state value)))))))
   (gptel-runner--checkpoint run)
   run)
 
@@ -1440,6 +1638,8 @@ increments to accumulate."
 ADDITIONAL-REQUESTS, ADDITIONAL-CALLS, and ADDITIONAL-DURATION are the
 validated requested increments.
 CALLBACK, when non-nil, replaces the callback for the next terminal state."
+  (when (eq (plist-get (gptel-runner-run-finalization run) :phase) 'finalizing)
+    (user-error "Run finalization has its own fixed allowance"))
   (let* ((budget (gptel-runner-run-budget run))
          (requests (and (gptel-runner-budget-max-requests budget)
                         additional-requests))
@@ -1515,6 +1715,9 @@ Return an ordered plist describing the increments that were reapplied."
                (cons node path)))))
       (let* ((path (walk root))
              (target (car (last path))))
+        (when (and (eq (gptel-runner-node-kind root) 'finalize)
+                   (memq (plist-get (gptel-runner-node-properties root) :finally) path))
+          (user-error "Retry targets must be in the workflow body"))
         (unless (and target (memq (gptel-runner-node-kind target) '(agent elisp)))
           (user-error "No agent or Elisp node %S in this workflow" node-id))
         (dolist (node path)

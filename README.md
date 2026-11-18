@@ -73,6 +73,84 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
+### One pipeline API for local and background runs
+
+Pipeline functions always receive the same run and node objects, whether
+started with `gptel-runner-start` or by a job worker. Use these public contracts
+throughout a pipeline; job definitions handle launching and scheduling.
+
+| Need | Public API |
+| --- | --- |
+| Supply and read named data | `:inputs`, `gptel-runner-get` |
+| Save a step result or another value | `:save-as`, `gptel-runner-put` |
+| Inspect named values | `gptel-runner-outputs` (alist, including inputs and history) |
+| Inspect a node | `gptel-runner-node-state`, `-outcome`, `-result`, `-error` |
+| Resolve a node's workspace | `gptel-runner-node-workspace` (node object or ID) |
+| Retain an existing file | `gptel-runner-publish-artifact` |
+| Retain generated text | `gptel-runner-write-artifact` |
+| List, locate, or read retained files | `gptel-runner-artifacts`, `-artifact-file`, `-read-artifact` |
+| Feed a retained file to an agent | `gptel-runner-context-artifact` |
+
+`gptel-runner-get`, `gptel-runner-outputs`, the four node inspection helpers,
+and the three artifact readers also accept an invocation record returned by
+`gptel-runner-invocation-get`. They read saved inspection data without loading
+an executable run. Refresh the invocation record to observe a running worker.
+Older invocation histories without exported node outcomes report that they are
+unavailable. `gptel-runner-invocation-outputs` remains supported.
+
+### Managed file outputs
+
+Publishing owns storage for the copy and returns the same descriptor in both
+environments. For generated text, no caller-managed temporary file is needed:
+
+```elisp
+(gptel-runner-elisp-step
+ :id 'report :save-as 'report
+ :function
+ (lambda (run _node)
+   (gptel-runner-write-artifact
+    run "report.md"
+    (format "# Report\n\n%s\n" (gptel-runner-get run 'analysis))
+    "text/markdown")))
+
+;; Or retain a copy of an existing file. Relative filenames use the run
+;; workspace; for node overrides, expand from gptel-runner-node-workspace.
+(gptel-runner-publish-artifact run "test-results" "results.json" "application/json")
+
+;; These readers also work with a saved background invocation record.
+(gptel-runner-artifacts run)
+(gptel-runner-artifact-file run (gptel-runner-get run 'report))
+(gptel-runner-read-artifact run (gptel-runner-get run 'report))
+
+;; A later agent can consume the artifact saved under 'report.
+(gptel-runner-agent-step
+ :id 'review-report :agent 'reviewer :prompt "Review the report."
+ :context (gptel-runner-context-artifact 'report))
+```
+
+Descriptors contain `:name`, `:file`, `:media-type`, `:epoch`, and
+`:published-at`. `:file` is relative to managed output storage; always resolve
+it through `gptel-runner-artifact-file`. `:epoch` is nil for local runs and the
+worker generation for background runs. Publication appends to the artifact
+registry; `:save-as` or `gptel-runner-put` separately names a descriptor on the
+blackboard. Repeated publication under the same display name retains distinct
+files, so retries and continuations do not overwrite earlier reports.
+
+Local files live in a unique private directory under
+`gptel-runner-output-directory`; jobs retain them inside invocation history.
+Files have mode 0600 and artifact directories 0700. Publication becomes visible
+after the complete file is moved into place. The file-copy API leaves its
+source untouched; the text API writes UTF-8. Managed output storage does not
+require `:allow-writes`, which governs declared workspace writes.
+
+Snapshots retain the output directory and artifact registry. Files survive
+completion, forgetting a run, and snapshot deletion. Remove retained directories
+explicitly when no longer needed; copying a snapshot alone does not copy its
+files. These files can contain the same sensitive data as other run outputs.
+
+See [artifact-pipeline.el](examples/artifact-pipeline.el) for one pipeline that
+runs unchanged locally or as a background job, without a provider.
+
 ### Finding nodes and inspecting outcomes
 
 Inspect a run without searching its call history or requiring `:save-as`:
@@ -319,6 +397,71 @@ failed phase; `gptel-runner-retry :from-node` can explicitly revisit an earlier
 step.  A new repeat iteration or `gptel-runner-continue` starts a fresh try.
 Use stable node IDs and serializable outputs for durable checkpoints.
 
+### Bounded run finalization
+
+Wrap the entire workflow in `gptel-runner-finalize` to publish partial results
+after success, failure, blocked/stalled outcomes, or exhaustion of duration,
+request, call, or repeat limits. Its `:body` and `:finally` are ordinary
+workflow nodes; the wrapper must be the workflow root.
+
+```elisp
+(gptel-runner-start
+ (gptel-runner-finalize
+  :id 'publish-run
+  :body my-workflow-node
+  :max-duration 30               ; separate finalizer allowance, required
+  :max-calls 0                   ; this finalizer only uses local Elisp
+  :max-requests 0
+  :on-cancel 'finalize            ; opt in; default is 'skip
+  :finally
+  (gptel-runner-elisp-step
+   :id 'publish-partial-results :save-as 'report
+   :function
+   (lambda (run _node)
+     (gptel-runner-write-artifact
+      run "partial-results.el"
+      (prin1-to-string
+       (list :outcome (plist-get (gptel-runner-finalization-outcome run) :body)
+             :results (gptel-runner-get run 'review-history)))))))
+ :max-duration 600)
+```
+
+The finalizer shares the run's blackboard, node outcomes, workspace rules,
+concurrency limits, and driver. It receives a fresh, separate budget:
+`:max-duration` must be positive and finite; `:max-calls` and `:max-requests`
+are nonnegative integers, each defaulting to 1. These allowances include
+retries and repairs. Body work is stopped before finalization starts, and
+late body results are ignored. The finalizer's allowance cannot be increased
+with `gptel-runner-extend`; pause stops its active-duration clock and resume
+uses what remains. As with Elisp steps, a timer cannot interrupt Lisp that
+does not yield; elapsed duration is checked when an Elisp step returns.
+
+Cancellation remains an immediate stop by default. `:on-cancel 'finalize`
+explicitly permits finalization after a run or body cancellation. Cancelling
+again while the finalizer runs always stops it. `try :finally` keeps its
+existing cancellation and duration behavior.
+
+The run stays `running` during finalization and calls its terminal callback
+only afterward. The run's final state and terminal data preserve the **body's
+outcome**, even if the finalizer fails, expires, or is cancelled. Inspect
+`gptel-runner-finalization-outcome`: `:body` and `:result` are separate
+`(:state STATE :value VALUE)` records, and `:phase` is `finalizing` or
+`complete`. A skipped finalizer has `:result (:state skipped :value
+run-cancelled)`. The record is nil until the body finishes. Budget records
+are `gptel-runner-budget` objects: `:body-budget` retains body accounting,
+while `:budget` records finalizer accounting after it runs. The ordinary run
+budget refers to the active phase and is restored to the body budget when
+finalization completes. A failed publication therefore remains observable
+without replacing the original failure or exhaustion reason.
+
+Snapshots retain both outcomes, the current phase, and its remaining budget.
+Resuming a paused finalizer continues its safe checkpoint without rerunning
+the body. Retrying, extending, or continuing a terminal run prepares a fresh
+finalizer for the next body outcome; `retry :from-node` targets must belong
+to the body. Finalizers should publish idempotently, since an unfinished step
+can restart after pause or process interruption. Finalizers use the same
+artifact APIs for local runs and background invocation history.
+
 ### Per-node workspaces
 
 Set `:workspace` on an agent or Elisp step to run it in a different directory.
@@ -369,7 +512,8 @@ Add `:context` at any workflow level to prepend stable project knowledge to
 the stateless prompt of each affected agent call.  A context value is one
 source or a list of sources.  Each source can be an inline string, a function
 of `(run node)` that returns a string (or nil to omit itself), or a file
-descriptor produced by `gptel-runner-context-file`.  `node` is the target
+descriptor produced by `gptel-runner-context-file` or
+`gptel-runner-context-artifact`.  `node` is the target
 agent step even when the function belongs to a broader scope:
 
 ```elisp
@@ -1009,8 +1153,10 @@ events, errors, and logs.  A pipeline can publish any number of named files:
 (gptel-runner-publish-artifact run "report" "/tmp/report.txt" "text/plain")
 ```
 
-Publishing copies the file into the invocation's private artifact directory;
-later changes to the source file do not change that historical output.
+The same publication API works locally. It copies the file into private managed
+storage; later changes to the source file do not change that historical output.
+Use `gptel-runner-write-artifact` to publish text directly, and the shared
+output, node outcome, and artifact readers above to inspect the invocation.
 Snapshot recovery data stays separate from inspection history.  Existing v2
 snapshots and session-local run IDs remain supported; external identities also
 include the invocation and worker generation to avoid cross-process collisions.

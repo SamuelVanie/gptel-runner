@@ -41,13 +41,10 @@
   (let* ((run (gptel-runner-call-run call))
          (report (format "Parallel pipeline report\n\n%s\n%s\n"
                          (gptel-runner-get run 'analysis-a)
-                         (gptel-runner-get run 'analysis-b)))
-         (file (make-temp-file "runner-example-" nil ".txt")))
-    (unwind-protect
-        (progn
-          (with-temp-file file (insert report))
-          (gptel-runner-publish-artifact run "report" file "text/plain"))
-      (delete-file file))
+                         (gptel-runner-get run 'analysis-b))))
+    (gptel-runner-put
+     run 'report-artifact
+     (gptel-runner-write-artifact run "report.txt" report "text/plain"))
     (list :value report)))
 
 (defun background-example-workflow (pause-after)

@@ -2,6 +2,15 @@
 
 ## 0.1.0 - unreleased
 
+- Unify local and background output APIs: retain files or generated text with
+  the same artifact descriptors, persist their registry across recovery, and
+  resolve artifacts through public readers and agent context sources. Share
+  named-value and node-outcome inspection across runs and invocation history;
+  accept node IDs in workspace lookup and document the common pipeline API.
+- Add explicit root-level run finalization with separate bounded budgets,
+  selectable cancellation behavior, partial-result access, and durable phase
+  resume. Retain body and finalizer outcomes separately and defer terminal
+  callbacks until finalization completes; keep `try :finally` unchanged.
 - Add public node traversal, lookup, paths, states, results, and error helpers.
   Preserve current outcomes for agent, Elisp, and container nodes in checkpoints,
   distinguish successful nil from unavailable values, and reuse accepted values
