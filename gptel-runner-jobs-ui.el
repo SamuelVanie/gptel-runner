@@ -30,6 +30,7 @@
 (declare-function gptel-runner-job-delete "gptel-runner-jobs")
 (declare-function gptel-runner-job-run "gptel-runner-jobs")
 (declare-function gptel-runner-job-command "gptel-runner-jobs")
+(declare-function gptel-runner-background-open "gptel-runner-jobs-panel")
 
 (defvar gptel-runner-jobs-buffer "*gptel-runner jobs*"
   "Name of the background jobs dashboard.")
@@ -69,7 +70,13 @@
         (push
          (list (list 'background-run id)
                (gptel-runner-ui--row-vector
-                `((workflow . ,(format "%s" (plist-get run :workflow)))
+                `((item . ,(propertize
+                            (gptel-runner-ui--tree-label
+                             (list 'background-run id)
+                             (format "%s · %s" (if (string-empty-p job)
+                                                    (plist-get run :workflow) job) id))
+                            'face 'bold))
+                  (workflow . ,(format "%s" (plist-get run :workflow)))
                   (run . ,id)
                   (job . ,job)
                   (state . ,(gptel-runner-ui--state (plist-get run :state)))
@@ -80,14 +87,23 @@
            (list (list 'background-call id (plist-get call :epoch)
                        (plist-get call :id))
                  (gptel-runner-ui--row-vector
-                  `((node . ,(format "%s" (plist-get call :node)))
+                  `((item . ,(format "    %s" (plist-get call :node)))
+                    (node . ,(format "%s" (plist-get call :node)))
                     (job . ,job)
                     (agent . ,(cond ((eq (plist-get call :kind) 'elisp) "Elisp")
                                    ((plist-get call :agent)
                                     (format "%s" (plist-get call :agent)))
                                    (t "")))
                     (call . ,(plist-get call :id))
-                    (state . ,(gptel-runner-ui--state (plist-get call :state)))
+                    (state . ,(let ((count (cl-count-if
+                                           (lambda (item)
+                                             (and (equal (plist-get item :call-id) (plist-get call :id))
+                                                  (equal (plist-get item :epoch) (plist-get call :epoch))))
+                                           (plist-get run :interactions))))
+                                (if (> count 0)
+                                    (propertize (format "%d approval%s pending" count
+                                                        (if (= count 1) "" "s")) 'face 'warning)
+                                  (gptel-runner-ui--state (plist-get call :state)))))
                     (elapsed . ,(gptel-runner-jobs-ui--elapsed call))
                     (attempts . ,(format "%s" (or (plist-get call :attempts) 0))))))
            entries))))
@@ -211,29 +227,6 @@
       (read-only-mode 1)
       (setq-local gptel-runner-background--target target))))
 
-(defun gptel-runner-jobs-ui--interaction (run call)
-  "Select an active interaction from RUN, optionally restricted to CALL."
-  (let* ((interactions
-          (cl-remove-if-not
-           (lambda (item)
-             (or (null call)
-                 (and (equal (plist-get item :call-id) (plist-get call :id))
-                      (or (null (plist-get item :epoch))
-                          (equal (plist-get item :epoch)
-                                 (plist-get call :epoch))))))
-           (plist-get run :interactions)))
-         (choices (mapcar (lambda (item)
-                            (cons (format "%s — %s: %s"
-                                          (plist-get item :id)
-                                          (or (plist-get item :source-buffer) "node")
-                                          (mapconcat
-                                           (lambda (tool) (plist-get tool :name))
-                                           (plist-get item :tools) ", "))
-                                  item)) interactions)))
-    (unless choices (user-error "No pending interaction on this row"))
-    (if (= (length choices) 1) (cdar choices)
-      (cdr (assoc (completing-read "Interaction: " choices nil t) choices)))))
-
 (defun gptel-runner-jobs-ui--budget-additions ()
   "Read requested background budget additions without loading runtime data."
   (let (arguments)
@@ -249,63 +242,52 @@
 (defun gptel-runner-background-command (operation &optional arguments)
   "Send OPERATION with ARGUMENTS to the selected invocation's worker.
 When ARGUMENTS is nil, read the arguments needed by OPERATION.  The returned
-receipt acknowledges submission; only the worker can acknowledge application."
+receipt acknowledges submission; only the worker can acknowledge application.
+Approval and rejection open the node panel for review before submission."
   (interactive
    (list (intern
           (completing-read
            "Background action: "
            '(pause resume cancel retry continue extend extend-repeat decision
-             pause-call cancel-call feedback accept approve reject)
+		   pause-call cancel-call feedback accept approve reject revoke-outside)
            nil t))))
-  (pcase-let* ((`(,run ,call ,target) (gptel-runner-jobs-ui--selection))
-               (arguments (copy-sequence arguments)))
-    (when (memq operation '(pause-call cancel-call feedback accept))
-      (unless call (user-error "Select a background call for this action")))
-    (unless arguments
-      (setq arguments
-            (pcase operation
-              ('resume (list :feedback (read-string "Resume feedback: ")))
-              ('feedback (list :feedback (read-string "Feedback for the agent: ")))
-              ('accept (let ((text (read-string
-                                   "Accepted result (empty uses latest response): ")))
-                         (unless (string-empty-p text) (list :result text))))
-              ('retry (append
-                       (when call (list :from-node (plist-get call :node)))
-                       (list :feedback (read-string "Retry feedback: "))))
-              ('continue (list :observation (read-string "Observation and new goal: ")
-                               :reset-budget
-                               (y-or-n-p "Reset consumed budget for this cycle? ")))
-              ('extend (gptel-runner-jobs-ui--budget-additions))
-              ('extend-repeat
-               (list :node (intern (read-string "Repeat node: "))
-                     :additional-iterations (read-number "Additional iterations: " 1)))
-              ('decision (list :text (read-string "Workflow decision: ")
-                               :reason (read-string "Rationale (optional): "))))))
-    (when (and call (memq operation '(pause-call cancel-call feedback accept)))
-      (setq arguments (plist-put arguments :call-id (plist-get call :id))
-            arguments (plist-put arguments :call-epoch (plist-get call :epoch))))
-    (when (memq operation '(approve reject))
-      (let* ((interaction (gptel-runner-jobs-ui--interaction run call))
-             (owner (cl-find (plist-get interaction :call-id) (plist-get run :calls)
-                             :key (lambda (item) (plist-get item :id))
-                             :test #'equal)))
-        (gptel-runner-jobs-ui--display "*gptel-runner pending interaction*"
-                                       interaction target)
-        (unless (yes-or-no-p (format "%s this pending tool request? "
-                                    (capitalize (symbol-name operation))))
-          (user-error "No tool decision submitted"))
-        (setq arguments
-              (append (list :interaction-id (plist-get interaction :id)
-                            :call-id (plist-get interaction :call-id)
-                            :call-epoch (or (plist-get interaction :epoch)
-                                            (plist-get owner :epoch))
-                            :generation (plist-get interaction :generation))
-                      arguments))))
-    (let ((receipt (gptel-runner-job-command run operation arguments)))
-      (gptel-runner-jobs-ui--display "*gptel-runner command receipt*" receipt target)
-      (message "Background command %s: %s"
-               (plist-get receipt :id) (or (plist-get receipt :status) 'queued))
-      receipt)))
+  (when (memq operation '(approve reject))
+    (require 'gptel-runner-jobs-panel))
+  (if (memq operation '(approve reject))
+      (gptel-runner-background-open)
+    (pcase-let* ((`(,run ,call ,_) (gptel-runner-jobs-ui--selection))
+		 (arguments (copy-sequence arguments)))
+      (when (memq operation '(pause-call cancel-call feedback accept revoke-outside))
+	(unless call (user-error "Select a background call for this action")))
+      (unless arguments
+	(setq arguments
+              (pcase operation
+		('resume (list :feedback (read-string "Resume feedback: ")))
+		('feedback (list :feedback (read-string "Feedback for the agent: ")))
+		('accept (let ((text (read-string
+                                      "Accepted result (empty uses latest response): ")))
+                           (unless (string-empty-p text) (list :result text))))
+		('retry (append
+			 (when call (list :from-node (plist-get call :node)))
+			 (list :feedback (read-string "Retry feedback: "))))
+		('continue (list :observation (read-string "Observation and new goal: ")
+				 :reset-budget
+				 (y-or-n-p "Reset consumed budget for this cycle? ")))
+		('extend (gptel-runner-jobs-ui--budget-additions))
+		('extend-repeat
+		 (list :node (intern (read-string "Repeat node: "))
+                       :additional-iterations (read-number "Additional iterations: " 1)))
+		('decision (list :text (read-string "Workflow decision: ")
+				 :reason (read-string "Rationale (optional): "))))))
+      (when (and call (memq operation '(pause-call cancel-call feedback accept revoke-outside)))
+	(setq arguments (plist-put arguments :call-id (plist-get call :id))
+              arguments (plist-put arguments :call-epoch (plist-get call :epoch))))
+      (when (eq operation 'revoke-outside)
+	(setq arguments (plist-put arguments :generation (plist-get call :generation))))
+      (let ((receipt (gptel-runner-job-command run operation arguments)))
+	(message "Background command %s: %s"
+		 (plist-get receipt :id) (or (plist-get receipt :status) 'queued))
+	receipt))))
 
 (defun gptel-runner-background-pause ()
   "Pause the selected invocation in its worker."
@@ -340,11 +322,11 @@ receipt acknowledges submission; only the worker can acknowledge application."
   (interactive) (gptel-runner-background-command 'accept))
 
 (defun gptel-runner-background-approve ()
-  "Review and approve a pending tool request."
+  "Open the node panel to review pending tools together."
   (interactive) (gptel-runner-background-command 'approve))
 
 (defun gptel-runner-background-reject ()
-  "Review and reject a pending tool request."
+  "Open the node panel to review and reject pending tools."
   (interactive) (gptel-runner-background-command 'reject))
 
 (defun gptel-runner-jobs-ui--forgettable-at-point-p ()
@@ -437,8 +419,7 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
    ["Interaction"
     ("f" "Agent feedback" gptel-runner-background-feedback)
     ("a" "Accept response" gptel-runner-background-accept)
-    ("y" "Approve tools" gptel-runner-background-approve)
-    ("n" "Reject tools" gptel-runner-background-reject)
+    ("y" "Review pending tools" gptel-runner-background-approve)
     (":" "All actions" gptel-runner-background-command)]]
   [["Manage"
     ("x" "Forget run" gptel-runner-background-forget-run
@@ -454,8 +435,9 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
   "Handle ACTION for external dashboard ROW and report whether handled."
   (when (gptel-runner-jobs-ui--target row)
     (pcase action
-      ('open (gptel-runner-background-inspect) t)
-      ('menu (gptel-runner-background-menu) t))))
+      ('open (require 'gptel-runner-jobs-panel)
+             (gptel-runner-background-open) t)
+      ('menu (call-interactively #'gptel-runner-background-menu) t))))
 
 (defun gptel-runner-jobs-ui--schedule (job)
   "Describe JOB's configured schedule."

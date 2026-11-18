@@ -50,6 +50,8 @@
 (declare-function gptel-agent-supervision-stop "gptel-agent-tools")
 (declare-function gptel-agent-supervision-retry "gptel-agent-tools")
 (declare-function gptel-agent-supervision-request-live-p "gptel-agent-tools")
+(declare-function gptel-agent-allow-outside-access "gptel-agent-access")
+(declare-function gptel-agent-revoke-outside-access "gptel-agent-access")
 
 (cl-defstruct (gptel-runner-gptel-driver
                (:constructor gptel-runner-gptel-driver-create))
@@ -137,7 +139,22 @@ must route replies back to that owning process.")
                :source-buffer (buffer-name
                                (if fsm (plist-get (gptel-fsm-info fsm) :buffer)
                                  (gptel-runner-call-buffer call)))
-               :tools (gptel-runner-gptel--tool-data tools))))
+               :tools (gptel-runner-gptel--tool-data tools)
+               :outside-access
+               (and (fboundp 'gptel-agent-allow-outside-access)
+                    fsm
+                    (cl-some
+                     (lambda (item)
+                       (and (plist-get item :agent-access-pending)
+                            (not (plist-get item :result))
+                            (cl-some
+                             (lambda (tool)
+                               (and (equal (gptel-tool-name (car tool))
+                                           (plist-get item :name))
+                                    (eq (cadr tool) (plist-get item :args))))
+                             tools)))
+                     (plist-get (gptel-fsm-info fsm) :tool-use))
+                    t))))
     (gptel-runner-gptel--set-interactions
      call (append (gptel-runner-gptel--interactions call)
                   (list (list :description interaction :tools tools :fsm fsm
@@ -150,10 +167,13 @@ must route replies back to that owning process.")
                         (copy-tree interaction t))
     interaction))
 
-(defun gptel-runner-gptel-answer-interaction (call interaction-id approve)
+(defun gptel-runner-gptel-answer-interaction (call interaction-id approve
+                                                &optional allow-outside)
   "Answer CALL's pending INTERACTION-ID, running tools when APPROVE is non-nil.
 Rejecting cancels the call.  Replies are accepted once and only while the
-interaction's generation is current."
+interaction's generation is current.  ALLOW-OUTSIDE uses gptel-agent's public
+approval action to remember outside file access in this request's conversation.
+Ordinary confirmations and file reviews remain enabled."
   (unless (gptel-runner-call-p call)
     (user-error "Unknown runner call"))
   (let* ((pending (cl-find interaction-id (gptel-runner-gptel--interactions call)
@@ -164,13 +184,18 @@ interaction's generation is current."
     (unless (and pending
                  (gptel-runner-gptel--interaction-live-p call pending))
       (user-error "Interaction %s is no longer pending" interaction-id))
+    (when (and allow-outside
+               (not (and approve (plist-get description :outside-access)
+                         (fboundp 'gptel-agent-allow-outside-access))))
+      (user-error "This request cannot grant outside file access"))
     ;; Consume before executing: synchronous tools may create a new gate.
     (gptel-runner-gptel--set-interactions
      call (remq pending (gptel-runner-gptel--interactions call)))
     (gptel-runner--emit
      (gptel-runner-call-run call) 'interaction-answered
      (gptel-runner-call-node call) call
-     (list :id interaction-id :approved (and approve t)))
+     (list :id interaction-id :approved (and approve t)
+           :allow-outside (and allow-outside t)))
     (if approve
         (with-current-buffer (or (plist-get pending :buffer)
                                  (gptel-runner-call-buffer call))
@@ -179,10 +204,54 @@ interaction's generation is current."
            (mapcar (lambda (tool) (plist-get tool :name))
                    (plist-get description :tools)))
           (unwind-protect
-              (gptel--accept-tool-calls (plist-get pending :tools))
+              (if allow-outside
+                  (progn
+                    ;; Retain owners for revocation, never for persistence or
+                    ;; inheritance by another call or child conversation.
+                    (setf (gptel-runner-call-driver-data call)
+                          (plist-put
+                           (gptel-runner-call-driver-data call) :outside-access-buffers
+                           (cl-adjoin
+                            (current-buffer)
+                            (plist-get (gptel-runner-call-driver-data call)
+                                       :outside-access-buffers))))
+                    (gptel-agent-allow-outside-access (plist-get pending :tools)))
+                (gptel--accept-tool-calls (plist-get pending :tools)))
             (gptel-runner-gptel--sync-interactions call)))
       (gptel-runner-abort-call call 'tool-rejected))
     call))
+
+(defun gptel-runner-gptel-approve-interactions (call ids &optional allow-outside)
+  "Approve exactly IDS on CALL, optionally remembering ALLOW-OUTSIDE access.
+Validate the complete displayed set before executing any tools.  New requests
+created by these tools are never included.  Every execution rechecks liveness."
+  (unless (and ids (equal ids (delete-dups (copy-sequence ids))))
+    (user-error "Supply a nonempty set of distinct interaction IDs"))
+  (dolist (id ids)
+    (unless (gptel-runner-gptel-interaction-pending-p call id)
+      (user-error "Interaction %s is no longer pending; refresh the panel" id)))
+  (let ((outside-ids
+         (cl-loop for pending in (gptel-runner-gptel--interactions call)
+                  for description = (plist-get pending :description)
+                  when (and (member (plist-get description :id) ids)
+                            (plist-get description :outside-access))
+                  collect (plist-get description :id))))
+    (when (and allow-outside
+               (not (and outside-ids (fboundp 'gptel-agent-allow-outside-access))))
+      (user-error "No displayed request can grant outside file access"))
+    (dolist (id ids)
+      (gptel-runner-gptel-answer-interaction
+       call id t (and allow-outside (member id outside-ids))))))
+
+(defun gptel-runner-gptel-revoke-outside-access (call)
+  "Revoke outside file access granted through CALL's runner controls."
+  (dolist (buffer (plist-get (gptel-runner-call-driver-data call)
+                             :outside-access-buffers))
+    (when (and (buffer-live-p buffer)
+               (fboundp 'gptel-agent-revoke-outside-access))
+      (with-current-buffer buffer (gptel-agent-revoke-outside-access))))
+  (setf (gptel-runner-call-driver-data call)
+        (plist-put (gptel-runner-call-driver-data call) :outside-access-buffers nil)))
 
 (defun gptel-runner-gptel--compatibility-error (&rest missing)
   "Signal an actionable compatibility error listing MISSING API pieces."
@@ -223,6 +292,7 @@ interaction's generation is current."
 
 (defun gptel-runner-gptel--stop-supervision (call)
   "Release CALL's optional agent supervisor and pending approvals."
+  (gptel-runner-gptel-revoke-outside-access call)
   (when-let* ((scope (plist-get (gptel-runner-call-driver-data call)
                                 :agent-supervision)))
     (setf (gptel-runner-call-driver-data call)

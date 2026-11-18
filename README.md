@@ -616,7 +616,8 @@ The dashboard keeps its permanent keymap small:
 
 | Key | Dashboard action |
 | --- | --- |
-| `RET` | Visit a call transcript, or inspect a run journal |
+| `RET` / click | Open a background node panel; local calls open their transcript |
+| `TAB` | Expand or collapse a run's nodes |
 | `?` | Open the dashboard action menu |
 | `g` | Refresh the dashboard |
 | `q` | Quit the dashboard |
@@ -644,15 +645,18 @@ ignored so the table keeps a stable canonical layout:
 
 ```elisp
 (setq gptel-runner-dashboard-columns
-      '(workflow run node job agent state elapsed))
+      '(item agent state elapsed))
 ```
 
-Available symbols are `workflow`, `run`, `node`, `call`, `job`, `agent`, `state`, `elapsed`,
+Available symbols are `item`, `workflow`, `run`, `node`, `call`, `job`, `agent`, `state`, `elapsed`,
 `attempts`, `iteration`, `requests`, and `calls`.  Press `g` in an open
 dashboard after changing the variable, or choose `V` from the `?` action menu
 to toggle one column interactively.  The same action is available as
 `M-x gptel-runner-dashboard-toggle-column`.
-The default includes job and agent names.  Rows stay on one line instead of
+The default `item` column groups job/workflow runs and their nodes into a compact
+tree.  Press `TAB` on a run or node to collapse or expand that run; press `RET`
+or click a row to open it.  Separate workflow, run, node, and job columns remain
+available for a wider table.  Rows stay on one line instead of
 wrapping, and the current row is highlighted.  Values longer than their column
 are shortened with an ellipsis so later columns stay aligned; hovering the
 shortened value shows its complete text.  The spelling
@@ -1163,11 +1167,30 @@ include the invocation and worker generation to avoid cross-process collisions.
 
 ### Inspect and control background work
 
-The dashboard displays external invocations alongside local runs.  Inspecting
-a background row opens durable results or transcripts without restoring its
-checkpoint in your interactive Emacs.  Its action menu sends commands to the
+The dashboard displays external invocations alongside local runs.  Opening
+a background row shows a live run or node panel without restoring its
+checkpoint in your interactive Emacs.  A run panel links to its nodes; a node
+panel shows its task, result, transcript link, available controls, and pending
+tool requests with their arguments.  `n` and `p` move between nodes, `TAB`
+moves between buttons, and `q` returns to the dashboard.  Its action menu sends commands to the
 owning worker, including pause, resume, cancel, retry, continue, budget
 extensions, decisions, call feedback, and tool approval or rejection.
+
+Requests are grouped by node, including requests from its child conversations.
+Choose **Approve once** for an individual request, or **Approve all N pending**
+(`a`) for all requests currently displayed on that node.  The displayed arguments
+are the review step; clicking an approval submits it without another prompt.
+**Reject & cancel node** makes the effect of rejection explicit.  Pending counts
+appear in the dashboard.  Submission receipts and worker errors appear inside
+the panel, without opening a receipt buffer; `? h` still opens the full history.
+
+For outside-directory file requests from `gptel-agent`, **Approve all + allow
+outside paths** (`A`) also remembers outside access in the conversations owning
+those requests.  It does not grant access to other nodes or future children.
+Ordinary tool confirmations, project instruction checks, and file reviews remain
+active.  **Revoke outside access** restores per-operation approval.  These grants
+also end on pause, completion, restart, or a working-directory change and are
+never saved in recovery checkpoints.
 
 The background `?` menu also provides `x` to forget the selected invocation
 (or the invocation owning the selected call), `X` to forget the selected
@@ -1197,8 +1220,10 @@ The programmatic control interface is:
 
 Commands are data records with durable receipts.  The worker validates the
 operation, target generation, and current state before applying a command.
-An approval can authorize only the pending tool interaction shown in the
-dashboard; stale approvals cannot authorize a later tool call.  Rejecting an
+One-time approvals authorize only the exact request IDs displayed in the
+panel, even when submitted as a group; stale approvals cannot authorize a later
+tool call.  The separate outside-path option explicitly grants future file
+access using gptel-agent's scoped approval API.  Rejecting an
 approval cancels that call.  Tool confirmation policy remains explicit;
 running in the background does not automatically authorize tools.
 

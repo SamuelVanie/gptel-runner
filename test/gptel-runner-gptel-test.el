@@ -771,6 +771,30 @@
         (gptel-runner-gptel-test--reply fsm "Reviewed" "stop")
         (should (eq (gptel-runner-run-state run) 'succeeded))))))
 
+(ert-deftest gptel-runner-gptel-batch-validates-entire-snapshot-before-execution ()
+  (with-temp-buffer
+    (let* ((call (gptel-runner-call-create :buffer (current-buffer) :generation 3))
+           (a (list :description '(:id "a" :generation 3) :buffer (current-buffer)))
+           (b (list :description '(:id "b" :generation 3 :outside-access t)
+                    :buffer (current-buffer)))
+           answered)
+      (gptel-runner-gptel--set-interactions call (list a b))
+      (cl-letf (((symbol-function 'gptel-runner-gptel-answer-interaction)
+                 (lambda (_call id _approve &optional outside)
+                   (push (list id (and outside t)) answered)
+                   ;; Simulate a new request appearing during execution.
+                   (gptel-runner-gptel--set-interactions
+                    call (append (gptel-runner-gptel--interactions call)
+                                 (list (list :description '(:id "new" :generation 3)
+                                             :buffer (current-buffer))))))))
+        (should-error (gptel-runner-gptel-approve-interactions call '("a" "missing"))
+                      :type 'user-error)
+        (should-not answered)
+        (should-error (gptel-runner-gptel-approve-interactions call '("a" "a"))
+                      :type 'user-error)
+        (gptel-runner-gptel-approve-interactions call '("a" "b"))
+        (should (equal (reverse answered) '(("a" nil) ("b" nil))))))))
+
 (ert-deftest gptel-runner-gptel-headless-rejection-and-stale-approval ()
   (dolist (action '(reject pause stale))
     (gptel-runner-gptel-test--with-transport

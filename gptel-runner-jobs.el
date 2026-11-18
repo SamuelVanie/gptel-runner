@@ -21,6 +21,8 @@
 (declare-function gptel-runner-launchd-start-worker "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-remove "gptel-runner-launchd")
 (declare-function gptel-runner-gptel-answer-interaction "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-approve-interactions "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-revoke-outside-access "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-interaction-pending-p "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-feedback "gptel-runner-gptel")
 (declare-function gptel-runner-complete-call-from-buffer "gptel-runner-gptel")
@@ -75,7 +77,8 @@ executes directly and does not need this launcher."
 (define-error 'gptel-runner-job-storage-error "Background job storage failed")
 (defconst gptel-runner-jobs--operations
   '(pause resume cancel retry continue extend extend-repeat decision
-	  pause-call cancel-call feedback accept approve reject))
+	  pause-call cancel-call feedback accept approve approve-all reject
+          revoke-outside))
 
 (defvar gptel-runner-headless nil)
 (defvar gptel-runner-interaction-hook nil)
@@ -767,7 +770,10 @@ invocation is recorded as skipped without starting another worker."
             ((or 'pause-call 'cancel-call) call-keys)
             ('feedback (cons :feedback call-keys))
             ('accept (cons :result call-keys))
-            ((or 'approve 'reject) (append '(:interaction-id :generation) call-keys))))
+            ('approve (append '(:interaction-id :generation :allow-outside) call-keys))
+            ('approve-all (append '(:interaction-ids :generation :allow-outside) call-keys))
+            ('revoke-outside (cons :generation call-keys))
+            ('reject (append '(:interaction-id :generation) call-keys))))
          seen)
     (cl-loop for (key value) on arguments by #'cddr do
              (unless (and (memq key allowed) (not (memq key seen)))
@@ -780,7 +786,12 @@ invocation is recorded as skipped without starting another worker."
                     (and (stringp value) (not (string-empty-p value))))
                    ((or :node :from-node)
                     (or (symbolp value) (stringp value) (integerp value)))
-                   (:reset-budget (memq value '(nil t)))
+                   ((or :reset-budget :allow-outside) (memq value '(nil t)))
+                   (:interaction-ids
+                    (and (consp value) (proper-list-p value)
+                         (cl-every (lambda (id) (and (stringp id)
+                                                     (not (string-empty-p id)))) value)
+                         (equal value (delete-dups (copy-sequence value)))))
                    (:additional-duration (and (numberp value) (> value 0)))
                    (:generation (and (integerp value) (>= value 0)))
                    (_ (and (integerp value) (> value 0))))
@@ -789,6 +800,8 @@ invocation is recorded as skipped without starting another worker."
                    ('continue '(:observation)) ('decision '(:text))
                    ('extend-repeat '(:node :additional-iterations))
                    ((or 'pause-call 'cancel-call 'accept) call-keys)
+                   ('revoke-outside (cons :generation call-keys))
+                   ('approve-all (append '(:interaction-ids :generation) call-keys))
                    ('feedback (cons :feedback call-keys))
                    ((or 'approve 'reject) (cons :interaction-id call-keys))))
       (unless (plist-get arguments key)
@@ -986,6 +999,9 @@ Opaque runtime objects and circular references are represented by type."
                                       (gptel-runner-agent-name agent))
                              :state (gptel-runner-call-state call)
                              :generation (gptel-runner-call-generation call)
+                             :outside-access
+                             (and (plist-get (gptel-runner-call-driver-data call)
+                                             :outside-access-buffers) t)
                              :started-at (gptel-runner-call-started-at call)
                              :finished-at (gptel-runner-call-finished-at call)
                              :attempts (gptel-runner-call-request-attempt call)
@@ -1109,7 +1125,12 @@ Opaque runtime objects and circular references are represented by type."
       ('accept (gptel-runner-complete-call-from-buffer (plist-get args :result) call))
       ((or 'approve 'reject)
        (gptel-runner-gptel-answer-interaction call (plist-get args :interaction-id)
-                                              (eq operation 'approve)))
+                                              (eq operation 'approve)
+                                              (plist-get args :allow-outside)))
+      ('approve-all
+       (gptel-runner-gptel-approve-interactions
+        call (plist-get args :interaction-ids) (plist-get args :allow-outside)))
+      ('revoke-outside (gptel-runner-gptel-revoke-outside-access call))
       (_ (error "Unsupported worker operation: %S" operation)))))
 
 (defun gptel-runner-jobs--commands ()

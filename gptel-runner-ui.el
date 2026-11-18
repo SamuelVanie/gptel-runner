@@ -24,7 +24,8 @@
                   "gptel-runner-gptel")
 
 (defconst gptel-runner-dashboard--column-specs
-  '((workflow "Workflow" 22)
+  '((item "Workflow / node" 38)
+    (workflow "Workflow" 22)
     (run "Run" 16)
     (node "Node" 20)
     (job "Job" 24)
@@ -43,10 +44,11 @@
   "Alias for `gptel-runner-dashboard-columns'.")
 
 (defcustom gptel-runner-dashboard-columns
-  '(workflow run node job agent state elapsed)
+  '(item agent state elapsed)
   "Columns visible in the runner dashboard.
 List order is ignored; columns always use the canonical dashboard order."
   :type '(set
+          (const :tag "Workflow / node tree" item)
           (const :tag "Workflow" workflow)
           (const :tag "Run" run)
           (const :tag "Node" node)
@@ -88,6 +90,13 @@ Supported actions are `open' and `menu'.")
 
 (defvar-local gptel-runner-dashboard--timer-interval nil
   "Refresh interval used by the current dashboard timer.")
+
+(defvar-local gptel-runner-dashboard--collapsed nil
+  "Run row identities whose node rows are collapsed in this dashboard.")
+
+(defun gptel-runner-ui--tree-label (row label)
+  "Return a fold indicator and LABEL for run ROW."
+  (concat (if (member row gptel-runner-dashboard--collapsed) "▸ " "▾ ") label))
 
 (defun gptel-runner-ui--selected-column-specs ()
   "Return selected column specifications in canonical display order."
@@ -195,7 +204,8 @@ An elided value retains its complete unpropertized text as hover help."
   (list
    (list 'workflow name)
    (gptel-runner-ui--row-vector
-    `((workflow . ,(propertize
+    `((item . ,(propertize (format "%s" (or name "<anonymous>")) 'face 'bold))
+      (workflow . ,(propertize
                     (if name (symbol-name name) "<anonymous>")
                     'face 'font-lock-function-name-face))
       (state . ,(propertize
@@ -207,7 +217,10 @@ An elided value retains its complete unpropertized text as hover help."
   (list
    (list 'run (gptel-runner-run-id run))
    (gptel-runner-ui--row-vector
-    `((run . ,(gptel-runner-run-id run))
+    `((item . ,(gptel-runner-ui--tree-label
+                (list 'run (gptel-runner-run-id run))
+                (gptel-runner-run-id run)))
+      (run . ,(gptel-runner-run-id run))
       (state . ,(gptel-runner-ui--state (gptel-runner-run-state run)))
       (elapsed . ,(gptel-runner-ui--elapsed run))
       (attempts . "-")
@@ -225,7 +238,8 @@ An elided value retains its complete unpropertized text as hover help."
     (list
      (list 'call (gptel-runner-call-id call))
      (gptel-runner-ui--row-vector
-      `((node . ,(format "%s" (gptel-runner-node-id node)))
+      `((item . ,(format "    %s" (gptel-runner-node-id node)))
+        (node . ,(format "%s" (gptel-runner-node-id node)))
         (agent . ,(if (gptel-runner--elisp-call-p call) "Elisp"
                     (when-let* ((agent (gptel-runner-call-agent call)))
                       (format "%s" (gptel-runner-agent-name agent)))))
@@ -253,7 +267,8 @@ An elided value retains its complete unpropertized text as hover help."
               (lambda (run)
                 (eq name (gptel-runner-ui--workflow-name run)))
               runs)))
-        (when (memq 'workflow gptel-runner-dashboard-columns)
+        (when (or (memq 'workflow gptel-runner-dashboard-columns)
+                  (memq 'item gptel-runner-dashboard-columns))
           (setq entries
                 (nconc entries
                        (list (gptel-runner-ui--workflow-entry
@@ -268,9 +283,41 @@ An elided value retains its complete unpropertized text as hover help."
 
 (defun gptel-runner-ui--entries ()
   "Return local dashboard entries followed by external source entries."
-  (append (gptel-runner-ui--local-entries)
-          (apply #'append
-                 (mapcar #'funcall gptel-runner-dashboard-entry-functions))))
+  (let (hidden)
+    (cl-remove-if
+     (lambda (entry)
+       (pcase (car-safe (car entry))
+         ((or 'run 'background-run)
+          (setq hidden (member (car entry) gptel-runner-dashboard--collapsed)) nil)
+         ('workflow (setq hidden nil))
+         ((or 'call 'background-call) hidden)))
+     (append (gptel-runner-ui--local-entries)
+             (apply #'append
+                    (mapcar #'funcall gptel-runner-dashboard-entry-functions))))))
+
+(defun gptel-runner-dashboard-toggle-nodes ()
+  "Expand or collapse the run at point, or the selected node's parent run."
+  (interactive)
+  (let* ((row (tabulated-list-get-id))
+         (target (pcase row
+                   ((or `(run ,_) `(background-run ,_)) row)
+                   (`(background-call ,id . ,_) (list 'background-run id))
+                   (`(call ,_)
+                    (list 'run (gptel-runner-run-id (gptel-runner-ui--run-at-point)))))))
+    (unless target (user-error "Select a run or node to fold"))
+    (if (member target gptel-runner-dashboard--collapsed)
+        (setq gptel-runner-dashboard--collapsed
+              (remove target gptel-runner-dashboard--collapsed))
+      (push target gptel-runner-dashboard--collapsed))
+    (gptel-runner-dashboard-refresh)
+    (goto-char (gptel-runner-dashboard--position-from-state
+                (list :id target :line 1 :column 2)))))
+
+(defun gptel-runner-dashboard-mouse-open (event)
+  "Open the dashboard node clicked in mouse EVENT."
+  (interactive "e")
+  (mouse-set-point event)
+  (when (tabulated-list-get-id) (gptel-runner-dashboard-open-at-point)))
 
 (defun gptel-runner-dashboard--configured-refresh-interval ()
   "Return the configured dashboard refresh interval after validation."
@@ -388,6 +435,7 @@ An elided value retains its complete unpropertized text as hover help."
         tabulated-list-padding 2
         tabulated-list-entries #'gptel-runner-ui--entries)
   (setq-local truncate-lines t)
+  (setq-local mode-line-process "  RET Open · TAB Fold · ? Actions · g Refresh")
   (setq-local revert-buffer-function #'gptel-runner-dashboard--revert)
   (add-hook 'change-major-mode-hook
             #'gptel-runner-dashboard--cancel-refresh-timer nil t)
@@ -893,6 +941,8 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
                  "p" "P" "r" "R" "s" "t" "v" "V" "x" "C" "D"))
     (define-key map (kbd key) nil))
   (define-key map (kbd "RET") #'gptel-runner-dashboard-open-at-point)
+  (define-key map (kbd "TAB") #'gptel-runner-dashboard-toggle-nodes)
+  (define-key map [mouse-1] #'gptel-runner-dashboard-mouse-open)
   (define-key map (kbd "?") #'gptel-runner-dashboard-menu)
   (define-key map (kbd "g") #'gptel-runner-dashboard-refresh))
 

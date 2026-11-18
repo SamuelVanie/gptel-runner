@@ -174,6 +174,78 @@
       (should-error (gptel-runner-gptel-answer-interaction call (plist-get (car interactions) :id) t)
                     :type 'user-error))))
 
+(ert-deftest gptel-runner-delegation-batch-approves-both-child-conversations ()
+  (gptel-runner-delegation-test--with-run
+    (let* ((worker (gptel-runner-delegation-test--agent fsm t))
+           (child (gptel-agent--run-fsm worker))
+           (chat (gptel-runner-delegation-test--discussion fsm))
+           (discussion (gptel-agent-discussion--chat-fsm chat)))
+      (dolist (request (list child discussion))
+        (with-current-buffer (plist-get (gptel-fsm-info request) :buffer)
+          (setq-local gptel-confirm-tool-calls t))
+        (gptel-runner-delegation-test--tool request "delegation_probe" nil))
+      (let ((ids (mapcar (lambda (item) (plist-get item :id)) interactions)))
+        (gptel-runner-gptel-approve-interactions call ids)
+        (should (= (length executions) 2))
+        (should (memq (gptel-agent-discussion--chat-buffer chat) executions))
+        (should (memq (gptel-agent--run-child-buffer worker) executions))
+        (should-error (gptel-runner-gptel-approve-interactions call ids) :type 'user-error)))))
+
+(ert-deftest gptel-runner-delegation-outside-grant-preserves-other-confirmations ()
+  (let ((outside (make-temp-file "runner-outside-" nil ".txt" "Evidence")))
+    (unwind-protect
+        (gptel-runner-delegation-test--with-run
+          (let* ((info (gptel-fsm-info fsm))
+                 (args (list :file_path outside)))
+            (with-current-buffer parent (setq-local gptel-confirm-tool-calls 'auto))
+            (setf (plist-get info :tools)
+                  (cons (gptel-get-tool "Read") (plist-get info :tools)))
+            (gptel-runner-delegation-test--tool fsm "Read" args)
+            (should (= (length interactions) 1))
+            (should (plist-get (car interactions) :outside-access))
+            (gptel-runner-gptel-approve-interactions
+             call (list (plist-get (car interactions) :id)) t)
+            (should (buffer-local-value 'gptel-agent-access--grant parent))
+            ;; Future outside reads skip this specific guard, but explicit
+            ;; confirmations for other tools still reach the dashboard.
+            (setq interactions nil)
+            (gptel-runner-delegation-test--tool fsm "Read" args)
+            (should-not interactions)
+            (gptel-runner-delegation-test--tool fsm "delegation_probe" nil)
+            (should (= (length interactions) 1))
+            (should-not (plist-get (car interactions) :outside-access))
+            (gptel-runner-gptel-answer-interaction call (plist-get (car interactions) :id) t)
+            (gptel-runner-gptel-revoke-outside-access call)
+            (should-not (buffer-local-value 'gptel-agent-access--grant parent))
+            (setq interactions nil)
+            (gptel-runner-delegation-test--tool fsm "Read" args)
+            (should (plist-get (car interactions) :outside-access))
+            (gptel-runner-gptel-approve-interactions
+             call (list (plist-get (car interactions) :id)) t)
+            (gptel-runner-pause-call call)
+            (should-not (buffer-local-value 'gptel-agent-access--grant parent))))
+      (delete-file outside))))
+
+(ert-deftest gptel-runner-delegation-outside-grant-belongs-only-to-requesting-child ()
+  (let ((outside (make-temp-file "runner-child-outside-" nil ".txt" "Evidence")))
+    (unwind-protect
+        (gptel-runner-delegation-test--with-run
+          (let* ((worker (gptel-runner-delegation-test--agent fsm t))
+                 (child (gptel-agent--run-fsm worker))
+                 (info (gptel-fsm-info child))
+                 (owner (plist-get info :buffer)))
+            (setf (plist-get info :tools)
+                  (cons (gptel-get-tool "Read") (plist-get info :tools)))
+            (gptel-runner-delegation-test--tool child "Read" (list :file_path outside))
+            (should (plist-get (car interactions) :outside-access))
+            (gptel-runner-gptel-approve-interactions
+             call (list (plist-get (car interactions) :id)) t)
+            (should (buffer-local-value 'gptel-agent-access--grant owner))
+            (should-not (buffer-local-value 'gptel-agent-access--grant parent))
+            (gptel-runner-gptel-revoke-outside-access call)
+            (should-not (buffer-local-value 'gptel-agent-access--grant owner))))
+      (delete-file outside))))
+
 (ert-deftest gptel-runner-delegation-cancel-invalidates-children-and-approvals ()
   (dolist (action '(cancel pause reject))
     (gptel-runner-delegation-test--with-run

@@ -2,6 +2,11 @@
 
 ## 0.1.0 - unreleased
 
+- Add a compact, collapsible dashboard tree and live background node panels
+  with readable requests, direct controls, node navigation, and inline command
+  status. Approve all displayed requests for one node in a single action, or
+  approve individually. Offer revocable gptel-agent outside-file grants while
+  retaining other confirmations, reviews, and stale-request checks.
 - Add background dashboard cleanup keys matching the classic run menu: forget
   a run, forget workflow history, or clear finished runs. Preserve saved history
   by default, optionally delete recovery checkpoints, and protect active or

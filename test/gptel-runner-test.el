@@ -2663,11 +2663,9 @@
                              (list 'run (gptel-runner-run-id run))
                              (list 'call (gptel-runner-call-id call))
                              '(workflow empty-workflow))))
-        ;; Cell contents start at their column edge; tabulated-list itself
-        ;; supplies all spacing between columns.
-        (should (equal (aref (cadr (nth 1 entries)) 1)
-                       (gptel-runner-run-id run)))
-        (should (equal (aref (cadr (nth 2 entries)) 2) "alpha-step"))
+        (should (equal (aref (cadr (nth 1 entries)) 0)
+                       (concat "▾ " (gptel-runner-run-id run))))
+        (should (equal (aref (cadr (nth 2 entries)) 0) "    alpha-step"))
         (with-temp-buffer
           (gptel-runner-dashboard-mode)
           (tabulated-list-print t)
