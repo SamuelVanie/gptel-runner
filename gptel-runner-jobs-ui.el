@@ -218,7 +218,13 @@
                                  (plist-get call :epoch))))))
            (plist-get run :interactions)))
          (choices (mapcar (lambda (item)
-                            (cons (plist-get item :id) item)) interactions)))
+                            (cons (format "%s — %s: %s"
+                                          (plist-get item :id)
+                                          (or (plist-get item :source-buffer) "node")
+                                          (mapconcat
+                                           (lambda (tool) (plist-get tool :name))
+                                           (plist-get item :tools) ", "))
+                                  item)) interactions)))
     (unless choices (user-error "No pending interaction on this row"))
     (if (= (length choices) 1) (cdar choices)
       (cdr (assoc (completing-read "Interaction: " choices nil t) choices)))))

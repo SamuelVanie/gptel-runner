@@ -40,6 +40,14 @@
 (defvar gptel-confirm-tool-calls)
 (defvar gptel-default-mode)
 (defvar gptel-stream)
+(defvar gptel-prompt-transform-functions)
+
+;; Optional integration uses only public gptel-agent APIs.  Agent lifecycle
+;; objects and callbacks stay out of scheduler records and persisted jobs.
+(declare-function gptel-agent-supervise "gptel-agent-tools")
+(declare-function gptel-agent-supervision-stop "gptel-agent-tools")
+(declare-function gptel-agent-supervision-retry "gptel-agent-tools")
+(declare-function gptel-agent-supervision-request-live-p "gptel-agent-tools")
 
 (cl-defstruct (gptel-runner-gptel-driver
                (:constructor gptel-runner-gptel-driver-create))
@@ -64,17 +72,78 @@ must route replies back to that owning process.")
              (when results (list :result (copy-tree (nth 2 entry) t)))))
    tools))
 
-(defun gptel-runner-gptel--pending-interaction (call tools)
-  "Retain TOOLS callbacks privately and publish CALL's pending approval."
+(defun gptel-runner-gptel--interactions (call)
+  "Return CALL's private pending approvals, including legacy single entries."
+  (let ((data (gptel-runner-call-driver-data call)))
+    (or (plist-get data :pending-interactions)
+        (when-let* ((pending (plist-get data :pending-interaction)))
+          (list pending)))))
+
+(defun gptel-runner-gptel--set-interactions (call pending)
+  "Store PENDING approvals for CALL, keeping the single-entry view compatible."
+  (setf (gptel-runner-call-driver-data call)
+        (plist-put (plist-put (gptel-runner-call-driver-data call)
+                              :pending-interactions pending)
+                   :pending-interaction (car pending))))
+
+(defun gptel-runner-gptel--interaction-live-p (call pending)
+  "Whether PENDING still belongs to a live request in CALL's generation."
+  (let ((description (plist-get pending :description))
+        (fsm (plist-get pending :fsm)))
+    (and (not (gptel-runner--call-terminal-p call))
+         (= (gptel-runner-call-generation call)
+            (plist-get description :generation))
+         (buffer-live-p (or (plist-get pending :buffer)
+                            (gptel-runner-call-buffer call)))
+         (or (null (plist-get pending :agent-supervision))
+             (gptel-agent-supervision-request-live-p
+              (plist-get pending :agent-supervision) fsm))
+         (or (null fsm)
+             (and (eq (gptel-fsm-state fsm) 'TOOL)
+                  (eq (plist-get pending :info) (gptel-fsm-info fsm)))))))
+
+(defun gptel-runner-gptel-interaction-pending-p (call id)
+  "Whether approval ID is still pending on CALL."
+  (cl-some (lambda (pending)
+             (and (equal id (plist-get (plist-get pending :description) :id))
+                  (gptel-runner-gptel--interaction-live-p call pending)))
+           (gptel-runner-gptel--interactions call)))
+
+(defun gptel-runner-gptel--sync-interactions (call)
+  "Discard stale approvals and retain CALL's waiting state for live ones."
+  (let* ((previous (gptel-runner-gptel--interactions call))
+         (pending (cl-remove-if-not
+                  (lambda (entry)
+                    (gptel-runner-gptel--interaction-live-p call entry))
+                  previous)))
+    (gptel-runner-gptel--set-interactions call pending)
+    (cond
+     ((and pending
+           (not (eq (gptel-runner-call-state call) 'waiting-confirmation)))
+      (gptel-runner-gptel--observe call 'waiting-confirmation))
+     ((and previous (null pending)
+           (eq (gptel-runner-call-state call) 'waiting-confirmation))
+      (gptel-runner-gptel--observe
+       call 'waiting-tool (gptel-runner-call-tool-names call))))))
+
+(defun gptel-runner-gptel--pending-interaction (call tools &optional fsm scope)
+  "Publish CALL's approval for TOOLS from FSM, optionally supervised by SCOPE."
   (let ((interaction
          (list :id (gptel-runner--id "interaction") :kind 'tool-approval
                :call-id (gptel-runner-call-id call)
                :generation (gptel-runner-call-generation call)
+               :source-buffer (buffer-name
+                               (if fsm (plist-get (gptel-fsm-info fsm) :buffer)
+                                 (gptel-runner-call-buffer call)))
                :tools (gptel-runner-gptel--tool-data tools))))
-    (setf (gptel-runner-call-driver-data call)
-          (plist-put (gptel-runner-call-driver-data call)
-                     :pending-interaction
-                     (list :description interaction :tools tools)))
+    (gptel-runner-gptel--set-interactions
+     call (append (gptel-runner-gptel--interactions call)
+                  (list (list :description interaction :tools tools :fsm fsm
+                              :agent-supervision scope
+                              :info (and fsm (gptel-fsm-info fsm))
+                              :buffer (if fsm (plist-get (gptel-fsm-info fsm) :buffer)
+                                        (gptel-runner-call-buffer call))))))
+    (gptel-runner-gptel--sync-interactions call)
     (run-hook-with-args 'gptel-runner-interaction-hook call
                         (copy-tree interaction t))
     interaction))
@@ -85,31 +154,31 @@ Rejecting cancels the call.  Replies are accepted once and only while the
 interaction's generation is current."
   (unless (gptel-runner-call-p call)
     (user-error "Unknown runner call"))
-  (let* ((pending (plist-get (gptel-runner-call-driver-data call)
-                             :pending-interaction))
+  (let* ((pending (cl-find interaction-id (gptel-runner-gptel--interactions call)
+                           :key (lambda (entry)
+                                  (plist-get (plist-get entry :description) :id))
+                           :test #'equal))
          (description (plist-get pending :description)))
     (unless (and pending
-                 (equal interaction-id (plist-get description :id))
-                 (= (gptel-runner-call-generation call)
-                    (plist-get description :generation))
-                 (eq (gptel-runner-call-state call) 'waiting-confirmation)
-                 (buffer-live-p (gptel-runner-call-buffer call)))
+                 (gptel-runner-gptel--interaction-live-p call pending))
       (user-error "Interaction %s is no longer pending" interaction-id))
     ;; Consume before executing: synchronous tools may create a new gate.
-    (setf (gptel-runner-call-driver-data call)
-          (plist-put (gptel-runner-call-driver-data call)
-                     :pending-interaction nil))
+    (gptel-runner-gptel--set-interactions
+     call (remq pending (gptel-runner-gptel--interactions call)))
     (gptel-runner--emit
      (gptel-runner-call-run call) 'interaction-answered
      (gptel-runner-call-node call) call
      (list :id interaction-id :approved (and approve t)))
     (if approve
-        (with-current-buffer (gptel-runner-call-buffer call)
+        (with-current-buffer (or (plist-get pending :buffer)
+                                 (gptel-runner-call-buffer call))
           (gptel-runner-gptel--observe
            call 'waiting-tool
            (mapcar (lambda (tool) (plist-get tool :name))
                    (plist-get description :tools)))
-          (gptel--accept-tool-calls (plist-get pending :tools)))
+          (unwind-protect
+              (gptel--accept-tool-calls (plist-get pending :tools))
+            (gptel-runner-gptel--sync-interactions call)))
       (gptel-runner-abort-call call 'tool-rejected))
     call))
 
@@ -119,6 +188,45 @@ interaction's generation is current."
                  "%S.  Install gptel >= 0.9.9.4 or update "
                  "gptel-runner-gptel.el for this gptel version")
          missing))
+
+(defun gptel-runner-gptel--start-supervision (call)
+  "Attach optional gptel-agent supervision to CALL's worker conversation."
+  (when (featurep 'gptel-agent-tools)
+    (dolist (function '(gptel-agent-supervise gptel-agent-supervision-stop
+                        gptel-agent-supervision-retry
+                        gptel-agent-supervision-request-live-p))
+      (unless (fboundp function)
+        (error "Update gptel-agent: runner integration requires %s" function)))
+    (unless (plist-get (gptel-runner-call-driver-data call) :agent-supervision)
+      (let ((generation (gptel-runner-call-generation call)))
+        (setf (gptel-runner-call-driver-data call)
+              (plist-put
+               (gptel-runner-call-driver-data call) :agent-supervision
+               (gptel-agent-supervise
+                (gptel-runner-call-buffer call)
+                :on-state-change
+                (lambda (_scope _fsm event)
+                  (when (and (= generation (gptel-runner-call-generation call))
+                             (not (gptel-runner--call-terminal-p call)))
+                    (when (eq event 'waiting-discussions)
+                      (gptel-runner-gptel--observe call 'waiting-tool '("Discussion")))
+                    (gptel-runner-gptel--sync-interactions call)))
+                :on-tool-approval
+                (lambda (scope fsm calls)
+                  (when gptel-runner-headless
+                    (when (and (= generation (gptel-runner-call-generation call))
+                               (not (gptel-runner--call-terminal-p call)))
+                      (gptel-runner-gptel--pending-interaction call calls fsm scope))
+                    t)))))))))
+
+(defun gptel-runner-gptel--stop-supervision (call)
+  "Release CALL's optional agent supervisor and pending approvals."
+  (when-let* ((scope (plist-get (gptel-runner-call-driver-data call)
+                                :agent-supervision)))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call) :agent-supervision nil))
+    (gptel-agent-supervision-stop scope))
+  (gptel-runner-gptel--set-interactions call nil))
 
 (defun gptel-runner-gptel--check-api ()
   "Load gptel and validate the supported request API shape."
@@ -277,7 +385,8 @@ RAW is gptel's internal flag for already formatted transcript content."
          (funcall observe 'tool-calls data)
          (funcall observe 'waiting-confirmation data))
        (if gptel-runner-headless
-           (gptel-runner-gptel--pending-interaction call (cdr response))
+           (gptel-runner-gptel--pending-interaction
+            call (cdr response) (gptel-runner-call-fsm call))
          ;; The normal renderer adds its confirmation UI and callbacks.
          (gptel-runner-gptel--insert-response response info)))
       ('tool-result
@@ -287,7 +396,8 @@ RAW is gptel's internal flag for already formatted transcript content."
                   (cdr response)))
        (gptel-runner-gptel--insert-response response info))
       (_ (funcall observe 'response-part response))))
-   (t (funcall observe 'response-part response))))
+   (t (funcall observe 'response-part response)))
+  (gptel-runner-gptel--sync-interactions call))
 
 (defun gptel-runner-gptel--post-once (call fsm)
   "Run gptel post-processing for CALL and FSM exactly once."
@@ -412,6 +522,7 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
 
 (defun gptel-runner-gptel--cleanup (call)
   "Clean CALL's worker buffer unless retention is enabled."
+  (gptel-runner-gptel--stop-supervision call)
   (when (and (not gptel-runner-retain-worker-buffers)
              (buffer-live-p (gptel-runner-call-buffer call)))
     (kill-buffer (gptel-runner-call-buffer call))
@@ -443,7 +554,11 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
       (if (and (gptel-runner-call-fsm call)
                (eq (gptel-fsm-state (gptel-runner-call-fsm call)) 'ERRS))
           ;; A transport retry resumes the exact FSM after its backoff timer.
-          (gptel--fsm-transition (gptel-runner-call-fsm call) 'WAIT)
+          (progn
+            (when-let* ((scope (plist-get (gptel-runner-call-driver-data call)
+                                          :agent-supervision)))
+              (gptel-agent-supervision-retry scope (gptel-runner-call-fsm call)))
+            (gptel--fsm-transition (gptel-runner-call-fsm call) 'WAIT))
         (gptel-runner-gptel--apply-preset-locally
          (gptel-runner-agent-preset agent))
         (if (plist-get (gptel-runner-run-options
@@ -453,12 +568,14 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
           (when (gptel-runner--writer-p call)
             ;; A writable preset cannot silently weaken the run safety gate.
             (setq-local gptel-confirm-tool-calls t)))
+        (gptel-runner-gptel--start-supervision call)
         (let ((fsm (gptel-runner-gptel--make-fsm)))
           (setf (gptel-runner-call-fsm call) fsm)
           (gptel-request
               (gptel-runner-call-prompt call)
             :buffer buffer :stream gptel-stream
             :context call :schema schema :fsm fsm
+            :transforms gptel-prompt-transform-functions
             :callback
             (lambda (response info &optional raw)
               (when (and (= generation (gptel-runner-call-generation call))
@@ -469,9 +586,7 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
 (cl-defmethod gptel-runner-driver-cancel
   ((_driver gptel-runner-gptel-driver) call)
   "Cancel CALL using its unique worker buffer."
-  (setf (gptel-runner-call-driver-data call)
-        (plist-put (gptel-runner-call-driver-data call)
-                   :pending-interaction nil))
+  (gptel-runner-gptel--stop-supervision call)
   (when (buffer-live-p (gptel-runner-call-buffer call))
     (let ((gptel-runner-gptel--cancelling t))
       (gptel-abort (gptel-runner-call-buffer call)))
@@ -487,9 +602,7 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
 (cl-defmethod gptel-runner-driver-pause
   ((_driver gptel-runner-gptel-driver) call)
   "Stop CALL's provider work while retaining its transcript for feedback."
-  (setf (gptel-runner-call-driver-data call)
-        (plist-put (gptel-runner-call-driver-data call)
-                   :pending-interaction nil))
+  (gptel-runner-gptel--stop-supervision call)
   (setf (gptel-runner-call-driver-data call)
         (plist-put (gptel-runner-call-driver-data call) :pausing t))
   (when (buffer-live-p (gptel-runner-call-buffer call))
@@ -550,9 +663,7 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
              (not (gptel-runner--call-terminal-p call)))
     (setf (gptel-runner-call-driver-data call)
           (plist-put (gptel-runner-call-driver-data call) :feedback-active nil))
-    (setf (gptel-runner-call-driver-data call)
-          (plist-put (gptel-runner-call-driver-data call)
-                     :pending-interaction nil))
+    (gptel-runner-gptel--stop-supervision call)
     (setf (gptel-runner-call-state call) 'waiting-feedback
           (gptel-runner-call-tool-names call) nil)
     (gptel-runner--deactivate-call call)
@@ -611,15 +722,19 @@ still requires explicit acceptance using
                           (gptel-runner-call-node call) call
                           (list :text text))
       (condition-case err
-          (gptel-request
+          (progn
+            (gptel-runner-gptel--start-supervision call)
+            (gptel-request
            nil :buffer (current-buffer) :stream gptel-stream
            :context call :fsm fsm
+           :transforms gptel-prompt-transform-functions
            :callback
            (lambda (response info &optional raw)
              (when (and (= generation (gptel-runner-call-generation call))
                         (not (gptel-runner--call-terminal-p call)))
-               (gptel-runner-gptel--callback call observe response info raw))))
+               (gptel-runner-gptel--callback call observe response info raw)))))
         (error
+         (gptel-runner-gptel--stop-supervision call)
          (setf (gptel-runner-call-state call) 'waiting-feedback)
          (gptel-runner--deactivate-call call)
          (setf (gptel-runner-call-driver-data call)

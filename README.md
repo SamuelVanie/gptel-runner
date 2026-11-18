@@ -1184,6 +1184,46 @@ dashboard; stale approvals cannot authorize a later tool call.  Rejecting an
 approval cancels that call.  Tool confirmation policy remains explicit;
 running in the background does not automatically authorize tools.
 
+Pipeline agent presets can include `Agent`, `Discussion`, and
+`DiscussionControl` from `gptel-agent`.  The runner applies the preset's prompt
+transforms so these tools receive their request-local dispatchers and allowed
+agent definitions.  This works in local runs and isolated job workers.
+
+This optional integration requires a gptel-agent version providing
+`gptel-agent-supervise`, `gptel-agent-supervision-stop`,
+`gptel-agent-supervision-retry`, and
+`gptel-agent-supervision-request-live-p`. The adapter reports a missing API
+with an update instruction. It uses one public supervision handle per node
+invocation; ownership, descendant completion and deferred wakeups belong to
+gptel-agent. The runner supplies approval and state callbacks and owns the
+root request's scheduling and retry policy. It neither advises private
+agent functions nor edits agent structs. Plain gptel presets continue to work
+without gptel-agent installed.
+
+A runner-owned request waits for its active discussion turns, nested
+discussions, and queued discussion follow-ups before completing.  Idle
+discussions do not hold the node open.  `Agent` workers, including workers
+started with `background: true`, also finish before their owning request.
+An explicit `DiscussionReport` resumes the parent for synthesis; an ordinary
+child reply remains local, so ask for a report when its findings must affect
+the node's result.  Silent child completion releases the held parent answer.
+Cancelling or pausing a node stops its discussions and subagents.  Ordinary
+gptel conversations outside a runner retain their independent discussion
+behavior.
+
+In jobs, tool confirmations from subagents and discussions appear as pending
+interactions on the owning node.  Each includes its source buffer, tool names,
+and arguments; several children can await approval simultaneously.  Approve
+or reject them through the existing background commands.  Approval executes
+in the child request's context, and rejection cancels the owning node.
+Replies to cancelled, completed, or superseded requests cannot run tools.
+Question forms and separate interactive file-review interfaces still require
+their own headless adapters; this bridge handles gptel tool confirmations.
+Nested work is supervised inside the node, not registered as additional
+pipeline nodes or separately charged against the runner's call/concurrency
+limits.  Crash recovery restarts unfinished nodes rather than restoring live
+child callbacks.
+
 The `background-example-feedback` workflow from the same initialization file
 stops after synthesis.  Create a job using that workflow, inspect the final
 call, and accept a result from the dashboard to release the pipeline.  Real
@@ -1356,6 +1396,14 @@ make compile
 make checkdoc
 make package-lint
 make release-check
+```
+
+The integration target checks the plain gptel adapter in a separate Emacs
+process before loading gptel-agent for the optional delegation suite. It uses
+real state machines and a mocked transport, including a background job worker:
+
+```sh
+make integration-test INTEGRATION_LOAD_PATH="-L /path/to/gptel -L /path/to/gptel-agent -L /path/to/compat -L /path/to/yaml.el"
 ```
 
 Live provider smoke tests are opt-in and excluded from ordinary CI.

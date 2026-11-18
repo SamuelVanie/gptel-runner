@@ -21,6 +21,7 @@
 (declare-function gptel-runner-launchd-start-worker "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-remove "gptel-runner-launchd")
 (declare-function gptel-runner-gptel-answer-interaction "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-interaction-pending-p "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-feedback "gptel-runner-gptel")
 (declare-function gptel-runner-complete-call-from-buffer "gptel-runner-gptel")
 (declare-function gptel-agent-update "gptel-agent")
@@ -895,12 +896,10 @@ Opaque runtime objects and circular references are represented by type."
   "Return non-nil if INTERACTION still targets a live pending call."
   (let* ((call (ignore-errors (gptel-runner-jobs--call (plist-get interaction :call-id))))
          (pending (and call
-                       (plist-get (plist-get (gptel-runner-call-driver-data call)
-                                             :pending-interaction)
-                                  :description))))
+                       (gptel-runner-gptel-interaction-pending-p
+                        call (plist-get interaction :id)))))
     (and call (eq (gptel-runner-call-state call) 'waiting-confirmation)
          pending
-         (equal (plist-get interaction :id) (plist-get pending :id))
          (equal (plist-get interaction :epoch)
                 (plist-get gptel-runner-jobs--invocation :epoch))
          (= (or (plist-get interaction :generation) -1)
@@ -1193,6 +1192,9 @@ initialization or persistence error.  This function does not call `kill-emacs'."
          (process-environment (copy-sequence process-environment))
          (exec-path (copy-sequence exec-path))
          (load-path (append (plist-get job :load-path) load-path))
+         ;; Local package checkouts may have stale bytecode after an update.
+         ;; Bootstrap the current source rather than silently using old tools.
+         (load-prefer-newer t)
          ;; Scheduled workers must not need a compiler/toolchain just to
          ;; install input guards, or write native caches into the editor's
          ;; configuration.  Already installed native code remains usable.

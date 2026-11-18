@@ -145,6 +145,7 @@
   (require 'gptel-runner-jobs)
   (let* ((call (gptel-runner-call-create
                 :id "call-1" :generation 2 :state 'waiting-confirmation
+                :buffer (current-buffer)
                 :driver-data '(:pending-interaction
                                (:description (:id "current" :generation 2)))))
          (gptel-runner-jobs--run (gptel-runner-run-create :calls (list call)))
