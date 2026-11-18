@@ -145,6 +145,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
       (value (gptel-runner-run-state run) "run state")
       (table "blackboard" (gptel-runner-run-blackboard run) t)
       (table "node-states" (gptel-runner-run-node-states run) nil)
+      (table "node-outcomes" (gptel-runner-run-node-outcomes run) nil)
       (table "iterations" (gptel-runner-run-iterations run) nil)
       (table "repeat-limits" (gptel-runner-run-repeat-limits run) nil)
       (literal "\n  :budget ")
@@ -431,9 +432,7 @@ asynchronous."
 
 (defun gptel-runner-store--node (root id)
   "Find node ID below ROOT."
-  (if (equal (gptel-runner-node-id root) id) root
-    (cl-loop for child in (gptel-runner-node-children root)
-             thereis (gptel-runner-store--node child id))))
+  (gptel-runner-find-node root id))
 
 (defun gptel-runner-store--notice-id (id)
   "Advance the process-local identifier counter beyond string ID."
@@ -492,6 +491,8 @@ calls, events, and transcripts are deliberately not restored."
                         (plist-get data :blackboard))
            :node-states (gptel-runner-store--alist-hash
                          (plist-get data :node-states))
+           :node-outcomes (gptel-runner-store--alist-hash
+                           (plist-get data :node-outcomes))
            :iterations (gptel-runner-store--alist-hash
                         (plist-get data :iterations))
            :repeat-limits repeat-limits
@@ -523,6 +524,15 @@ calls, events, and transcripts are deliberately not restored."
       (unless (gptel-runner-store--node root (car entry))
         (user-error "Snapshot node %S is absent from workflow %S"
                     (car entry) workflow-name)))
+    (dolist (entry (plist-get data :node-outcomes))
+      (let ((state (plist-get (cdr entry) :state)))
+        (unless (and (gptel-runner-find-node root (car entry))
+                     (gptel-runner--terminal-p state)
+                     (eq state (gethash (car entry)
+                                        (gptel-runner-run-node-states run)))
+                     (plist-member (cdr entry) :value))
+          (user-error "Snapshot node outcome %S is invalid for workflow %S"
+                      (car entry) workflow-name))))
     (dolist (entry (plist-get data :iterations))
       (unless (gptel-runner-store--node root (car entry))
         (user-error "Snapshot iteration node %S is absent from workflow %S"

@@ -191,14 +191,7 @@ When WORKSPACE is non-nil, also require every declared file to be readable."
 
 (defun gptel-runner--node-path (root target)
   "Return the path from ROOT to TARGET, including both nodes."
-  (when (gptel-runner-node-p root)
-    (if (or (eq root target)
-            (equal (gptel-runner-node-id root)
-                   (gptel-runner-node-id target)))
-        (list root)
-      (cl-loop for child in (gptel-runner-node-children root)
-               for path = (gptel-runner--node-path child target)
-               when path return (cons root path)))))
+  (gptel-runner-node-path root target))
 
 (defun gptel-runner--read-context-file (run node file)
   "Return FILE's contents, resolving it from NODE's workspace in RUN."
@@ -281,10 +274,7 @@ Return a cons of label and text, or nil when a function omits its context."
 
 (defun gptel-runner--find-node (root id)
   "Return the node named ID below ROOT, or nil when it is absent."
-  (if (equal (gptel-runner-node-id root) id)
-      root
-    (cl-loop for child in (gptel-runner-node-children root)
-             thereis (gptel-runner--find-node child id))))
+  (gptel-runner-find-node root id))
 
 (defun gptel-runner--workflow-repeat-limits (root)
   "Return a table containing every repeat limit below ROOT."
@@ -503,8 +493,7 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
     (dolist (property '(:save-as :error-as))
       (when-let* ((key (plist-get (gptel-runner-node-properties node) property)))
         (remhash key (gptel-runner-run-blackboard run)))))
-  (puthash (gptel-runner-node-id node) 'pending
-           (gptel-runner-run-node-states run))
+  (gptel-runner--reset-node-state run (gptel-runner-node-id node))
   (mapc (lambda (child) (gptel-runner--reset-subtree run child))
         (gptel-runner-node-children node)))
 
@@ -1062,21 +1051,26 @@ Return the new history entry, or nil when NODE does not collect history."
                   (gptel-runner-run-node-states run) 'pending)))
     (cond
      ((eq saved-state 'succeeded)
-      (funcall done 'succeeded
-               (if (eq (gptel-runner-node-kind node) 'try)
-                   (plist-get (gptel-runner-get
-                               run (list 'gptel-runner-try
-                                         (gptel-runner-node-id node))) :value)
-                 (when (memq (gptel-runner-node-kind node) '(agent elisp))
-                   (when-let ((key (plist-get
-                                    (gptel-runner-node-properties node)
-                                    :save-as)))
-                     (gptel-runner-get run key))))))
+      (let ((outcome (gethash (gptel-runner-node-id node)
+                              (gptel-runner-run-node-outcomes run))))
+        (funcall done 'succeeded
+                 (if (plist-member outcome :value)
+                     (plist-get outcome :value)
+                   ;; Older v2 snapshots have no node outcomes.  Retain their
+                   ;; previous resume behavior without inventing public data.
+                   (if (eq (gptel-runner-node-kind node) 'try)
+                       (plist-get (gptel-runner-get
+                                   run (list 'gptel-runner-try
+                                             (gptel-runner-node-id node))) :value)
+                     (when (memq (gptel-runner-node-kind node) '(agent elisp))
+                       (when-let ((key (plist-get
+                                        (gptel-runner-node-properties node)
+                                        :save-as)))
+                         (gptel-runner-get run key))))))))
      ((not (eq (gptel-runner-run-state run) 'running)) nil)
      (t
       (when (eq saved-state 'skipped)
-        (puthash (gptel-runner-node-id node) 'pending
-                 (gptel-runner-run-node-states run)))
+        (gptel-runner--reset-node-state run (gptel-runner-node-id node)))
       (pcase (gptel-runner-node-kind node)
         ('agent (gptel-runner--execute-agent run node done))
         ('elisp (gptel-runner--execute-elisp run node done))
@@ -1249,7 +1243,7 @@ CALLBACK runs exactly once with the terminal run."
     (maphash
      (lambda (id state)
        (unless (or (gethash id completed) (memq state '(succeeded skipped)))
-         (puthash id 'pending (gptel-runner-run-node-states run))))
+         (gptel-runner--reset-node-state run id)))
      (gptel-runner-run-node-states run))))
 
 (defun gptel-runner--prepare-terminal-repeat-bodies (run root)
@@ -1565,8 +1559,8 @@ Enclosing repeat histories and counters are retained."
                (puthash (list 'gptel-runner-retry-repeat
                               (gptel-runner-node-id node))
                         t (gptel-runner-run-blackboard run)))
-             (puthash (gptel-runner-node-id node) 'pending
-                      (gptel-runner-run-node-states run))))))
+             (gptel-runner--reset-node-state
+              run (gptel-runner-node-id node))))))
     (walk path)))
 
 (cl-defun gptel-runner-retry (run &key from-node feedback callback)
@@ -1949,8 +1943,7 @@ for the extended run's next terminal transition."
     (gptel-runner--finish-call call 'succeeded (cdr parsed))
     (when-let ((key (plist-get (gptel-runner-node-properties node) :save-as)))
       (gptel-runner-put run key (cdr parsed)))
-    (puthash (gptel-runner-node-id node) 'succeeded
-             (gptel-runner-run-node-states run))
+    (gptel-runner--set-node-state run node 'succeeded (cdr parsed))
     (if (eq (gptel-runner-run-state run) 'paused)
         (gptel-runner-resume-run run)
       (gptel-runner--checkpoint run))))

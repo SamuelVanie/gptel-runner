@@ -38,6 +38,9 @@ normal verification commands where applicable.
 
 ## User experience and hardening
 
+- [x] Public node traversal and durable outcomes across agent, Elisp, and
+  container nodes, including successful nil and checkpoint recovery.
+
 - [x] Workflow-grouped session dashboard with inspect, visit, lifecycle,
   cleanup, configurable columns, and abort actions.
 - [x] Default-on, run-scoped decision memory with provenance, automatic

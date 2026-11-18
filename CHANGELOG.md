@@ -2,6 +2,10 @@
 
 ## 0.1.0 - unreleased
 
+- Add public node traversal, lookup, paths, states, results, and error helpers.
+  Preserve current outcomes for agent, Elisp, and container nodes in checkpoints,
+  distinguish successful nil from unavailable values, and reuse accepted values
+  when resuming containers without historical calls or `:save-as` entries.
 - Add native asynchronous Elisp steps with completion/rejection callbacks,
   once-only cleanup on completion, cancellation, pause, and timeout, per-attempt
   timeouts, and protection against duplicate or late results.

@@ -121,6 +121,7 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
                (:constructor gptel-runner-run-create))
   "Runtime state for one workflow execution."
   id workflow goal workspace (state 'pending) blackboard node-states
+  (node-outcomes (make-hash-table :test #'equal))
   iterations repeat-limits active-calls calls events budget driver queue
   (active-count 0)
   (writer-active 0) started-at finished-at terminal-data
@@ -128,6 +129,121 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   callback callback-called
   duration-timer duration-remaining active-started-at
   paused-at snapshot-file (generation 0) options)
+
+(defun gptel-runner--source-root (source)
+  "Return the workflow root represented by SOURCE.
+Accept a run, workflow, registered workflow name, or subtree node."
+  (cond
+   ((gptel-runner-node-p source) source)
+   ((gptel-runner-run-p source)
+    (gptel-runner--source-root (gptel-runner-run-workflow source)))
+   ((gptel-runner-workflow-p source) (gptel-runner-workflow-root source))
+   ((and (symbolp source) (gethash source gptel-runner--workflows))
+    (gptel-runner-workflow-root (gethash source gptel-runner--workflows)))
+   (t (user-error "Not a runner run, workflow, or node: %S" source))))
+
+(defun gptel-runner-map-nodes (function source)
+  "Apply FUNCTION to every node in SOURCE and return the results in order.
+SOURCE is a run, workflow object, registered workflow name, or subtree node.
+Visit the root first, then each child subtree in definition order, including
+unexecuted branches and try handlers.  Repeat bodies appear once, regardless
+of their iteration count.  FUNCTION receives one node; do not mutate the
+workflow tree while traversing it."
+  (let (results)
+    (cl-labels ((walk (node)
+                 (push (funcall function node) results)
+                 (mapc #'walk (gptel-runner-node-children node))))
+      (walk (gptel-runner--source-root source)))
+    (nreverse results)))
+
+(defun gptel-runner-list-nodes (source &optional predicate)
+  "Return SOURCE's nodes in root-first definition order.
+SOURCE accepts the same forms as `gptel-runner-map-nodes'.  When PREDICATE
+is non-nil, include only nodes for which it returns non-nil.  Filtering a
+parent does not exclude its descendants.  The returned list is fresh; its
+nodes are the actual workflow definitions."
+  (let ((nodes (gptel-runner-map-nodes #'identity source)))
+    (if predicate (cl-remove-if-not predicate nodes) nodes)))
+
+(defun gptel-runner-find-node (source id)
+  "Return the node with ID in SOURCE, or nil if absent.
+SOURCE accepts the same forms as `gptel-runner-map-nodes'.  IDs are compared
+with `equal'."
+  (cl-labels ((find-node (node)
+               (if (equal id (gptel-runner-node-id node)) node
+                 (cl-some #'find-node (gptel-runner-node-children node)))))
+    (find-node (gptel-runner--source-root source))))
+
+(defun gptel-runner-node-path (source node)
+  "Return the path from SOURCE's root to NODE, including both endpoints.
+NODE is a node object or ID.  Return nil when it is absent.  SOURCE accepts
+the same forms as `gptel-runner-map-nodes'."
+  (let ((id (if (gptel-runner-node-p node) (gptel-runner-node-id node) node)))
+    (cl-labels ((path (current)
+                 (if (equal id (gptel-runner-node-id current)) (list current)
+                   (when-let* ((tail (cl-some #'path
+                                             (gptel-runner-node-children
+                                              current))))
+                     (cons current tail)))))
+      (path (gptel-runner--source-root source)))))
+
+(defun gptel-runner--resolve-node (run node)
+  "Resolve NODE, an object or ID, in RUN or signal a user error."
+  (unless (gptel-runner-run-p run)
+    (user-error "Not a gptel-runner run: %S" run))
+  (let ((id (if (gptel-runner-node-p node) (gptel-runner-node-id node) node)))
+    (or (gptel-runner-find-node run id)
+        (user-error "Unknown node %S in run %s" id (gptel-runner-run-id run)))))
+
+(defun gptel-runner-node-state (run node)
+  "Return NODE's current workflow state in RUN.
+NODE is a node object or ID; an unknown ID signals a user error.  Nodes not
+yet reached are `pending'.  This is workflow state, not the more detailed
+state of an individual call, such as retry-wait or waiting-feedback."
+  (gethash (gptel-runner-node-id (gptel-runner--resolve-node run node))
+           (gptel-runner-run-node-states run) 'pending))
+
+(defun gptel-runner-node-outcome (run node)
+  "Return NODE's current outcome in RUN as a fresh plist.
+NODE is a node object or ID; an unknown ID signals a user error.
+The plist contains `:node' and `:state'.  A known terminal outcome also has
+`:value': the accepted output on success, or failure/cancellation/skip data
+otherwise.  Use `plist-member' to distinguish a known nil value from an
+unavailable value.  Pending and running nodes have no `:value'; completed
+nodes loaded from older snapshots can also lack it.
+Outcomes are independent of calls and `:save-as', and survive checkpoints.
+They describe the current execution, not history: resetting a node for a
+repeat iteration, retry, or continuation clears its previous outcome.
+The value itself is shared with the run and should be treated as read-only."
+  (let* ((id (gptel-runner-node-id (gptel-runner--resolve-node run node)))
+         (state (gethash id (gptel-runner-run-node-states run) 'pending))
+         (outcome (gethash id (gptel-runner-run-node-outcomes run))))
+    (append (list :node id :state state)
+            (when (and (gptel-runner--terminal-p state)
+                       (eq state (plist-get outcome :state))
+                       (plist-member outcome :value))
+              (list :value (plist-get outcome :value))))))
+
+(defun gptel-runner-node-result (run node &optional default)
+  "Return NODE's successful output in RUN, or DEFAULT if unavailable.
+NODE is a node object or ID.  A successful nil output returns nil even when
+DEFAULT is non-nil.  Use `gptel-runner-node-outcome' for state and failure data."
+  (let ((outcome (gptel-runner-node-outcome run node)))
+    (if (and (eq (plist-get outcome :state) 'succeeded)
+             (plist-member outcome :value))
+        (plist-get outcome :value)
+      default)))
+
+(defun gptel-runner-node-error (run node &optional default)
+  "Return NODE's unsuccessful outcome data in RUN, or DEFAULT.
+NODE is a node object or ID.  Unsuccessful states are failed, blocked,
+stalled, and cancelled.  Successful, skipped, unfinished, and unavailable
+outcomes return DEFAULT.  Known nil error data returns nil."
+  (let ((outcome (gptel-runner-node-outcome run node)))
+    (if (and (memq (plist-get outcome :state) '(failed blocked stalled cancelled))
+             (plist-member outcome :value))
+        (plist-get outcome :value)
+      default)))
 
 (defun gptel-runner--node-workspace (node workspace)
   "Resolve NODE's workspace override relative to run WORKSPACE.
@@ -447,8 +563,17 @@ non-nil, also delete snapshot files belonging to the removed runs."
          (old (gethash id states 'pending)))
     (unless (or (eq old state) (gptel-runner--terminal-p old))
       (puthash id state states)
+      (if (gptel-runner--terminal-p state)
+          (puthash id (list :state state :value data)
+                   (gptel-runner-run-node-outcomes run))
+        (remhash id (gptel-runner-run-node-outcomes run)))
       (gptel-runner--emit run (intern (format "node-%s" state)) node nil data)
       t)))
+
+(defun gptel-runner--reset-node-state (run id)
+  "Reset node ID to pending in RUN and discard its previous outcome."
+  (puthash id 'pending (gptel-runner-run-node-states run))
+  (remhash id (gptel-runner-run-node-outcomes run)))
 
 (defun gptel-runner--persistent-p (run)
   "Return non-nil when RUN has durable snapshotting enabled."
@@ -498,6 +623,16 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
           (gptel-runner-run-finished-at run) (float-time)
           (gptel-runner-run-terminal-data run) data)
     (gptel-runner--stop-duration-clock run)
+    ;; Cancellation invalidates continuations, including a try's completion
+    ;; closure and paused calls.  Finish entered nodes those closures can no
+    ;; longer terminalize, while retaining pending nodes as never reached.
+    (when (and (not (eq state 'succeeded)) (gptel-runner-run-workflow run))
+      (gptel-runner-map-nodes
+       (lambda (node)
+         (when (eq (gethash (gptel-runner-node-id node)
+                            (gptel-runner-run-node-states run)) 'running)
+           (gptel-runner--set-node-state run node state data)))
+       run))
     (gptel-runner--emit run
                         (if (eq state 'succeeded)
                             'run-completed

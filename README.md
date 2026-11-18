@@ -73,6 +73,74 @@ Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
+### Finding nodes and inspecting outcomes
+
+Inspect a run without searching its call history or requiring `:save-as`:
+
+```elisp
+(gptel-runner-find-node run 'review)       ; node object, or nil
+(gptel-runner-list-nodes run)              ; root, then descendants
+(gptel-runner-node-path run 'review)       ; root-to-review node objects
+(gptel-runner-node-state run 'review)      ; pending, running, succeeded, ...
+(gptel-runner-node-outcome run 'review)    ; state and available value
+(gptel-runner-node-result run 'review 'unavailable)
+(gptel-runner-node-error run 'review 'no-error)
+
+;; A report for every node, including containers and unused branches.
+(gptel-runner-map-nodes
+ (lambda (node) (gptel-runner-node-outcome run node))
+ run)
+
+;; Select just the failed nodes, in workflow definition order.
+(gptel-runner-list-nodes
+ run (lambda (node) (eq (gptel-runner-node-state run node) 'failed)))
+```
+
+Traversal helpers accept a run, workflow object, registered workflow name,
+or node used as a subtree root.  They visit each node before its children,
+in definition order, including unused branch arms and try handlers.  Repeat
+bodies appear once.  An optional predicate on `gptel-runner-list-nodes`
+filters nodes without pruning their descendants.
+
+State, outcome, result, and error helpers take a run object and either a node
+object or its ID.  Unknown IDs signal an error; `find-node` and `node-path`
+return nil when absent.  Nodes and outcome values are shared with the run;
+treat them as read-only.
+
+Outcomes use the same shape for agent, Elisp, and container nodes:
+
+```elisp
+(:node check :state pending)                  ; not reached yet
+(:node check :state running)                  ; no accepted result yet
+(:node check :state succeeded :value nil)      ; successfully returned nil
+(:node check :state failed :value (:type ...)) ; failed with these details
+(:node check :state skipped :value branch-not-selected)
+```
+
+The `:value` key is present for every known terminal outcome, even when its
+value is nil.  `gptel-runner-node-result` returns only successful values and
+uses its optional default for failures or unavailable results.  Thus a
+non-nil default distinguishes successful nil from missing output.
+`gptel-runner-node-error` returns data for failed, blocked, stalled, or
+cancelled nodes, with its optional default for other states or missing data.
+Node state describes workflow progress; individual call states such as
+`retry-wait` and `waiting-feedback` remain available on calls.
+
+Agent outcomes contain parsed, validated outputs; existing empty-response
+and parser validation rules still apply.  Elisp nodes accept nil.  Sequence
+success yields nil; branches propagate the selected child's value; repeats
+propagate the finishing body's value (or nil if already satisfied); parallel
+success yields its collected child outcomes; try nodes preserve the body or
+handler outcome unless cleanup fails.
+
+Outcomes survive checkpoint recovery even when historical calls are absent.
+They describe the current execution: repeat iterations, retries, and new
+continuation cycles clear outcomes only for nodes being reset.  Use repeat
+history options when you need earlier iterations.  Older v2 snapshots still
+load, but completed nodes without stored outcomes omit `:value`; they are
+not reported as successful nil.  Check `plist-member` when reading that
+distinction directly.
+
 ### Mixing Elisp and agent steps
 
 Use `gptel-runner-elisp-step` for local operations such as reading files,
@@ -139,10 +207,10 @@ Agent-only options such as `:prompt`, `:parser`, `:validator`, `:context`, and
 `:pause-after` are rejected on Elisp steps; inherited context still applies
 to agent steps.  Put transformations and validation in the function itself.
 
-Checkpoint recovery retains completed Elisp nodes and their saved outputs.
+Checkpoint recovery retains completed Elisp nodes and their outcomes.
 Unfinished nodes restart, and `gptel-runner-retry :from-node` accepts Elisp
 step IDs.  Use stable explicit IDs and reload the workflow's function
-definitions before restoring a snapshot.  Saved values must be readable Lisp
+definitions before restoring a snapshot.  Outcome values must be readable Lisp
 data.  Functions with side effects should tolerate repeated execution after
 retries or recovery; pausing or cancellation cannot undo effects already made.
 
@@ -789,23 +857,28 @@ After restarting Emacs, load the same workflow and agent definitions, then:
 
 Alternatively, choose `l` and then `r` from the dashboard action menu.
 
-Version 2 snapshots preserve only execution state: the goal, canonical
-workspace, blackboard, completed node states, repeat iterations, budgets, and
-timing/options data.  Historical calls, event journals, and transcripts remain
-available for inspection in the original Emacs session but are not restored.
+Version 2 snapshots preserve execution state and current node outcomes: the
+goal, canonical workspace, blackboard, node states and outcome values, repeat
+iterations, budgets, and timing/options data.  Historical calls, event journals,
+and transcripts remain available for inspection in the original Emacs session
+but are not restored.
 The dashboard therefore has no historical call rows immediately after loading;
 new rows appear when an extended or resumed run dispatches calls.  An
 unfinished call restarts statelessly from its workflow node.
-Store every downstream result needed after restoration on the blackboard,
-normally with `:save-as`.  Recorded decisions use the reserved
+Use `gptel-runner-node-result` to read a completed node's output after
+restoration, or keep using named blackboard entries with `:save-as`.
+All outcome values and blackboard entries in persistent runs must be readable
+Lisp data; buffers and processes cannot be serialized.  An unreadable outcome
+produces a `snapshot-error` naming the node and leaves the prior snapshot
+intact.  Recorded decisions use the reserved
 `gptel-runner-decisions` blackboard key, so they are preserved by the same
 snapshot mechanism.
 
 Completion callbacks and live provider processes are not serializable; supply
 a new callback to `gptel-runner-load-run`.  Calls consumed before pausing remain
 charged to call and request budgets.  Version 1 snapshots are not accepted.
-Snapshot files have mode `0600`, but blackboard values can contain prompts,
-outputs, tool results, and secrets; protect and delete them as sensitive data.
+Snapshot files have mode `0600`, but outcomes and blackboard values can contain
+prompts, outputs, tool results, and secrets; protect and delete them as sensitive data.
 
 Run options include `:driver`, `:max-requests`, `:max-calls`,
 `:max-concurrency`, `:max-duration`, `:allow-writes`,
@@ -1127,7 +1200,7 @@ can change; CI checks v0.9.9.4 and uses current master as an early-warning job.
 | `invalid-output` | The original and one repair response both failed validation. |
 | Cancellation cannot undo a tool | Stop/undo the external tool action separately. |
 | Snapshot cannot find a node | Reload the same named workflow with stable explicit node IDs. |
-| Snapshot cannot be saved | Keep blackboard keys/values, the run goal, and per-run context readable as Emacs Lisp data. |
+| Snapshot cannot be saved | Keep node outcomes, blackboard keys/values, the run goal, and per-run context readable as Emacs Lisp data. |
 
 ## Development
 
