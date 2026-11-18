@@ -5,9 +5,9 @@
 ;; This example builds an implementation/review loop using only the generic
 ;; runner primitives.  It does not require `gptel-runner-review'.
 ;;
-;; Every invocation is a fresh, stateless call:
+;; The workflow alternates turns between two node chats:
 ;;
-;;   fresh implementer -> fresh reviewer -> fresh implementer -> ...
+;;   implementer -> reviewer -> implementer -> ...
 ;;
 ;; The calls communicate through `.gptel-runner/handoff.md' in the workspace.
 ;; That file contains only the goal, the latest status, and natural-language

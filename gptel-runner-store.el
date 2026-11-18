@@ -5,17 +5,30 @@
 
 ;;; Commentary:
 
-;; Compact, versioned execution checkpoints for named workflows.  Automatic
+;; Versioned execution checkpoints and node chats for named workflows.  Automatic
 ;; checkpoints are debounced and all snapshots are serialized in short timer
 ;; slices so persistence does not monopolize the Emacs event loop.  Snapshots
-;; contain only the state required to resume execution; calls, events, and
-;; worker transcripts remain session-local inspection data.
+;; contain the execution cursor and one native session per visited agent node.
+;; Archived conversations become ordinary chat buffers on first visit.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'gptel-runner-core)
 (require 'gptel-runner-flow)
+
+(autoload 'gptel-runner-gptel-chat-text "gptel-runner-gptel")
+(autoload 'gptel-runner-gptel-chat-from-text "gptel-runner-gptel")
+(autoload 'gptel-runner-gptel-save-chat "gptel-runner-gptel")
+(autoload 'gptel-runner-gptel-open-chat "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-submitted-end "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-restore-submitted-end "gptel-runner-gptel")
+
+(declare-function gptel-agent-session-buffer-record "gptel-agent-session")
+(declare-function gptel-agent-session-buffer-from-record "gptel-agent-session")
+(declare-function gptel-agent-session-export-buffer "gptel-agent-session")
+(declare-function gptel-agent-session-write-record "gptel-agent-session")
+(declare-function gptel-agent-session-import-buffer "gptel-agent-session")
 
 (defgroup gptel-runner-store nil
   "Persistent snapshots for gptel-runner."
@@ -32,7 +45,7 @@ Repeated safe checkpoints reset this delay.  Explicit saves, pauses, and
 terminal run transitions bypass it, but their writes are still asynchronous."
   :type 'number)
 
-(defconst gptel-runner-snapshot-version 2
+(defconst gptel-runner-snapshot-version 3
   "Current on-disk runner snapshot format version.")
 
 (defconst gptel-runner-store--slice-seconds 0.01
@@ -59,6 +72,113 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 
 (defvar gptel-runner-store--coordinators (make-hash-table :test #'eq)
   "Save coordinators indexed by live run object.")
+
+(defun gptel-runner-store--agent-sessions-p ()
+  "Whether configured agent sessions support standalone session records."
+  (and (featurep 'gptel-agent-session)
+       (fboundp 'gptel-agent-session-buffer-record)))
+
+(defun gptel-runner-store--require-agent-sessions ()
+  "Load the reader needed for an archived gptel-agent chat."
+  (unless (and (require 'gptel-agent nil t)
+               (gptel-runner-store--agent-sessions-p))
+    (user-error "Install gptel-agent with standalone session support to open this chat")))
+
+(defun gptel-runner-store--archive (buffer)
+  "Capture BUFFER in its native chat format."
+  (if (gptel-runner-store--agent-sessions-p)
+      (cons 'gptel-agent (gptel-agent-session-buffer-record buffer))
+    (cons 'gptel (gptel-runner-gptel-chat-text buffer))))
+
+(defun gptel-runner-store-export-chat (chat file)
+  "Save live or archived CHAT to FILE and return its native format."
+  (pcase chat
+    (`(gptel-agent . ,record)
+     (gptel-runner-store--require-agent-sessions)
+     (gptel-agent-session-write-record record file)
+     'gptel-agent)
+    (`(gptel . ,text) (gptel-runner-gptel-save-chat text file) 'gptel)
+    (_ (if (gptel-runner-store--agent-sessions-p)
+           (progn (gptel-agent-session-export-buffer chat file) 'gptel-agent)
+         (gptel-runner-gptel-save-chat chat file)
+         'gptel))))
+
+(defun gptel-runner-store-open-chat (file format)
+  "Open FILE in FORMAT as a fresh, independently editable chat."
+  (pcase format
+    ('gptel-agent (gptel-runner-store--require-agent-sessions)
+                  (gptel-agent-session-import-buffer file))
+    ('gptel (gptel-runner-gptel-open-chat file))
+    (_ (user-error "Unknown runner chat format %S" format))))
+
+(defun gptel-runner-store--chat-changed (&rest _)
+  "Queue a checkpoint for the current chat when its run is persistent."
+  (when gptel-runner--call
+    (gptel-runner--checkpoint (gptel-runner-call-run gptel-runner--call))))
+
+(defun gptel-runner-store--close-chat ()
+  "Retain a session record when a node conversation is closed."
+  (when-let* ((call gptel-runner--call)
+              (run (gptel-runner-call-run call))
+              (id (gptel-runner-node-id (gptel-runner-call-node call)))
+              (chats (gptel-runner-run-chats run))
+              ((eq (current-buffer) (gethash id chats))))
+    (when (memq (gptel-runner-call-state call)
+                '(running waiting-confirmation waiting-tool retry-wait))
+      (gptel-runner-pause-call call 'chat-closed))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call) :submitted-end
+                     (gptel-runner-gptel-submitted-end (current-buffer))))
+    (puthash id (gptel-runner-store--archive (current-buffer)) chats)
+    (gptel-runner--checkpoint run)))
+
+(defun gptel-runner-store-track-chat (call buffer)
+  "Associate CALL with its node's ordinary gptel BUFFER and return BUFFER."
+  (setf (gptel-runner-call-buffer call) buffer)
+  (puthash (gptel-runner-node-id (gptel-runner-call-node call)) buffer
+           (gptel-runner-run-chats (gptel-runner-call-run call)))
+  (with-current-buffer buffer
+    (setq-local gptel-runner--call call)
+    (add-hook 'after-change-functions #'gptel-runner-store--chat-changed nil t)
+    (add-hook 'kill-buffer-hook #'gptel-runner-store--close-chat nil t))
+  buffer)
+
+(defun gptel-runner-node-buffer (run node)
+  "Return the chat for NODE in RUN, restoring it on demand.
+NODE is a workflow node or its ID.  Return nil before the first chat turn
+and for nodes that execute without a gptel conversation."
+  (let* ((id (if (gptel-runner-node-p node) (gptel-runner-node-id node)
+               (gptel-runner-node-id (gptel-runner--resolve-node run node))))
+         (chat (gethash id (gptel-runner-run-chats run))))
+    (cond
+     ((buffer-live-p chat) chat)
+     ((consp chat)
+      (let ((call (cl-find-if
+                   (lambda (c)
+                     (and (equal id (gptel-runner-node-id (gptel-runner-call-node c)))
+                          (or (gptel-runner-call-buffer c)
+                              (plist-get (gptel-runner-call-driver-data c) :restored))))
+                   (gptel-runner-run-calls run) :from-end t))
+            buffer)
+        (unless call (error "No call owns chat for node %S" id))
+        (pcase (car chat)
+          ('gptel-agent
+           (gptel-runner-store--require-agent-sessions)
+           (setq buffer (gptel-agent-session-buffer-from-record (cdr chat)))
+           (gptel-runner-gptel-restore-submitted-end
+            buffer (plist-get (gptel-runner-call-driver-data call) :submitted-end)))
+          ('gptel (setq buffer (gptel-runner-gptel-chat-from-text (cdr chat))))
+          (_ (user-error "Unknown saved chat format %S" (car chat))))
+        (with-current-buffer buffer
+          (setq-local default-directory (gptel-runner-call-workspace call)))
+        (gptel-runner-store-track-chat call buffer))))))
+
+(defun gptel-runner-call-chat-buffer (call)
+  "Return CALL's node conversation, reopening a saved chat if necessary."
+  (or (and (buffer-live-p (gptel-runner-call-buffer call))
+           (gptel-runner-call-buffer call))
+      (gptel-runner-node-buffer (gptel-runner-call-run call)
+                                (gptel-runner-call-node call))))
 
 (defun gptel-runner-store--alist-hash (alist &optional test)
   "Return a hash table populated from ALIST using TEST."
@@ -110,6 +230,41 @@ terminal run transitions bypass it, but their writes are still asynchronous."
         (list :type (plist-get data :type)))
        (t '(:type other))))))
 
+(defun gptel-runner-store--call-record (call)
+  "Capture CALL's scheduling metadata for its node's saved chat."
+  (list :id (gptel-runner-call-id call)
+        :node (gptel-runner-node-id (gptel-runner-call-node call))
+        :state (gptel-runner-call-state call)
+        :submitted-end
+        (let ((buffer (gptel-runner-call-buffer call)))
+          (if (and (buffer-live-p buffer)
+                   (eq (buffer-local-value 'gptel-runner--call buffer) call))
+              (gptel-runner-gptel-submitted-end buffer)
+            (plist-get (gptel-runner-call-driver-data call) :submitted-end)))
+        :prompt (when-let* ((prompt (gptel-runner-call-prompt call)))
+                  (substring-no-properties prompt))
+        :result (let ((result (gptel-runner-call-result call)))
+                  (if (stringp result) (substring-no-properties result) result))
+        :error (gptel-runner-call-error call)
+        :started-at (gptel-runner-call-started-at call)
+        :finished-at (gptel-runner-call-finished-at call)
+        :attempt (gptel-runner-call-request-attempt call)
+        :generation (gptel-runner-call-generation call)
+        :repair (gptel-runner-call-repair-p call)))
+
+(defconst gptel-runner-store--title-prefix ";;; gptel-runner session · "
+  "Prefix of the single-line session picker label in saved checkpoints.")
+
+(defun gptel-runner-store-session-title (file)
+  "Read FILE's picker label, or return its basename for older checkpoints."
+  (or (ignore-errors
+        (with-temp-buffer
+          (insert-file-contents file nil 0 2048)
+          (goto-char (point-min))
+          (when (looking-at (regexp-quote gptel-runner-store--title-prefix))
+            (buffer-substring-no-properties (match-end 0) (line-end-position)))))
+      (file-name-nondirectory file)))
+
 (defun gptel-runner-store--snapshot-tokens (run)
   "Return incremental serialization tokens for a compact snapshot of RUN."
   (let ((budget (gptel-runner-run-budget run)) tokens)
@@ -128,8 +283,20 @@ terminal run transitions bypass it, but their writes are still asynchronous."
                         (format "blackboard entry %S" (car entry))
                       (format "%s entry %S" name (car entry)))))
            (literal ")")))
-      (literal ";;; gptel-runner snapshot -- execution data only\n")
-      (literal "(:format gptel-runner-snapshot\n :version 2\n :saved-at ")
+      (literal (concat
+                gptel-runner-store--title-prefix
+                (truncate-string-to-width
+                 (replace-regexp-in-string
+                  "[[:cntrl:][:space:]]+" " "
+                  (format "%s · %s · %s  %s"
+                          (gptel-runner-workflow-name (gptel-runner-run-workflow run))
+                          (gptel-runner-run-state run)
+                          (format-time-string "%Y-%m-%d %H:%M")
+                          (or (gptel-runner-run-goal run) "")))
+                 180 nil nil "…")
+                "\n"))
+      (literal (format "(:format gptel-runner-snapshot\n :version %d\n :saved-at "
+                       gptel-runner-snapshot-version))
       (value (float-time) "save time")
       (literal "\n :run (:id ")
       (value (gptel-runner-run-id run) "run identifier")
@@ -137,6 +304,9 @@ terminal run transitions bypass it, but their writes are still asynchronous."
       (value (gptel-runner-workflow-name
               (gptel-runner-run-workflow run))
              "workflow name")
+      (when-let* ((ids (gptel-runner--generated-node-ids (gptel-runner-run-workflow run))))
+        (literal "\n  :generated-node-ids ")
+        (value ids "generated workflow node IDs"))
       (literal "\n  :goal ")
       (value (gptel-runner-run-goal run) "run goal")
       (literal "\n  :workspace ")
@@ -152,6 +322,24 @@ terminal run transitions bypass it, but their writes are still asynchronous."
       (table "blackboard" (gptel-runner-run-blackboard run) t)
       (table "node-states" (gptel-runner-run-node-states run) nil)
       (table "node-outcomes" (gptel-runner-run-node-outcomes run) nil)
+      (literal "\n  :chats (")
+      (maphash
+       (lambda (id chat)
+         (literal "\n   ")
+         (value (cons id (if (buffer-live-p chat)
+                             (gptel-runner-store--archive chat)
+                           chat))
+                (format "chat for node %S" id)))
+       (gptel-runner-run-chats run))
+      (literal ")\n  :chat-calls (")
+      (dolist (call (gptel-runner-run-calls run))
+        (when (and (or (gptel-runner-call-buffer call)
+                       (plist-get (gptel-runner-call-driver-data call) :restored))
+                   (gethash (gptel-runner-node-id (gptel-runner-call-node call))
+                            (gptel-runner-run-chats run)))
+          (literal "\n   ")
+          (value (gptel-runner-store--call-record call) "chat call")))
+      (literal ")")
       (table "iterations" (gptel-runner-run-iterations run) nil)
       (table "repeat-limits" (gptel-runner-run-repeat-limits run) nil)
       (literal "\n  :budget ")
@@ -266,7 +454,8 @@ The result is one of `clean', `pending', `writing', or `error'."
 (defun gptel-runner-store--flush-parts (writer)
   "Append WRITER's buffered text parts to its temporary file."
   (when (gptel-runner-store--writer-parts writer)
-    (let ((text (apply #'concat
+    (let ((coding-system-for-write 'utf-8-emacs)
+          (text (apply #'concat
                        (nreverse (gptel-runner-store--writer-parts writer)))))
       (write-region text nil
                     (gptel-runner-store--writer-temporary writer)
@@ -346,7 +535,9 @@ When DRAIN is non-nil, finish all remaining work synchronously."
   (condition-case err
       (let* ((run (gptel-runner-store--coordinator-run coordinator))
              (file (gptel-runner-store--coordinator-file coordinator))
-             (directory (file-name-directory file)))
+             (directory (file-name-directory file))
+             ;; An exporter can fail.  Capture before allocating a temp file.
+             (tokens (gptel-runner-store--snapshot-tokens run)))
         (make-directory directory t)
         (setf
          (gptel-runner-store--coordinator-writer coordinator)
@@ -356,7 +547,7 @@ When DRAIN is non-nil, finish all remaining work synchronously."
           :temporary
           (make-temp-file (expand-file-name ".gptel-runner-" directory)
                           nil ".snapshot")
-          :tokens (gptel-runner-store--snapshot-tokens run)
+          :tokens tokens
           :notify (gptel-runner-store--coordinator-notify coordinator))
          (gptel-runner-store--coordinator-state coordinator) 'writing
          (gptel-runner-store--coordinator-error coordinator) nil
@@ -438,6 +629,14 @@ asynchronous."
              (gptel-runner-store--flush-coordinator coordinator))
            gptel-runner-store--coordinators))
 
+(defun gptel-runner-store-flush-run (run)
+  "Finish saving RUN before releasing its live session."
+  (gptel-runner-schedule-save run t)
+  (let ((coordinator (gptel-runner-store--coordinator run)))
+    (gptel-runner-store--flush-coordinator coordinator)
+    (when-let* ((err (gptel-runner-store--coordinator-error coordinator)))
+      (signal (car err) (cdr err)))))
+
 (defun gptel-runner-store--node (root id)
   "Find node ID below ROOT."
   (gptel-runner-find-node root id))
@@ -450,31 +649,54 @@ asynchronous."
                (string-to-number (match-string 1 id))))))
 
 (defun gptel-runner-store--read-file (file)
-  "Read and validate v2 snapshot FILE as data."
+  "Read and validate session or legacy version 2 checkpoint FILE as data."
   (with-temp-buffer
     (insert-file-contents file)
     (goto-char (point-min))
     (let ((data (read (current-buffer))))
       (unless (eq (plist-get data :format) 'gptel-runner-snapshot)
         (user-error "Not a gptel-runner snapshot: %s" file))
-      (unless (equal (plist-get data :version)
-                     gptel-runner-snapshot-version)
-        (user-error "Unsupported snapshot version %S (expected v2)"
+      (unless (memq (plist-get data :version) (list 2 gptel-runner-snapshot-version))
+        (user-error "Unsupported snapshot version %S (expected v2 or v3)"
                     (plist-get data :version)))
       data)))
 
+(defun gptel-runner-store--restore-call (run record)
+  "Restore RECORD's place in RUN without creating a buffer or a request."
+  (let* ((node (gptel-runner--resolve-node run (plist-get record :node)))
+         (id (plist-get record :id))
+         (state (plist-get record :state)))
+    (unless (and (stringp id) (string-match-p "\\`[[:alnum:]_-]+\\'" id)
+                 (eq (gptel-runner-node-kind node) 'agent)
+                 (gethash (gptel-runner-node-id node) (gptel-runner-run-chats run)))
+      (user-error "Invalid saved chat call %S" id))
+    (gptel-runner-store--notice-id id)
+    (gptel-runner-call-create
+     :id id :run run :node node :workspace (gptel-runner-node-workspace run node)
+     :agent (gptel-runner--agent (plist-get (gptel-runner-node-properties node) :agent))
+     :state (if (or (gptel-runner--terminal-p state) (eq state 'waiting-feedback))
+                state 'paused)
+     :started-at (plist-get record :started-at) :finished-at (plist-get record :finished-at)
+     :result (plist-get record :result) :error (plist-get record :error)
+     :prompt (plist-get record :prompt) :generation (or (plist-get record :generation) 0)
+     :repair-p (plist-get record :repair) :request-attempt (or (plist-get record :attempt) 0)
+     :driver-data (list :restored t :submitted-end (plist-get record :submitted-end)))))
+
 (defun gptel-runner-load-run (file &optional callback driver)
-  "Load a run from v2 snapshot FILE using CALLBACK and DRIVER.
-The workflow and all referenced agents must already be registered.  Historical
-calls, events, and transcripts are deliberately not restored."
+  "Open the run saved in FILE using CALLBACK and DRIVER.
+The workflow and agents must already be registered.  Its node conversations
+open on demand.  A version 2 checkpoint restores execution state only."
   (setq file (expand-file-name file))
   (let* ((snapshot (gptel-runner-store--read-file file))
          (data (plist-get snapshot :run))
          (run-id (plist-get data :id))
          (workflow-name (plist-get data :workflow))
-         (workflow (or (gethash workflow-name gptel-runner--workflows)
-                       (user-error "Define workflow %S before loading snapshot"
-                                   workflow-name)))
+         (registered (or (gethash workflow-name gptel-runner--workflows)
+                         (user-error "Define workflow %S before loading snapshot"
+                                     workflow-name)))
+         (workflow (gptel-runner--restore-node-ids
+                    registered (and (= (plist-get snapshot :version) 3)
+                                    (plist-get data :generated-node-ids))))
          (root (gptel-runner-workflow-root workflow))
          (repeat-limits
           (let ((limits (gptel-runner--workflow-repeat-limits root)))
@@ -504,11 +726,15 @@ calls, events, and transcripts are deliberately not restored."
                          (plist-get data :node-states))
            :node-outcomes (gptel-runner-store--alist-hash
                            (plist-get data :node-outcomes))
+           :chats (gptel-runner-store--alist-hash (plist-get data :chats))
            :iterations (gptel-runner-store--alist-hash
                         (plist-get data :iterations))
            :repeat-limits repeat-limits
            :events nil :budget budget
-           :driver (or driver gptel-runner-default-driver)
+           :driver (or driver gptel-runner-default-driver
+                       (and (gptel-runner--needs-driver-p root)
+                            (require 'gptel-runner-gptel)
+                            gptel-runner-default-driver))
            :queue nil :active-calls nil :calls nil
            :started-at (plist-get data :started-at)
            :finished-at (plist-get data :finished-at)
@@ -557,6 +783,9 @@ calls, events, and transcripts are deliberately not restored."
                      (> (cdr entry) 0))
           (user-error "Snapshot repeat limit %S is invalid for workflow %S"
                       entry workflow-name))))
+    (setf (gptel-runner-run-calls run)
+          (mapcar (lambda (record) (gptel-runner-store--restore-call run record))
+                  (plist-get data :chat-calls)))
     (gptel-runner-store--notice-id (gptel-runner-run-id run))
     (puthash (gptel-runner-run-id run) run gptel-runner--runs)
     (gptel-runner--emit run 'snapshot-loaded nil nil file)

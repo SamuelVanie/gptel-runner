@@ -2,6 +2,14 @@
 
 ## 0.1.0 - unreleased
 
+- Each agent node now uses an ordinary gptel conversation across turns.
+  Open it with `RET` in the dashboard. Save and reopen a named run with
+  `gptel-runner-save-session` and `gptel-runner-open-session`. Version 3
+  checkpoints include the node chats and preserve pending feedback. With the
+  companion gptel-agent session API, the runner uses its native chat records.
+  Background agents publish editable copies that link to the worker controls.
+  Existing version 2 checkpoints and background text transcripts still open.
+
 - Add a compact, collapsible dashboard tree and live background node panels
   with readable requests, direct controls, node navigation, and inline command
   status. Approve all displayed requests for one node in a single action, or

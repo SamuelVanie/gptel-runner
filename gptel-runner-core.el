@@ -20,12 +20,11 @@
 (declare-function gptel-runner--finalize-run "gptel-runner-flow")
 
 (defgroup gptel-runner nil
-  "Deterministic workflows over stateless agent calls."
+  "Deterministic workflows with per-node gptel conversations."
   :group 'applications)
 
 (defcustom gptel-runner-retain-worker-buffers t
-  "When non-nil, gptel worker transcripts survive terminal calls.
-Set this to nil to kill a worker buffer as soon as its call terminalizes."
+  "When non-nil, keep node chat buffers open after their run finishes."
   :type 'boolean
   :group 'gptel-runner)
 
@@ -63,6 +62,13 @@ deactivated, and to roll back a refused or failed admission attempt.")
 
 (defvar gptel-runner--next-id 0)
 
+(defvar gptel-runner--session-id
+  (substring (secure-hash 'sha256
+                          (format "%s %s %s %s" (system-name) (emacs-pid)
+                                  (current-time) (random)))
+             0 12)
+  "Process identifier used to keep saved run and call IDs distinct.")
+
 (defconst gptel-runner-terminal-states
   '(succeeded failed blocked stalled cancelled skipped)
   "States after which an object cannot transition again.")
@@ -85,7 +91,7 @@ deactivated, and to roll back a refused or failed admission attempt.")
 (cl-defstruct (gptel-runner-node
                (:constructor gptel-runner-node-create))
   "A node in a workflow definition."
-  id kind properties children)
+  id kind properties children generated-id-p)
 
 (cl-defstruct (gptel-runner-workflow
                (:constructor gptel-runner-workflow-create))
@@ -123,6 +129,7 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   "Runtime state for one workflow execution."
   id workflow goal workspace (state 'pending) blackboard node-states
   (node-outcomes (make-hash-table :test #'equal))
+  (chats (make-hash-table :test #'equal))
   iterations repeat-limits active-calls calls events budget driver queue
   (active-count 0)
   (writer-active 0) started-at finished-at terminal-data
@@ -312,7 +319,10 @@ status; request budgets, retry limits, and `:permanent' still apply.")
 
 (defun gptel-runner--id (prefix)
   "Return a new identifier beginning with PREFIX."
-  (format "%s-%d" prefix (cl-incf gptel-runner--next-id)))
+  (format "%s-%d" (if (member prefix '("run" "call"))
+                       (concat prefix "-" gptel-runner--session-id)
+                     prefix)
+          (cl-incf gptel-runner--next-id)))
 
 (defun gptel-runner--terminal-p (state)
   "Return non-nil when STATE is terminal."
@@ -551,8 +561,14 @@ When DELETE-SNAPSHOT is non-nil, also delete its durable snapshot file."
   (unless (gptel-runner--forgettable-run-p run)
     (user-error "Run %s is active; abort or pause it before removing it"
                 (gptel-runner-run-id run)))
+  (when (and (not delete-snapshot) (gptel-runner--persistent-p run)
+             (fboundp 'gptel-runner-store-flush-run))
+    (gptel-runner-store-flush-run run))
   (when (fboundp 'gptel-runner-store-cancel-save)
     (gptel-runner-store-cancel-save run))
+  ;; The last checkpoint already owns these chats.  Closing the buffers must
+  ;; not enqueue another save for a run that is leaving the registry.
+  (clrhash (gptel-runner-run-chats run))
   (dolist (call (gptel-runner-run-calls run))
     (when (buffer-live-p (gptel-runner-call-buffer call))
       (kill-buffer (gptel-runner-call-buffer call))

@@ -71,7 +71,7 @@ For binary files, use `gptel-runner-artifact-file' instead."
       (let ((root (expand-file-name gptel-runner-output-directory)))
         (make-directory root t)
         (set-file-modes root #o700)
-        ;; Session run IDs are not unique across Emacs processes.
+        ;; Allocate a private directory for this run’s published files.
         (setf (gptel-runner-run-output-directory run)
               (file-name-as-directory
                (make-temp-file (expand-file-name "run-" root) t))))))

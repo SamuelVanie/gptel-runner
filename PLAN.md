@@ -21,9 +21,8 @@ normal verification commands where applicable.
 - [x] Driver protocol and deterministic fake driver, including delayed/manual
   outcomes, transient errors, duplicate completions, and late callbacks.
 - [x] Generation-based retry/cancellation protection and request backoff.
-- [x] gptel compatibility adapter with private worker buffers, local presets,
-  non-streaming stateless requests, event bridging, abort integration, and
-  early API compatibility checks.
+- [x] gptel adapter with one editable chat per agent node, local presets,
+  streaming and non-streaming turns, tool approvals, and abort integration.
 - [ ] Validate the adapter against a live provider (opt-in; never part of CI).
 
 ## Workflow interpreter
@@ -45,14 +44,15 @@ normal verification commands where applicable.
   cleanup, configurable columns, and abort actions.
 - [x] Default-on, run-scoped decision memory with provenance, automatic
   downstream prompt propagation, snapshot persistence, and manual entry.
-- [x] Versioned atomic snapshots, pause/resume across Emacs sessions, restored
-  transcript buffers, in-buffer human feedback, and active-duration accounting.
+- [x] Versioned atomic sessions that restore workflow progress and editable
+  node chats, using native gptel-agent session records or saved gptel chats.
+  Pending human feedback and active-duration accounting survive reopening.
 - [x] Implement/review and fan-out/synthesis examples.
 - [x] Automated tests for core workflow behavior, budgets, retries,
   cancellation, output repair, stalls, parallel joins, and writer safety.
 - [x] Installation, API, safety, compatibility, and troubleshooting docs.
 - [ ] Dedicated human gate nodes, worktrees, enforced tool wrappers,
-  gptel-agent files, bounded dialogue, and streaming (post-v0.1).
+  gptel-agent files, and bounded dialogue (post-v0.1).
 - [ ] Add a start-time custom-input API, such as `:inputs', that initializes
   the run blackboard before the first node can dispatch.  Prompt functions
   will read these values with `gptel-runner-get`; arbitrary inputs will not

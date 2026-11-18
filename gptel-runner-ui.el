@@ -15,6 +15,11 @@
 
 (declare-function gptel-runner-save-run "gptel-runner-store")
 (declare-function gptel-runner-load-run "gptel-runner-store")
+(declare-function gptel-runner-list-snapshots "gptel-runner-store")
+(declare-function gptel-runner-store-session-title "gptel-runner-store")
+(defvar gptel-runner-snapshot-directory)
+(declare-function gptel-runner-call-chat-buffer "gptel-runner-store")
+(declare-function gptel-runner-node-buffer "gptel-runner-store")
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
 (declare-function gptel-runner-continue "gptel-runner-flow")
 (declare-function gptel-runner-extend "gptel-runner-flow")
@@ -493,8 +498,8 @@ An elided value retains its complete unpropertized text as hover help."
     (`(call ,_) (when-let* ((call (gptel-runner-ui--call-at-point)))
                   (gptel-runner-call-run call)))))
 
-(defun gptel-runner-ui--decision-context ()
-  "Return a (RUN . CALL) decision source for the current buffer, if any."
+(defun gptel-runner-ui--run-context ()
+  "Return (RUN . CALL) for the current node chat or dashboard row."
   (cond
    ((and (boundp 'gptel-runner--call)
          (gptel-runner-call-p gptel-runner--call))
@@ -525,7 +530,7 @@ From a runner worker, use the current call as provenance.  From the dashboard,
 use the selected run or call row.  Elsewhere, prompt for a session-local run.
 CALL may supply explicit provenance when this function is called from Lisp."
   (interactive
-   (let* ((context (gptel-runner-ui--decision-context))
+   (let* ((context (gptel-runner-ui--run-context))
           (run (or (car context) (gptel-runner-ui--read-run)))
           (text (read-string "Workflow decision: "))
           (rationale (read-string "Rationale (optional): ")))
@@ -549,10 +554,16 @@ CALL may supply explicit provenance when this function is called from Lisp."
   "Return non-nil when point represents a dashboard run or call."
   (and (gptel-runner-ui--run-at-point) t))
 
+(defun gptel-runner-ui--chat-available-p (call)
+  "Whether CALL has a live or saved conversation, without opening it."
+  (and call (not (gptel-runner--elisp-call-p call))
+       (or (buffer-live-p (gptel-runner-call-buffer call))
+           (gethash (gptel-runner-node-id (gptel-runner-call-node call))
+                    (gptel-runner-run-chats (gptel-runner-call-run call))))))
+
 (defun gptel-runner-ui--worker-at-point-p ()
-  "Return non-nil when point represents a call with a live worker buffer."
-  (let ((call (gptel-runner-ui--call-at-point)))
-    (and call (buffer-live-p (gptel-runner-call-buffer call)))))
+  "Return non-nil when the call at point has a live or saved chat."
+  (gptel-runner-ui--chat-available-p (gptel-runner-ui--call-at-point)))
 
 (defun gptel-runner-ui--pausable-call-at-point-p ()
   "Return non-nil when the call at point can be paused for feedback."
@@ -568,7 +579,7 @@ CALL may supply explicit provenance when this function is called from Lisp."
   (let ((call (gptel-runner-ui--call-at-point)))
     (and call
          (memq (gptel-runner-call-state call) '(paused waiting-feedback))
-         (buffer-live-p (gptel-runner-call-buffer call)))))
+         (gptel-runner-ui--chat-available-p call))))
 
 (defun gptel-runner-ui--abortable-call-at-point-p ()
   "Return non-nil when the call at point can be aborted."
@@ -673,8 +684,7 @@ CALL may supply explicit provenance when this function is called from Lisp."
       (display-buffer (current-buffer)))))
 
 (defun gptel-runner-dashboard-open-at-point ()
-  "Open the natural inspection target for the dashboard row at point.
-Visit a call's worker transcript, or inspect a run's event journal."
+  "Open the selected agent's chat or the run's event journal."
   (interactive)
   (unless (run-hook-with-args-until-success
            'gptel-runner-dashboard-row-action-functions
@@ -685,14 +695,34 @@ Visit a call's worker transcript, or inspect a run's event journal."
         (gptel-runner-dashboard-inspect-events)))))
 
 (defun gptel-runner-dashboard-visit-worker ()
-  "Visit the retained or active worker transcript for the call at point."
+  "Visit the live or saved node chat for the call at point."
   (interactive)
-  (let* ((call (or (gptel-runner-ui--call-at-point)
-                   (user-error "No call on this row")))
-         (buffer (gptel-runner-call-buffer call)))
-    (unless (buffer-live-p buffer)
-      (user-error "Call has no retained worker transcript"))
-    (pop-to-buffer buffer)))
+  (let ((call (or (gptel-runner-ui--call-at-point)
+                  (user-error "Select an agent node"))))
+    (pop-to-buffer (or (gptel-runner-call-chat-buffer call)
+                       (user-error "No chat was retained for this node")))))
+
+;;;###autoload
+(defun gptel-runner-visit-node-chat (run node)
+  "Visit NODE's conversation in RUN.
+From a node chat or dashboard row, use its run.  Elsewhere, read a run
+from the local session.  NODE may be a node object or its ID."
+  (interactive
+   (let* ((context (gptel-runner-ui--run-context))
+          (run (or (car context) (gptel-runner-ui--read-run)))
+          (nodes (delete-dups
+                  (cl-loop for call in (gptel-runner-run-calls run)
+                           when (gptel-runner-ui--chat-available-p call)
+                           collect (gptel-runner-call-node call))))
+          (choices (mapcar (lambda (node)
+                             (cons (format "%s" (gptel-runner-node-id node)) node))
+                           nodes)))
+     (unless choices (user-error "No agent has started a chat in this run"))
+     (list run (if (cdr choices)
+                   (cdr (assoc (completing-read "Node chat: " choices nil t) choices))
+                 (cdar choices)))))
+  (pop-to-buffer (or (gptel-runner-node-buffer run node)
+                     (user-error "No chat was retained for this node"))))
 
 (defun gptel-runner-dashboard-abort-call ()
   "Abort the unfinished call at point."
@@ -737,13 +767,18 @@ Visit a call's worker transcript, or inspect a run's event journal."
     (message "Paused %s; snapshot queued for %s"
              (gptel-runner-run-id run) file)))
 
-(defun gptel-runner-dashboard-save-run ()
-  "Save a snapshot of the run at point without pausing it."
+;;;###autoload
+(defun gptel-runner-save-session ()
+  "Save the current run and its chats without pausing execution.
+From a node chat or the dashboard, use the corresponding run.  Elsewhere,
+read a run from the current session."
   (interactive)
-  (let* ((run (or (gptel-runner-ui--run-at-point)
-                  (user-error "No run on this row")))
+  (let* ((run (or (car (gptel-runner-ui--run-context))
+                  (gptel-runner-ui--read-run)))
          (file (gptel-runner-save-run run)))
-    (message "Snapshot queued for %s" file)))
+    (message "Saving run %s to %s" (gptel-runner-run-id run) file)))
+
+(defalias 'gptel-runner-dashboard-save-run #'gptel-runner-save-session)
 
 (defun gptel-runner-dashboard-resume-run ()
   "Resume the paused run at point with optional human feedback."
@@ -827,11 +862,48 @@ The node is rerun in the current workflow state, even for a historical call."
     (revert-buffer)
     (message "Extended limits for %s" (gptel-runner-run-id run))))
 
-(defun gptel-runner-dashboard-load-snapshot (file)
-  "Load paused run from snapshot FILE into the dashboard."
-  (interactive "fSnapshot file: ")
-  (gptel-runner-load-run file)
-  (revert-buffer))
+(defun gptel-runner-ui--read-session (&optional browse)
+  "Choose a saved run by its description or, with BROWSE, by filename."
+  (require 'gptel-runner-store)
+  (let* ((files (unless browse (gptel-runner-list-snapshots)))
+         (choices
+          (mapcar (lambda (file)
+                    (let ((name (file-name-nondirectory file))
+                          (title (gptel-runner-store-session-title file)))
+                      (cons (if (equal name title) name (format "%s  [%s]" title name))
+                            file)))
+                  files))
+         (picked (and choices
+                      (completing-read
+                       "Open run session: " (append choices '(("Choose another file…")))
+                       nil t nil nil (caar choices)))))
+    (or (cdr (assoc picked choices))
+        (read-file-name "Session file: "
+                        (when (file-directory-p gptel-runner-snapshot-directory)
+                          gptel-runner-snapshot-directory)
+                        nil t))))
+
+;;;###autoload
+(defun gptel-runner-open-session (file)
+  "Open the run saved in FILE and select it in the dashboard.
+Interactively choose from saved sessions.  A prefix argument opens the
+file picker directly."
+  (interactive (list (gptel-runner-ui--read-session current-prefix-arg)))
+  (let ((run (or (cl-find-if
+                  (lambda (candidate)
+                    (when-let* ((saved (gptel-runner-run-snapshot-file candidate)))
+                      (file-equal-p file saved)))
+                  (gptel-runner-list-runs))
+                 (gptel-runner-load-run file))))
+    (if (derived-mode-p 'gptel-runner-dashboard-mode)
+        (gptel-runner-dashboard-refresh)
+      (gptel-runner-show-dashboard))
+    (goto-char (gptel-runner-dashboard--position-from-state
+                (list :id (list 'run (gptel-runner-run-id run))
+                      :line 1 :column 2)))
+    run))
+
+(defalias 'gptel-runner-dashboard-load-snapshot #'gptel-runner-open-session)
 
 (defun gptel-runner-dashboard-forget-run (&optional delete-snapshot)
   "Forget the run at point and remove its retained buffers.
@@ -885,7 +957,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
   [["Inspect"
     ("e" "Event journal" gptel-runner-dashboard-inspect-events
      :inapt-if-not gptel-runner-ui--run-at-point-p)
-    ("v" "Agent transcript" gptel-runner-dashboard-visit-worker
+    ("v" "Open node chat" gptel-runner-dashboard-visit-worker
      :inapt-if-not gptel-runner-ui--worker-at-point-p)]
    ["Call"
     ("p" "Pause for feedback" gptel-runner-dashboard-pause-call
@@ -897,7 +969,7 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
     ("k" "Abort call" gptel-runner-dashboard-abort-call
      :inapt-if-not gptel-runner-ui--abortable-call-at-point-p)]
    ["Run"
-    ("P" "Pause and snapshot" gptel-runner-dashboard-pause-run
+    ("P" "Pause and save" gptel-runner-dashboard-pause-run
      :inapt-if-not gptel-runner-ui--pausable-run-at-point-p)
     ("r" "Resume" gptel-runner-dashboard-resume-run
      :inapt-if-not gptel-runner-ui--resumable-run-at-point-p)
@@ -910,9 +982,9 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
     ("K" "Abort run" gptel-runner-dashboard-abort-run
      :inapt-if-not gptel-runner-ui--abortable-run-at-point-p)]]
   [["Persistence"
-    ("s" "Save snapshot" gptel-runner-dashboard-save-run
+    ("s" "Save run and chats" gptel-runner-dashboard-save-run
      :inapt-if-not gptel-runner-ui--persistable-run-at-point-p)
-    ("l" "Load snapshot" gptel-runner-dashboard-load-snapshot)]
+    ("l" "Open saved run" gptel-runner-dashboard-load-snapshot)]
    ["Manage"
     ("d" "Record decision" gptel-runner-add-decision
      :inapt-if-not gptel-runner-ui--run-at-point-p)

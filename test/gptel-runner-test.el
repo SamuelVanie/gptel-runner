@@ -2319,6 +2319,53 @@
                               'succeeded))))))
         (delete-directory snapshot-directory t)))))
 
+(ert-deftest gptel-runner-snapshot-reopens-redefined-generated-nodes ()
+  (gptel-runner-test--isolated
+    (let* ((gptel-runner-snapshot-directory (make-temp-file "runner-layout-" t))
+           (driver (gptel-runner-fake-driver-create))
+           (define (lambda ()
+                     (gptel-runner-defworkflow implicit-ids ()
+                       (gptel-runner-sequence
+                        (gptel-runner-elisp-step :id 'explicit :function #'ignore)
+                        (gptel-runner-branch
+                         :predicate #'always
+                         :then (gptel-runner-agent-step
+                                :agent 'reader :prompt "Inspect" :save-as 'result)))))))
+      (unwind-protect
+          (progn
+            (gptel-runner-register-agent 'reader :preset nil)
+            (funcall define)
+            (gptel-runner-fake-queue driver 'reader '(:manual t))
+            (let* ((run (gptel-runner-start 'implicit-ids :driver driver))
+                   (ids (gptel-runner-map-nodes #'gptel-runner-node-id run))
+                   (file (progn (gptel-runner-pause-run run)
+                                (gptel-runner-run-snapshot-file run))))
+              (gptel-runner-forget-run run)
+              (let* ((saved (gptel-runner-store--read-file file))
+                     (legacy (expand-file-name "legacy.el" gptel-runner-snapshot-directory))
+                     (mapping (plist-get (plist-get saved :run) :generated-node-ids)))
+                (should (equal (cdr mapping) (remq 'explicit (copy-sequence ids))))
+                (with-temp-file legacy
+                  (prin1 (plist-put (copy-sequence saved) :version 2) (current-buffer)))
+                (funcall define)
+                (let* ((fresh (gptel-runner-map-nodes #'gptel-runner-node-id 'implicit-ids))
+                       (restored (gptel-runner-load-run file nil driver)))
+                  (should-not (equal fresh ids))
+                  (should (equal (gptel-runner-map-nodes #'gptel-runner-node-id restored) ids))
+                  (gptel-runner-fake-queue driver 'reader '(:value "Resumed"))
+                  (gptel-runner-resume-run restored)
+                  (should (equal (gptel-runner-get restored 'result) "Resumed"))
+                  (should (eq (gptel-runner-node-state restored (car (last ids))) 'succeeded))
+                  (should (equal fresh (gptel-runner-map-nodes #'gptel-runner-node-id
+                                                             'implicit-ids)))
+                  (gptel-runner-forget-run restored))
+                ;; V2 checkpoints still use the original registered IDs.
+                (should-error (gptel-runner-load-run legacy nil driver) :type 'user-error)
+                (gptel-runner-defworkflow implicit-ids ()
+                  (gptel-runner-agent-step :agent 'reader :prompt "Changed layout"))
+                (should-error (gptel-runner-load-run file nil driver) :type 'user-error))))
+        (delete-directory gptel-runner-snapshot-directory t)))))
+
 (ert-deftest gptel-runner-extended-repeat-limit-survives-snapshot-load ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)

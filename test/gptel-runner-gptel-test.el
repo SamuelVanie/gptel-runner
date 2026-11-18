@@ -406,7 +406,7 @@
                            (alist-get 'TOOL gptel-request--handlers)
                            (list #'gptel--update-tool-ask))))
     (should (equal (alist-get 'DONE handlers)
-                   (list #'gptel-runner-gptel--done)))
+                   (list #'gptel--handle-post-insert #'gptel-runner-gptel--done)))
     (should (equal (alist-get 'ERRS handlers)
                    (list #'gptel-runner-gptel--error)))
     (should (equal (alist-get 'ABRT handlers)
@@ -526,9 +526,8 @@
                    (should (equal (buffer-local-value 'default-directory buffer)
                                   expected))
                    (with-current-buffer buffer
-                     (should (string-match-p
-                              (regexp-quote (concat "Workspace: " expected))
-                              (buffer-string))))))
+                     (should gptel-mode)
+                     (should-not (string-match-p "Runner call:" (buffer-string))))))
                calls (list node-directory directory))
               (should-not (eq (gptel-runner-call-buffer (car calls))
                               (gptel-runner-call-buffer (cadr calls))))
@@ -544,17 +543,18 @@
          (node (gptel-runner-node-create :id 'node))
          (call (gptel-runner-call-create
                 :id "call" :agent agent :run run :node node
-                :workspace default-directory))
+                :workspace default-directory :prompt "Inspect this node"))
          (buffer (gptel-runner-gptel--worker-buffer call)))
     (unwind-protect
         (progn
-          (should (string-prefix-p "*gptel-runner:" (buffer-name buffer)))
+          (should (string-prefix-p "*gptel:node*" (buffer-name buffer)))
           (should (eq (buffer-local-value 'gptel-runner--call buffer) call))
           (should (equal (buffer-local-value 'default-directory buffer)
                          default-directory))
           (with-current-buffer buffer
-            (should (string-match-p "Runner call: call" (buffer-string)))
-            (should (string-match-p "User prompt" (buffer-string)))))
+            (should gptel-mode)
+            (should (equal (buffer-string)
+                           (concat (gptel-prompt-prefix-string) "Inspect this node")))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gptel-runner-gptel-worker-renders-final-response ()
@@ -574,6 +574,129 @@
           (should (string-match-p "Inspect the project" (buffer-string)))
           (should (string-match-p "Visible answer" (buffer-string))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gptel-runner-gptel-repeated-node-continues-chat-before-draft ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'reviewer :preset nil)
+    (let* ((run (gptel-runner-start
+                 (gptel-runner-repeat-until
+                  :id 'loop :max 2
+                  :until (lambda (run) (equal (gptel-runner-get run 'answer) "Approved"))
+                  :body (gptel-runner-agent-step
+                         :id 'review :agent 'reviewer :save-as 'answer
+                         :prompt "Review this change"))
+                 :driver (gptel-runner-gptel-driver-create)))
+           (chat (gptel-runner-node-buffer run 'review))
+           (first (pop requests)))
+      (with-current-buffer chat
+        (should-error (gptel-send) :type 'user-error)
+        (goto-char (point-max))
+        (insert "Draft for a later discussion"))
+      (gptel-runner-gptel-test--reply first "Needs revision" "stop")
+      ;; An obsolete callback or FSM transition must leave the new turn alone.
+      (let ((info (gptel-fsm-info first)) (before (with-current-buffer chat (buffer-string))))
+        (funcall (plist-get info :callback) "Stale answer" info)
+        (gptel--fsm-transition first 'DONE)
+        (should (equal before (with-current-buffer chat (buffer-string)))))
+      (let* ((fsm (pop requests))
+             (data (plist-get (gptel-fsm-info fsm) :data))
+             (messages (append (plist-get data :messages) nil)))
+        (should (equal (mapcar (lambda (m) (plist-get m :content))
+                               (cl-remove-if
+                                (lambda (m) (equal (plist-get m :role) "system"))
+                                messages))
+                       '("Review this change" "Needs revision" "Review this change")))
+        (should (cl-every (lambda (call) (eq (gptel-runner-call-buffer call) chat))
+                          (gptel-runner-run-calls run)))
+        (with-current-buffer chat
+          (should-not (gptel-runner-gptel--last-response chat)))
+        (gptel-runner-gptel-test--reply fsm "Approved" "stop")
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (with-current-buffer chat
+          (should (string-suffix-p "Draft for a later discussion" (buffer-string))))))))
+
+(ert-deftest gptel-runner-gptel-queues-workflow-turn-during-ordinary-send ()
+  (dolist (end '(reply error abort kill))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'planner)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'plan :agent 'planner :prompt "Plan")
+                   :driver (gptel-runner-gptel-driver-create)))
+             (chat (gptel-runner-node-buffer run 'plan))
+             (first (pop requests))
+             manual)
+        (gptel-runner-gptel-test--reply first "First plan" "stop")
+        (with-current-buffer chat
+          (goto-char (point-max))
+          (insert "My follow-up")
+          (gptel-send)
+          (setq manual (pop requests)))
+        (gptel-runner-continue run "Plan again")
+        (should-not requests)
+        (should (= 1 (length (gptel-runner-run-queue run))))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (with-current-buffer chat
+          (add-hook 'gptel-post-response-functions
+                    (lambda (&rest _)
+                      (gptel-runner--drain-queue run)
+                      (should-not requests))
+                    nil t))
+        (pcase end
+          ('reply
+           (setf (plist-get (gptel-fsm-info manual) :callback) #'gptel--insert-response)
+           (gptel-runner-gptel-test--reply manual "Manual answer" "stop"))
+          ('error
+           (setf (plist-get (gptel-fsm-info manual) :error) "Offline")
+           (gptel--fsm-transition manual 'ERRS))
+          ('abort
+           (let ((gptel--request-alist (list (cons 'mock-process (cons manual #'ignore)))))
+             (gptel-abort chat)))
+          ('kill (kill-buffer chat)))
+        ;; The next dispatch runs after the terminal handlers or kill hooks.
+        (should-not requests)
+        (accept-process-output nil 0.02)
+        (should (= 1 (length requests)))
+        (let ((next (pop requests)))
+          (when (eq end 'reply)
+            (should (string-search "Manual answer"
+                                   (prin1-to-string (plist-get (gptel-fsm-info next) :data)))))
+          (gptel-runner-gptel-test--reply next "Second plan" "stop"))
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
+(ert-deftest gptel-runner-gptel-native-chat-round-trip ()
+  (gptel-runner-gptel-test--with-transport
+    (dolist (mode '(text-mode org-mode))
+      (let* ((gptel-default-mode mode)
+             (chat (gptel (generate-new-buffer-name "*runner round trip*") nil "My question"))
+             restored)
+        (unwind-protect
+            (with-current-buffer chat
+              (setq-local gptel-model 'runner-test)
+              (setq-local default-directory temporary-file-directory)
+              (setq-local gptel-confirm-tool-calls t)
+              (setq-local gptel-runner-gptel--submitted-end (point-marker))
+              (insert "\n\n" (propertize "The answer" 'gptel 'response) "\nUnsent draft")
+              (let* ((before (buffer-string))
+                     (text (gptel-runner-gptel-chat-text chat)))
+                (should (equal before (buffer-string)))
+                (setq restored (gptel-runner-gptel-chat-from-text text))
+                (with-current-buffer restored
+                  (should gptel-mode)
+                  (should (eq major-mode mode))
+                  (should (eq gptel-model 'runner-test))
+                  (should gptel-confirm-tool-calls)
+                  (should (equal default-directory (file-name-as-directory temporary-file-directory)))
+                  (when (eq mode 'org-mode)
+                    (with-temp-buffer
+                      (insert (gptel-runner-gptel-chat-text restored))
+                      (should (= (how-many "^:PROPERTIES:$" (point-min) (point-max)) 1))))
+                  (should (equal (gptel-runner-gptel--last-response restored) "The answer"))
+                  (should (string-suffix-p "Unsent draft" (buffer-string)))
+                  (should (equal (buffer-substring-no-properties
+                                  (- gptel-runner-gptel--submitted-end 11)
+                                  gptel-runner-gptel--submitted-end) "My question")))))
+          (kill-buffer chat)
+          (when (buffer-live-p restored) (kill-buffer restored)))))))
 
 (ert-deftest gptel-runner-gptel-direct-worker-abort-cancels-runner-only ()
   (let ((gptel-runner--agents (make-hash-table :test #'eq))
@@ -644,7 +767,7 @@
           (gptel-runner-pause-call call 'test)
           (should (eq (gptel-runner-call-state call) 'waiting-feedback))
           (with-current-buffer buffer
-            (should (string-match-p "Runner intervention" (buffer-string)))
+            (should-not (string-match-p "Runner intervention" (buffer-string)))
             (goto-char (point-max))
             (insert (propertize "guided answer" 'gptel 'response)))
           (gptel-runner-complete-call-from-buffer nil call)
@@ -668,9 +791,9 @@
           (gptel-runner-driver-await-feedback driver call)
           (should (zerop aborts))
           (with-current-buffer buffer
-            (should (string-match-p "Runner intervention" (buffer-string)))
+            (should-not (string-match-p "Runner intervention" (buffer-string)))
             (should (string-match-p
-                     "waiting for your feedback" (buffer-string)))))
+                     "Feedback" (nth 1 header-line-format)))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gptel-runner-gptel-confirmed-tool-resumes-call-and-fsm ()
@@ -836,10 +959,8 @@
         (gptel-runner-gptel-test--reply (pop requests) "Initial answer" "stop")
         (should (eq (gptel-runner-call-state call) 'waiting-feedback))
         (with-current-buffer (gptel-runner-call-buffer call)
-          (should (string-match-p "background dashboard" (buffer-string)))
-          (should (string-match-p "use Feedback" (buffer-string)))
-          (should (string-match-p "Use Accept" (buffer-string)))
-          (should-not (string-match-p "ordinary gptel commands" (buffer-string))))
+          (should (string-match-p "Feedback" (nth 1 header-line-format)))
+          (should-not (string-match-p "background dashboard" (buffer-string))))
         (gptel-runner-gptel-feedback call "Please check the cancellation path")
         (let ((fsm (pop requests)))
           (should fsm)

@@ -349,10 +349,11 @@ An interrupted or corrupt manifest does not hide other invocations."
 
 (defun gptel-runner-jobs--artifact-path (invocation relative)
   "Resolve RELATIVE inspection file within INVOCATION's directory."
-  (let* ((directory (file-name-as-directory (plist-get invocation :directory)))
-         (file (expand-file-name relative directory)))
+  (let* ((directory (file-name-as-directory
+                     (file-truename (plist-get invocation :directory))))
+         (file (file-truename (expand-file-name relative directory))))
     (unless (and (not (file-name-absolute-p relative))
-                 (file-in-directory-p file directory))
+                 (string-prefix-p directory file))
       (error "Inspection artifact escapes invocation directory"))
     file))
 
@@ -962,22 +963,25 @@ Opaque runtime objects and circular references are represented by type."
        (expand-file-name relative (plist-get gptel-runner-jobs--invocation :directory)) data)
       (puthash relative hash gptel-runner-jobs--exports))))
 
-(defun gptel-runner-jobs--export-transcript (call relative)
-  "Export CALL's transcript to RELATIVE when its text changes."
-  (let ((buffer (gptel-runner-call-buffer call)))
-    (when (buffer-live-p buffer)
-      (let* ((text (with-current-buffer buffer (buffer-substring-no-properties (point-min) (point-max))))
-             (hash (secure-hash 'sha256 text))
-             (file (expand-file-name relative (plist-get gptel-runner-jobs--invocation :directory))))
-        (unless (equal hash (gethash relative gptel-runner-jobs--exports))
-          (gptel-runner-jobs--mkdir (file-name-directory file))
-          (let ((temporary (make-temp-file (concat file ".tmp-"))))
-            (unwind-protect
-                (progn (set-file-modes temporary #o600)
-                       (write-region text nil temporary nil 'silent)
-                       (rename-file temporary file t))
-              (when (file-exists-p temporary) (delete-file temporary))))
-          (puthash relative hash gptel-runner-jobs--exports))))))
+(defun gptel-runner-jobs--export-chat (call epoch)
+  "Return the published session fields for CALL's node in EPOCH."
+  (when-let* ((node (gptel-runner-node-id (gptel-runner-call-node call)))
+              (chat (gethash node (gptel-runner-run-chats (gptel-runner-call-run call)))))
+    (let* ((relative (format "chats/%d-%s.chat" epoch
+                             (secure-hash 'sha256 (prin1-to-string node))))
+           (file (expand-file-name relative
+                                   (plist-get gptel-runner-jobs--invocation :directory)))
+           (stamp (if (buffer-live-p chat)
+                      (with-current-buffer chat
+                        (list chat (buffer-modified-tick) (point-min) (point-max)
+                              (point) (buffer-name)))
+                    chat))
+           (cached (gethash relative gptel-runner-jobs--exports)))
+      (unless (equal stamp (car cached))
+        (gptel-runner-jobs--mkdir (file-name-directory file))
+        (setq cached (cons stamp (gptel-runner-store-export-chat chat file)))
+        (puthash relative cached gptel-runner-jobs--exports))
+      (list :chat relative :chat-format (cdr cached)))))
 
 (defun gptel-runner-jobs--publish ()
   "Publish current worker inspection data and its compact manifest."
@@ -989,9 +993,15 @@ Opaque runtime objects and circular references are represented by type."
                       (lambda (call) (= (plist-get call :epoch) epoch))
                       (plist-get gptel-runner-jobs--invocation :calls)))
            calls outputs)
-      (dolist (call (gptel-runner-run-calls run))
+      ;; Preserve earlier rows under their owning epoch.  A worker might
+      ;; also have checkpointed a chat just before its first publication.
+      (dolist (call (cl-remove-if
+                     (lambda (c)
+                       (and (plist-get (gptel-runner-call-driver-data c) :restored)
+                            (cl-find (gptel-runner-call-id c) previous
+                                     :key (lambda (row) (plist-get row :id)) :test #'equal)))
+                     (gptel-runner-run-calls run)))
         (let* ((base (format "calls/%d-%s" epoch (gptel-runner-call-id call)))
-               (transcript (concat base ".txt"))
                (record (list :id (gptel-runner-call-id call) :epoch epoch
                              :node (gptel-runner-node-id (gptel-runner-call-node call))
                              :kind (gptel-runner-node-kind (gptel-runner-call-node call))
@@ -1005,15 +1015,14 @@ Opaque runtime objects and circular references are represented by type."
                              :started-at (gptel-runner-call-started-at call)
                              :finished-at (gptel-runner-call-finished-at call)
                              :attempts (gptel-runner-call-request-attempt call)
-                             :record (concat base ".el")
-                             :transcript (when (buffer-live-p (gptel-runner-call-buffer call)) transcript))))
+                             :record (concat base ".el"))))
+          (setq record (append record (gptel-runner-jobs--export-chat call epoch)))
           (gptel-runner-jobs--export-file
            (concat base ".el")
            (append record (list :prompt (gptel-runner-call-prompt call)
                                 :workspace (gptel-runner-call-workspace call)
                                 :result (gptel-runner-jobs--safe-value (gptel-runner-call-result call))
                                 :error (gptel-runner-jobs--safe-value (gptel-runner-call-error call)))))
-          (gptel-runner-jobs--export-transcript call transcript)
           (push record calls)))
       (setq outputs (gptel-runner-outputs run))
       (gptel-runner-jobs--export-file "outputs.el" outputs)

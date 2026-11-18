@@ -271,7 +271,8 @@
     (let* ((run (gptel-runner-start 'legacy-outcomes))
            (file (gptel-runner-outcome-test--save run))
            (snapshot (gptel-runner-store--read-file file)))
-      (setf (plist-get (plist-get snapshot :run) :node-outcomes) nil)
+      (setf (plist-get snapshot :version) 2
+            (plist-get (plist-get snapshot :run) :node-outcomes) nil)
       (with-temp-file file (prin1 snapshot (current-buffer)))
       (remhash (gptel-runner-run-id run) gptel-runner--runs)
       (let ((restored (gptel-runner-load-run file)))

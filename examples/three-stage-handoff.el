@@ -2,7 +2,7 @@
 
 ;;; Commentary:
 
-;; This example demonstrates an explicit, stateless handoff:
+;; This example demonstrates an explicit handoff between independent chats:
 ;;
 ;;   researcher -> planner -> human approval -> implementer
 ;;

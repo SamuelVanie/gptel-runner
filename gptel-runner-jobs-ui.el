@@ -30,7 +30,8 @@
 (declare-function gptel-runner-job-delete "gptel-runner-jobs")
 (declare-function gptel-runner-job-run "gptel-runner-jobs")
 (declare-function gptel-runner-job-command "gptel-runner-jobs")
-(declare-function gptel-runner-background-open "gptel-runner-jobs-panel")
+(autoload 'gptel-runner-background-open "gptel-runner-jobs-panel" nil t)
+(declare-function gptel-runner-store-open-chat "gptel-runner-store")
 
 (defvar gptel-runner-jobs-buffer "*gptel-runner jobs*"
   "Name of the background jobs dashboard.")
@@ -46,6 +47,9 @@
 
 (defvar-local gptel-runner-background--target nil
   "External invocation and call identity associated with this buffer.")
+
+(defvar-local gptel-runner-jobs-ui--chat-revision nil
+  "Source call, file and publication time of this local chat copy.")
 
 (defun gptel-runner-jobs-ui--elapsed (record)
   "Format elapsed time from an invocation or call RECORD."
@@ -117,9 +121,9 @@
     (when (memq (car-safe identity) '(background-run background-call))
       identity)))
 
-(defun gptel-runner-jobs-ui--selection ()
-  "Return fresh (INVOCATION CALL TARGET) data for the selected external row."
-  (let* ((target (or (gptel-runner-jobs-ui--target)
+(defun gptel-runner-jobs-ui--selection (&optional target)
+  "Return fresh (INVOCATION CALL TARGET) data for TARGET or the selected row."
+  (let* ((target (or target (gptel-runner-jobs-ui--target)
                      (user-error "Select a background run or call")))
          (run (or (gptel-runner-invocation-get (nth 1 target))
                   (user-error "Background invocation no longer exists")))
@@ -187,17 +191,61 @@
                 (lambda (&rest _ignored) (gptel-runner-background-commands)))
     (local-set-key (kbd "g") #'revert-buffer)))
 
-(defun gptel-runner-background-transcript ()
-  "Open the selected background call's persisted transcript read-only."
+(defconst gptel-runner-jobs-ui--controls-link
+  (propertize "Worker controls" 'face 'link 'mouse-face 'highlight
+              'help-echo "Review approvals or send feedback to the worker"
+              'local-map (define-keymap
+                           "<header-line> <mouse-1>"
+                           (lambda (event)
+                             (interactive "e")
+                             (select-window (posn-window (event-start event)))
+                             (gptel-runner-background-open))))
+  "Header link from a local chat copy to the worker that produced it.")
+
+(defun gptel-runner-background-transcript (&optional selection)
+  "Visit the selected background call's most recently saved chat.
+Edits and ordinary gptel sends belong to this local conversation.  Use
+`gptel-runner-background-feedback' to send feedback to the worker.
+Legacy text transcripts open read-only.  SELECTION defaults to the row
+at point."
   (interactive)
-  (pcase-let ((`(,run ,call ,target) (gptel-runner-jobs-ui--selection)))
+  (pcase-let ((`(,run ,call ,target) (or selection (gptel-runner-jobs-ui--selection))))
     (unless call (user-error "Select a background call"))
-    (let ((path (gptel-runner-jobs-ui--artifact-path
-                 run (plist-get call :transcript))))
-      (let ((enable-local-variables nil) (enable-local-eval nil))
-        (pop-to-buffer (find-file-noselect path)))
-      (read-only-mode 1)
-      (setq-local gptel-runner-background--target target))))
+    (if-let* ((chat (plist-get call :chat)))
+        (let* ((path (gptel-runner-jobs-ui--artifact-path run chat))
+               (revision (list target path
+                               (file-attribute-modification-time (file-attributes path))))
+               (existing (cl-find revision (buffer-list) :test #'equal
+                                  :key (lambda (buffer)
+                                         (buffer-local-value
+                                          'gptel-runner-jobs-ui--chat-revision buffer)))))
+          (pop-to-buffer
+           (or existing
+               (with-current-buffer
+                   (gptel-runner-store-open-chat path (plist-get call :chat-format))
+                 (setq-local gptel-runner-background--target target
+                             gptel-runner-jobs-ui--chat-revision revision
+                             header-line-format
+                             (list " Local chat copy · " gptel-runner-jobs-ui--controls-link
+                                   "    " header-line-format))
+                 (current-buffer)))))
+      (let ((path (gptel-runner-jobs-ui--artifact-path
+                   run (or (plist-get call :transcript)
+                           (user-error "This call has no saved chat"))))
+            (enable-local-variables nil) (enable-local-eval nil))
+        (pop-to-buffer (find-file-noselect path))
+        (read-only-mode 1)
+        (setq-local gptel-runner-background--target target)))))
+
+(defun gptel-runner-background-visit (&optional target)
+  "Visit TARGET's chat, or its controls when there is no chat.
+TARGET defaults to the selected background run or node."
+  (interactive)
+  (let* ((selection (gptel-runner-jobs-ui--selection target))
+         (call (nth 1 selection)))
+    (if (and call (or (plist-get call :chat) (plist-get call :transcript)))
+        (gptel-runner-background-transcript selection)
+      (gptel-runner-background-open (nth 2 selection)))))
 
 (defun gptel-runner-background-events ()
   "Open the persisted event journal for the selected invocation."
@@ -251,8 +299,6 @@ Approval and rejection open the node panel for review before submission."
            '(pause resume cancel retry continue extend extend-repeat decision
 		   pause-call cancel-call feedback accept approve reject revoke-outside)
            nil t))))
-  (when (memq operation '(approve reject))
-    (require 'gptel-runner-jobs-panel))
   (if (memq operation '(approve reject))
       (gptel-runner-background-open)
     (pcase-let* ((`(,run ,call ,_) (gptel-runner-jobs-ui--selection))
@@ -404,8 +450,9 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
   "Inspect and control the selected background invocation."
   [["Inspect"
     ("i" "Run/call details" gptel-runner-background-inspect)
+    ("w" "Worker controls" gptel-runner-background-open)
     ("e" "Event journal" gptel-runner-background-events)
-    ("v" "Transcript" gptel-runner-background-transcript)
+    ("v" "Open node chat" gptel-runner-background-transcript)
     ("o" "Saved outputs" gptel-runner-background-outputs)
     ("h" "Command receipts" gptel-runner-background-commands)
     ("A" "Artifact" gptel-runner-background-artifact)]
@@ -435,8 +482,7 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
   "Handle ACTION for external dashboard ROW and report whether handled."
   (when (gptel-runner-jobs-ui--target row)
     (pcase action
-      ('open (require 'gptel-runner-jobs-panel)
-             (gptel-runner-background-open) t)
+      ('open (gptel-runner-background-visit row) t)
       ('menu (call-interactively #'gptel-runner-background-menu) t))))
 
 (defun gptel-runner-jobs-ui--schedule (job)

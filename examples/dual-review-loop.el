@@ -6,8 +6,8 @@
 ;;
 ;;   writer -> (reviewer A || reviewer B) -> writer -> ...
 ;;
-;; Both independent reviewers must report PASS in the same iteration.  Every
-;; iteration uses fresh stateless calls, and the writer receives the previous
+;; Both independent reviewers must report PASS in the same iteration.  Each
+;; reviewer keeps its own chat, and the writer receives the previous
 ;; reviews explicitly through the run blackboard.
 ;;
 ;; Reviewers must begin their response with exactly one of:
@@ -17,7 +17,7 @@
 ;;
 ;; The strict parser signals an error when this protocol is missing.  Each
 ;; reviewer step enables `:repair-invalid t', so the runner makes one
-;; stateless format-repair call.  If that response is malformed too, the
+;; format-repair turn.  If that response is malformed too, the
 ;; workflow fails safely with `invalid-output'.
 
 ;;; Code:

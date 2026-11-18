@@ -14,23 +14,23 @@
 (require 'gptel-runner-core)
 (require 'gptel-runner-output)
 
-(defun gptel-runner--node-id (properties kind)
-  "Find an ID in PROPERTIES or make one based on KIND."
-  (or (plist-get properties :id)
-      (intern (gptel-runner--id (symbol-name kind)))))
+(defun gptel-runner--make-node (kind properties &optional children)
+  "Create a KIND node with PROPERTIES and CHILDREN, allocating an ID if needed."
+  (let ((id (plist-get properties :id)))
+    (gptel-runner-node-create
+     :kind kind :properties properties :children children :generated-id-p (null id)
+     :id (or id (intern (gptel-runner--id (symbol-name kind)))))))
 
 (defun gptel-runner-agent-step (&rest properties)
   "Return an agent node described by PROPERTIES.
-Required keys are `:id', `:agent', and `:prompt'.  `:save-as', `:retries',
-`:parser', `:validator', `:repair-invalid', `:pause-after', `:workspace',
-and `:context' customize its execution.  A non-nil `:pause-after' holds a
-successful response for human feedback before completing the node.
+Required keys are `:agent' and `:prompt'.  Optional `:id', `:save-as',
+`:retries', `:parser', `:validator', `:repair-invalid', `:pause-after',
+`:workspace', and `:context' customize its execution.  A non-nil `:pause-after'
+holds a successful response for human feedback before completing the node.
 `:workspace' selects an existing directory, relative to the run workspace
 or absolute.  Omitted or
 nil values inherit the workspace passed to `gptel-runner-start'."
-  (gptel-runner-node-create
-   :id (gptel-runner--node-id properties 'agent)
-   :kind 'agent :properties properties))
+  (gptel-runner--make-node 'agent properties))
 
 (defun gptel-runner-elisp-step (&rest properties)
   "Return an Elisp node described by PROPERTIES.
@@ -51,9 +51,7 @@ Errors and rejections fail the step; `:retries' permits additional attempts,
 including after timeout.  Pause stops work; resume starts a fresh attempt.
 Timers cannot preempt Lisp that does not yield to Emacs.
 Elisp steps consume concurrency slots but no agent-call or request budget."
-  (gptel-runner-node-create
-   :id (gptel-runner--node-id properties 'elisp)
-   :kind 'elisp :properties properties))
+  (gptel-runner--make-node 'elisp properties))
 
 (defun gptel-runner-sequence (&rest arguments)
   "Return a fail-fast sequence described by ARGUMENTS.
@@ -67,19 +65,15 @@ Leading keyword/value pairs set properties such as `:id' and inherited
     (when (and (plist-member properties :id)
                (null (plist-get properties :id)))
       (user-error "Sequence :id cannot be nil"))
-    (gptel-runner-node-create
-     :id (gptel-runner--node-id properties 'sequence)
-     :kind 'sequence :properties properties :children arguments)))
+    (gptel-runner--make-node 'sequence properties arguments)))
 
 (defun gptel-runner-branch (&rest properties)
   "Return a predicate branch described by PROPERTIES.
 Use `:predicate' (or `:if'), `:then', `:else', and optional `:id'.  A
 `:context' value is inherited by the selected subtree."
-  (gptel-runner-node-create
-   :id (gptel-runner--node-id properties 'branch)
-   :kind 'branch :properties properties
-   :children (delq nil (list (plist-get properties :then)
-                             (plist-get properties :else)))))
+  (gptel-runner--make-node
+   'branch properties (delq nil (list (plist-get properties :then)
+                                      (plist-get properties :else)))))
 
 (defun gptel-runner-repeat-until (&rest properties)
   "Return a bounded repeat node described by PROPERTIES.
@@ -87,10 +81,7 @@ The node requires `:body' and a positive `:max'.  `:until', `:stop-when', and
 `:progress-key' are functions accepting the current run.  `:collect-keys' and
 `:save-history-as' retain ordered per-iteration blackboard snapshots.
 `:context' is inherited by every agent call in the body."
-  (gptel-runner-node-create
-   :id (gptel-runner--node-id properties 'repeat)
-   :kind 'repeat :properties properties
-   :children (list (plist-get properties :body))))
+  (gptel-runner--make-node 'repeat properties (list (plist-get properties :body))))
 
 (defun gptel-runner-try (&rest properties)
   "Return a recovery node described by PROPERTIES.
@@ -106,12 +97,10 @@ successful body or handler value, never the cleanup value.
 Cancellation and run duration expiry stop execution immediately, including
 cleanup.  Pausing checkpoints the current phase for later resumption.
 Optional `:id' and inherited `:context' work as on other composite nodes."
-  (gptel-runner-node-create
-   :id (gptel-runner--node-id properties 'try)
-   :kind 'try :properties properties
-   :children (delq nil (list (plist-get properties :body)
-                             (plist-get properties :catch)
-                             (plist-get properties :finally)))))
+  (gptel-runner--make-node
+   'try properties (delq nil (list (plist-get properties :body)
+                                   (plist-get properties :catch)
+                                   (plist-get properties :finally)))))
 
 (defun gptel-runner-finalize (&rest properties)
   "Return a run finalization wrapper described by PROPERTIES.
@@ -126,11 +115,9 @@ The run retains the body's terminal outcome, even if finalization fails.
 Inspect `gptel-runner-finalization-outcome' for both outcomes and accounting.
 The terminal callback runs after finalization.  Pause/resume checkpoints the
 current phase.  Timers cannot preempt Lisp that does not yield to Emacs."
-  (gptel-runner-node-create
-   :id (gptel-runner--node-id properties 'finalize)
-   :kind 'finalize :properties properties
-   :children (list (plist-get properties :body)
-                   (plist-get properties :finally))))
+  (gptel-runner--make-node
+   'finalize properties (list (plist-get properties :body)
+                              (plist-get properties :finally))))
 
 (defun gptel-runner-finalization-outcome (run)
   "Return RUN's finalization record, or nil before its body finishes.
@@ -151,9 +138,57 @@ arguments are child nodes."
       (let ((key (pop arguments)))
         (unless arguments (error "Missing value for %S" key))
         (setq properties (plist-put properties key (pop arguments)))))
-    (gptel-runner-node-create
-     :id (gptel-runner--node-id properties 'parallel)
-     :kind 'parallel :properties properties :children arguments)))
+    (gptel-runner--make-node 'parallel properties arguments)))
+
+(defun gptel-runner--generated-node-ids (workflow)
+  "Return WORKFLOW's generated IDs and a digest of their layout, or nil."
+  (let (ids layout)
+    (dolist (node (gptel-runner-list-nodes workflow))
+      (let ((props (gptel-runner-node-properties node))
+            (generated (gptel-runner-node-generated-id-p node)))
+        (when generated (push (gptel-runner-node-id node) ids))
+        ;; Child counts delimit subtrees in preorder.  Named IDs and the
+        ;; presence of a catch distinguish otherwise identical subtree layouts.
+        (push (list (gptel-runner-node-kind node)
+                    (unless generated (gptel-runner-node-id node))
+                    (length (gptel-runner-node-children node))
+                    (and (plist-get props :catch) t)
+                    (plist-get props :agent) (plist-get props :save-as))
+              layout)))
+    (when ids
+      (let ((print-level nil) (print-length nil) (print-circle t))
+        (cons (secure-hash 'sha256 (prin1-to-string (nreverse layout)))
+              (nreverse ids))))))
+
+(defun gptel-runner--restore-node-ids (workflow saved)
+  "Resolve SAVED generated node IDs against WORKFLOW for this run only."
+  (if (null saved) workflow
+    (let ((current (gptel-runner--generated-node-ids workflow)))
+      (unless (and (proper-list-p saved) (equal (car saved) (car current))
+                   (= (length saved) (length current))
+                   (cl-every (lambda (id) (and id (symbolp id))) (cdr saved)))
+        (user-error "Generated nodes no longer match workflow %S"
+                    (gptel-runner-workflow-name workflow)))
+      (if (equal current saved) workflow
+        (let ((copy (copy-gptel-runner-workflow workflow))
+              (copies (make-hash-table :test #'eq))
+              (ids (cdr saved)))
+          (cl-labels
+              ((clone (node)
+                 (let ((new (copy-gptel-runner-node node)))
+                   (when (gptel-runner-node-generated-id-p node)
+                     (setf (gptel-runner-node-id new) (pop ids)))
+                   (setf (gptel-runner-node-children new)
+                         (mapcar #'clone (gptel-runner-node-children node)))
+                   ;; Composite nodes execute child references in their
+                   ;; plist as well as the public children list.
+                   (setf (gptel-runner-node-properties new)
+                         (cl-loop for (key value) on (gptel-runner-node-properties node)
+                                  by #'cddr append (list key (gethash value copies value))))
+                   (puthash node new copies))))
+            (setf (gptel-runner-workflow-root copy)
+                  (clone (gptel-runner-workflow-root workflow))))
+          copy)))))
 
 (defmacro gptel-runner-defworkflow (name options &rest body)
   "Define workflow NAME with OPTIONS and one node in BODY."
@@ -663,7 +698,7 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
       (error (cons nil (list :type 'invalid-output :error err))))))
 
 (defun gptel-runner--repair-prompt (run node value error-data)
-  "Build a stateless output repair prompt for RUN, NODE, VALUE, ERROR-DATA."
+  "Build an output repair prompt for RUN, NODE, VALUE, ERROR-DATA."
   (format
    (concat "Return only a corrected structured result for the previous call.\n"
            "Original goal: %s\nWorkspace: %s\nNode: %S\n"
@@ -674,7 +709,7 @@ Return (t . VALUE) on success or (nil . ERROR) on invalid output."
 
 (defun gptel-runner--empty-output-repair-prompt (run node original-prompt)
   "Build a one-shot repair prompt for an empty result from NODE in RUN.
-ORIGINAL-PROMPT is included because each repair call is stateless."
+Include ORIGINAL-PROMPT so the repair instructions identify the task."
   (format
    (concat "The previous call completed without a non-empty final answer, "
            "possibly after a tool call.\n"
@@ -2143,13 +2178,17 @@ for the extended run's next terminal transition."
          (parsed (gptel-runner--parse-agent-result agent node value)))
     (unless (car parsed)
       (user-error "Manual response is invalid: %S" (cdr parsed)))
-    (gptel-runner--finish-call call 'succeeded (cdr parsed))
+    (gptel-runner--finish-call call 'succeeded value)
     (when-let* ((key (plist-get (gptel-runner-node-properties node) :save-as)))
       (gptel-runner-put run key (cdr parsed)))
     (gptel-runner--set-node-state run node 'succeeded (cdr parsed))
-    (if (eq (gptel-runner-run-state run) 'paused)
+    ;; Parallel reviewers can both have finished answers waiting for a human.
+    ;; Restarting now would supersede the other reviewer's pending acceptance.
+    (if (and (eq (gptel-runner-run-state run) 'paused)
+             (not (cl-find 'waiting-feedback (gptel-runner-run-calls run)
+                           :key #'gptel-runner-call-state)))
         (gptel-runner-resume-run run)
-      (gptel-runner--checkpoint run))))
+      (gptel-runner--checkpoint run t))))
 
 (provide 'gptel-runner-flow)
 ;;; gptel-runner-flow.el ends here

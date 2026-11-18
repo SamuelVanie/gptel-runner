@@ -15,11 +15,21 @@
 (require 'text-property-search)
 (require 'gptel-runner-core)
 
+(declare-function gptel "gptel")
+(declare-function gptel-prompt-prefix-string "gptel-request")
+(declare-function gptel--save-state "gptel")
+(declare-function gptel--restore-state "gptel")
+(declare-function gptel--handle-post-insert "gptel")
+(autoload 'gptel-runner-node-buffer "gptel-runner-store")
+(autoload 'gptel-runner-call-chat-buffer "gptel-runner-store")
+(autoload 'gptel-runner-store-track-chat "gptel-runner-store")
 (declare-function gptel-request "gptel-request")
 (declare-function gptel-abort "gptel-request")
 (declare-function gptel-make-fsm "gptel-request")
 (declare-function gptel-fsm-info "gptel-request")
 (declare-function gptel-fsm-state "gptel-request")
+(declare-function gptel-fsm-handlers "gptel-request")
+(declare-function gptel--fsm-live-p "gptel")
 (declare-function gptel--fsm-transition "gptel-request")
 (declare-function gptel--handle-post "gptel-request")
 (declare-function gptel--apply-preset "gptel")
@@ -42,6 +52,12 @@
 (defvar gptel-confirm-tool-calls)
 (defvar gptel-default-mode)
 (defvar gptel-stream)
+(defvar gptel--fsm-last)
+(defvar gptel-response-separator)
+(defvar-local gptel-runner-gptel--submitted-end nil
+  "End of the last workflow prompt submitted in this node chat.")
+(defvar-local gptel-runner-gptel--manual-requests nil
+  "Ordinary gptel sends still using this node chat.")
 (defvar gptel-prompt-transform-functions)
 
 ;; Optional integration uses only public gptel-agent APIs.  Agent lifecycle
@@ -319,56 +335,197 @@ created by these tools are never included.  Every execution rechecks liveness."
       (gptel-runner-gptel--compatibility-error function)))
   t)
 
+(defun gptel-runner-gptel-submitted-end (buffer)
+  "Return the position after BUFFER's latest submitted workflow prompt."
+  (when-let* ((marker (buffer-local-value 'gptel-runner-gptel--submitted-end buffer)))
+    (marker-position marker)))
+
+(defun gptel-runner-gptel-restore-submitted-end (buffer position)
+  "Restore the latest submitted prompt boundary in BUFFER to POSITION."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (when (and (integerp position) (<= (point-min) position (point-max)))
+        (setq gptel-runner-gptel--submitted-end (copy-marker position))))))
+
+(defun gptel-runner-gptel--insert-turn (text)
+  "Insert workflow prompt TEXT before any unsent draft and leave point at its end."
+  (widen)
+  (goto-char (point-max))
+  (let* ((role (text-property-search-backward 'gptel nil nil))
+         (history (max (or gptel-runner-gptel--submitted-end (point-min))
+                       (if role (prop-match-end role) (point-min))))
+         (prefix (gptel-prompt-prefix-string)))
+    (goto-char history)
+    (unless (bobp)
+      (if (looking-at (regexp-quote gptel-response-separator))
+          (goto-char (match-end 0))
+        (insert gptel-response-separator)))
+    (if (looking-at (regexp-quote prefix))
+        (goto-char (match-end 0))
+      (insert prefix))
+    (insert (substring-no-properties (or text "")))
+    (setq gptel-runner-gptel--submitted-end (point-marker))
+    ;; The request parser rounds point to a word end.  Separate a pending
+    ;; draft so even a draft starting with a word never enters this request.
+    (unless (eobp) (save-excursion (insert "\n")))))
+
+(defun gptel-runner-gptel--node-chat-name (call)
+  "Return a human-readable buffer name for CALL's node conversation."
+  (let* ((workflow (gptel-runner-run-workflow (gptel-runner-call-run call)))
+         (name (and workflow (gptel-runner-workflow-name workflow)))
+         (id (gptel-runner-node-id (gptel-runner-call-node call))))
+    (format "*gptel:%s%s*" (if name (format "%s/" name) "") id)))
+
 (defun gptel-runner-gptel--worker-buffer (call)
-  "Return CALL's live worker buffer, creating it if necessary."
-  (or (and (buffer-live-p (gptel-runner-call-buffer call))
+  "Prepare CALL's turn in its node's ordinary gptel chat."
+  (or (and (plist-get (gptel-runner-call-driver-data call) :turn-started)
+           (buffer-live-p (gptel-runner-call-buffer call))
            (gptel-runner-call-buffer call))
-      (let ((buffer
-             (generate-new-buffer
-              (format "*gptel-runner:%s:%s:%s*"
-                      (gptel-runner-run-id (gptel-runner-call-run call))
-                      (gptel-runner-node-id (gptel-runner-call-node call))
-                      (gptel-runner-call-id call)))))
-        (setf (gptel-runner-call-buffer call) buffer)
+      (let* ((run (gptel-runner-call-run call))
+             (node (gptel-runner-call-node call))
+             (existing (and (gptel-runner-run-workflow run)
+                            (gptel-runner-node-buffer run node)))
+             (buffer (or existing
+                         (gptel (generate-new-buffer-name
+                                 (gptel-runner-gptel--node-chat-name call))))))
         (with-current-buffer buffer
-          (when (and (boundp 'gptel-default-mode)
-                     (symbolp gptel-default-mode)
-                     (fboundp gptel-default-mode))
-            (funcall gptel-default-mode))
-          (when (fboundp 'gptel-mode) (gptel-mode 1))
-          ;; Major-mode initialization clears buffer-local variables, so set
-          ;; runner identity and workspace only after the display modes.
           (setq-local default-directory (gptel-runner-call-workspace call))
-          (setq-local gptel-runner--call call)
-          (let ((inhibit-read-only t)
-                (run (gptel-runner-call-run call)))
-            (insert
-             (format
-              (concat "Runner call: %s\nRun: %s\nNode: %s\nAgent: %s\n"
-                      "Workspace: %s\n\nUser prompt\n===========\n\n%s\n")
-              (gptel-runner-call-id call)
-              (gptel-runner-run-id run)
-              (gptel-runner-node-id (gptel-runner-call-node call))
-              (gptel-runner-agent-name (gptel-runner-call-agent call))
-              (gptel-runner-call-workspace call)
-              (gptel-runner-call-prompt call)))
-            (goto-char (point-max))))
+          (unless existing
+            (gptel-runner-gptel--apply-preset-locally
+             (gptel-runner-agent-preset (gptel-runner-call-agent call))))
+          (gptel-runner-store-track-chat call buffer)
+          (gptel-runner-gptel--insert-turn (gptel-runner-call-prompt call))
+          (setf (gptel-runner-call-driver-data call)
+                (plist-put (gptel-runner-call-driver-data call) :turn-started t)))
         buffer)))
 
 (defun gptel-runner-gptel-restore-worker-buffer (call transcript)
-  "Restore CALL's human-readable worker buffer from TRANSCRIPT."
+  "Open legacy plain-text TRANSCRIPT as CALL's gptel chat."
   (gptel-runner-gptel--check-api)
-  (let ((buffer (gptel-runner-gptel--worker-buffer call)))
+  (let ((buffer (gptel (generate-new-buffer-name
+                        (gptel-runner-gptel--node-chat-name call))
+                       nil transcript)))
     (with-current-buffer buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert transcript)
-        (goto-char (point-max)))
-      (setq-local gptel-runner--call call)
       (setq-local default-directory (gptel-runner-call-workspace call))
       (gptel-runner-gptel--apply-preset-locally
-       (gptel-runner-agent-preset (gptel-runner-call-agent call))))
+       (gptel-runner-agent-preset (gptel-runner-call-agent call)))
+      (gptel-runner-store-track-chat call buffer))
     buffer))
+
+(defun gptel-runner-gptel-chat-text (buffer)
+  "Return BUFFER as a native gptel chat file, leaving its live text untouched."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (let ((mode (cond ((derived-mode-p 'org-mode) 'org)
+                        ((derived-mode-p 'markdown-mode) 'markdown)
+                        (t 'text)))
+            (submitted (gptel-runner-gptel-submitted-end buffer))
+            (workspace default-directory)
+            (confirmation gptel-confirm-tool-calls))
+        (with-temp-buffer
+          (if (eq mode 'org) (org-mode) (text-mode))
+          (dolist (setting '(gptel--preset gptel-backend gptel-model
+                             gptel-system-prompt gptel-tools gptel-max-tokens
+                             gptel-temperature gptel--num-messages-to-send))
+            (set (make-local-variable setting) (buffer-local-value setting buffer)))
+          (insert-buffer-substring buffer)
+          (when submitted (setq submitted (copy-marker submitted)))
+          ;; Start a separate locals block even when the user's draft itself
+          ;; contains an example of Emacs file-local variables.
+          (when (eq mode 'org) (gptel--save-state))
+          (goto-char (point-max))
+          (let ((footer (point)) (print-escape-newlines t))
+            (insert "\n;; Local Variables:\n;; mode: " (symbol-name mode) "\n;; End:\n")
+            (add-file-local-variable 'gptel-runner-directory workspace)
+            (add-file-local-variable 'gptel-confirm-tool-calls confirmation)
+            (when submitted
+              (add-file-local-variable 'gptel-runner-submitted-end
+                                       (marker-position submitted)))
+            (unless (eq mode 'org)
+              (save-restriction
+                (narrow-to-region footer (point-max))
+                (gptel--save-state))))
+          (buffer-substring-no-properties (point-min) (point-max)))))))
+
+(defun gptel-runner-gptel-chat-from-text (text)
+  "Open native chat TEXT in an independent, editable gptel buffer."
+  (gptel-runner-gptel--check-api)
+  (let (settings body)
+    (with-temp-buffer
+      (insert (substring-no-properties text))
+      (goto-char (point-max))
+      (unless (search-backward "\n;; Local Variables:\n" nil t)
+        (user-error "Missing gptel chat settings"))
+      (setq body (buffer-substring-no-properties (point-min) (point)))
+      (narrow-to-region (point) (point-max))
+      ;; Read the generated footer as data.  Never activate file/dir locals,
+      ;; modes, or eval forms supplied by the transcript.
+      ;; Emacs' file-locals scanner limits its search near the end of the
+      ;; file.  A long tool conversation can have many kilobytes of bounds.
+      (let ((read-circle nil))
+        (while (re-search-forward "^;; \\([^ :\n]+\\):[ \t]*" nil t)
+          (let ((key (intern-soft (match-string 1))))
+            (when (memq key '(mode gptel-runner-submitted-end gptel-runner-directory
+                              gptel-confirm-tool-calls gptel-model
+                              gptel--preset gptel--backend-name gptel-system-prompt
+                              gptel--tool-names gptel--bounds gptel-max-tokens
+                              gptel--num-messages-to-send gptel-temperature))
+              (push (cons key (read (current-buffer))) settings))))))
+    (let* ((gptel-default-mode
+            (pcase (alist-get 'mode settings)
+              ('org 'org-mode)
+              ('markdown (if (fboundp 'markdown-mode) 'markdown-mode 'text-mode))
+              (_ 'text-mode)))
+           (buffer (gptel (generate-new-buffer-name "*gptel-runner chat*") nil body)))
+      (condition-case err
+          (with-current-buffer buffer
+            (dolist (entry settings)
+              (when (pcase (car entry)
+                      ((or 'gptel-model 'gptel--preset) (symbolp (cdr entry)))
+                      ((or 'gptel--backend-name 'gptel-system-prompt) (stringp (cdr entry)))
+                      ('gptel--tool-names (and (proper-list-p (cdr entry))
+                                               (cl-every #'stringp (cdr entry))))
+                      ('gptel--bounds (proper-list-p (cdr entry)))
+                      ((or 'gptel-max-tokens 'gptel--num-messages-to-send) (natnump (cdr entry)))
+                      ('gptel-temperature (numberp (cdr entry))))
+                (set (make-local-variable (car entry)) (cdr entry))))
+            ;; The native restorer checks for a visited file.  This chat
+            ;; stays independent of the snapshot after restoration.
+            (let ((buffer-file-name "gptel chat")) (gptel--restore-state))
+            (when-let* ((workspace (alist-get 'gptel-runner-directory settings))
+                        ((stringp workspace)) ((file-name-absolute-p workspace)))
+              (setq-local default-directory (file-name-as-directory workspace)))
+            (when-let* ((entry (assq 'gptel-confirm-tool-calls settings))
+                        ((memq (cdr entry) '(auto t nil))))
+              (setq-local gptel-confirm-tool-calls (cdr entry)))
+            (gptel-runner-gptel-restore-submitted-end
+             buffer (alist-get 'gptel-runner-submitted-end settings))
+            (goto-char (point-max))
+            buffer)
+        (error (kill-buffer buffer) (signal (car err) (cdr err)))))))
+
+(defun gptel-runner-gptel-save-chat (source file)
+  "Atomically save a native gptel chat from SOURCE to FILE.
+SOURCE is a live buffer or text returned by `gptel-runner-gptel-chat-text'."
+  (let ((temporary (make-temp-file
+                    (expand-file-name ".chat-" (file-name-directory
+                                                (expand-file-name file)))))
+        (coding-system-for-write 'utf-8-unix))
+    (unwind-protect
+        (progn
+          (write-region (if (stringp source) source (gptel-runner-gptel-chat-text source))
+                        nil temporary nil 'silent)
+          (rename-file temporary file t)
+          file)
+      (when (file-exists-p temporary) (delete-file temporary)))))
+
+(defun gptel-runner-gptel-open-chat (file)
+  "Open native gptel chat FILE in an independent editable buffer."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8-unix)) (insert-file-contents file))
+    (gptel-runner-gptel-chat-from-text (buffer-string))))
 
 (defun gptel-runner-gptel--apply-preset-locally (preset)
   "Apply symbol or plist PRESET in the current worker buffer.
@@ -474,7 +631,7 @@ RAW is gptel's internal flag for already formatted transcript content."
   (gptel-runner-gptel--sync-interactions call))
 
 (defun gptel-runner-gptel--post-once (call fsm)
-  "Run gptel post-processing for CALL and FSM exactly once."
+  "Run gptel post-processing for a failed or cancelled CALL and FSM once."
   (unless (plist-get (gptel-runner-call-driver-data call) :posted)
     (setf (gptel-runner-call-driver-data call)
           (plist-put (gptel-runner-call-driver-data call) :posted t))
@@ -526,7 +683,6 @@ RAW is gptel's internal flag for already formatted transcript content."
          (value (mapconcat #'identity
                            (reverse (gptel-runner-call-response-parts call)) "")))
     (gptel-runner-gptel--update-status info " Ready" 'success)
-    (gptel-runner-gptel--post-once call fsm)
     (funcall (gptel-runner-gptel--complete-function call) 'success value nil)))
 
 (defun gptel-runner-gptel--error (fsm)
@@ -580,7 +736,7 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
     ;; Use the send transition table and tool handlers so pre/post-tool hooks,
     ;; request-local cleanup and steering retain gptel's normal ordering.
     ;; Response insertion and terminal completion remain owned by the runner.
-    (dolist (state '(TPRE TRET TSTR))
+    (dolist (state '(TYPE TPRE TRET TSTR))
       (setf (alist-get state handlers)
             (copy-sequence (alist-get state gptel-send--handlers))))
     (setf (alist-get 'WAIT handlers)
@@ -592,7 +748,8 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
                   (alist-get 'TOOL handlers)
                   (list #'gptel--update-tool-ask))
           (alist-get 'DONE handlers)
-          (list (or terminal-handler #'gptel-runner-gptel--done))
+          (list #'gptel--handle-post-insert
+                (or terminal-handler #'gptel-runner-gptel--done))
           (alist-get 'ERRS handlers)
           (list (or terminal-handler #'gptel-runner-gptel--error))
           (alist-get 'ABRT handlers)
@@ -600,13 +757,27 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
     (gptel-make-fsm :table table
                     :handlers handlers)))
 
-(defun gptel-runner-gptel--cleanup (call)
-  "Clean CALL's worker buffer unless retention is enabled."
-  (gptel-runner-gptel--stop-supervision call)
+(defun gptel-runner-gptel--retire-request (call)
+  "Disarm CALL's finished request before another turn can reuse this chat."
+  (when-let* ((fsm (gptel-runner-call-fsm call)))
+    ;; A late async tool result can advance its old FSM even after abort.
+    ;; Each runner FSM owns its handler table.  Keep its request data for
+    ;; inspection while preventing another send or insertion into the chat.
+    (dolist (entry (gptel-fsm-handlers fsm)) (setcdr entry nil))))
+
+(defun gptel-runner-gptel--release-chats (event)
+  "Release node chats after the run's terminal EVENT when retention is disabled."
   (when (and (not gptel-runner-retain-worker-buffers)
-             (buffer-live-p (gptel-runner-call-buffer call)))
-    (kill-buffer (gptel-runner-call-buffer call))
-    (setf (gptel-runner-call-buffer call) nil)))
+             (memq (gptel-runner-event-type event)
+                   '(run-completed run-failed run-blocked run-stalled run-cancelled)))
+    (when-let* ((run (gptel-runner-find-run (gptel-runner-event-run-id event))))
+      (dolist (call (gptel-runner-run-calls run))
+        (when-let* ((buffer (gptel-runner-call-buffer call))
+                    ((buffer-live-p buffer))
+                    ((eq (buffer-local-value 'gptel-runner--call buffer) call)))
+          (kill-buffer buffer))))))
+
+(add-hook 'gptel-runner-event-hook #'gptel-runner-gptel--release-chats)
 
 (cl-defmethod gptel-runner-driver-start
   ((_driver gptel-runner-gptel-driver) call complete observe)
@@ -621,9 +792,14 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
           (lambda (status &optional value metadata)
             (unless completed
               (setq completed t)
-              (funcall complete status value metadata)
-              (when (gptel-runner--call-terminal-p call)
-                (gptel-runner-gptel--cleanup call))))))
+              ;; Completing can synchronously dispatch the same node again.
+              ;; Its new turn must be able to claim this conversation.
+              (unless (and (eq status 'transient)
+                           (gptel-runner--retryable-p
+                            call (plist-get metadata :http-status) metadata))
+                (gptel-runner-gptel--stop-supervision call)
+                (gptel-runner-gptel--retire-request call))
+              (funcall complete status value metadata)))))
     (setf (gptel-runner-call-driver-data call)
           (plist-put (gptel-runner-call-driver-data call)
                      :complete wrapped))
@@ -639,8 +815,6 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
                                           :agent-supervision)))
               (gptel-agent-supervision-retry scope (gptel-runner-call-fsm call)))
             (gptel--fsm-transition (gptel-runner-call-fsm call) 'WAIT))
-        (gptel-runner-gptel--apply-preset-locally
-         (gptel-runner-agent-preset agent))
         (if (plist-get (gptel-runner-run-options
                         (gptel-runner-call-run call))
                        :allow-unconfirmed-tools)
@@ -651,17 +825,18 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
         (gptel-runner-gptel--start-supervision call)
         (let ((fsm (gptel-runner-gptel--make-fsm)))
           (setf (gptel-runner-call-fsm call) fsm)
-          (gptel-request
-              (gptel-runner-call-prompt call)
-            :buffer buffer :stream gptel-stream
-            :context call :schema schema :fsm fsm
-            :transforms gptel-prompt-transform-functions
-            :callback
-            (lambda (response info &optional raw)
-              (when (and (= generation (gptel-runner-call-generation call))
-                         (not (gptel-runner--call-terminal-p call)))
-                (gptel-runner-gptel--callback
-                 call observe response info raw)))))))))
+          (goto-char gptel-runner-gptel--submitted-end)
+          (let ((mark-active nil))
+            (gptel-request nil
+              :buffer buffer :stream gptel-stream
+              :context call :schema schema :fsm fsm
+              :transforms gptel-prompt-transform-functions
+              :callback
+              (lambda (response info &optional raw)
+                (when (and (= generation (gptel-runner-call-generation call))
+                           (not (gptel-runner--call-terminal-p call)))
+                  (gptel-runner-gptel--callback
+                   call observe response info raw))))))))))
 
 (cl-defmethod gptel-runner-driver-cancel
   ((_driver gptel-runner-gptel-driver) call)
@@ -677,7 +852,7 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
       ;; During retry backoff or confirmation there may be no process for
       ;; `gptel-abort' to find, so explicitly enter the same ABRT handler.
       (gptel--fsm-transition (gptel-runner-call-fsm call) 'ABRT))
-    (gptel-runner-gptel--cleanup call)))
+    (gptel-runner-gptel--retire-request call)))
 
 (cl-defmethod gptel-runner-driver-pause
   ((_driver gptel-runner-gptel-driver) call)
@@ -692,34 +867,20 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
                (not (eq (gptel-fsm-state (gptel-runner-call-fsm call))
                         'ABRT)))
       (gptel--fsm-transition (gptel-runner-call-fsm call) 'ABRT))
-    (gptel-runner-gptel--insert-feedback-instructions call)))
+    (gptel-runner-gptel--retire-request call)
+    (gptel-runner-gptel--show-feedback-status call)))
 
-(defun gptel-runner-gptel--insert-feedback-instructions (call)
-  "Append human-feedback instructions to CALL's retained worker buffer."
+(defun gptel-runner-gptel--show-feedback-status (call)
+  "Show the next action for paused CALL outside its conversation text."
   (when (buffer-live-p (gptel-runner-call-buffer call))
     (with-current-buffer (gptel-runner-call-buffer call)
-      (goto-char (point-max))
-      (let ((inhibit-read-only t))
-        (insert
-         (concat
-          "\n\nRunner intervention\n===================\n\n"
-          (if gptel-runner-headless
-              (concat
-               "This workflow call is waiting for your feedback.  Select "
-               "the call in the background dashboard and use Feedback to "
-               "request a revision.  Use Accept to return the latest or "
-               "your edited response to the workflow.\n")
-            (concat
-             "This workflow call is waiting for your feedback.  Add feedback "
-             "and continue with ordinary gptel commands in this buffer.  When "
-             "the response should be returned to the workflow, select it or "
-             "leave point after the latest response and run M-x "
-             "gptel-runner-complete-call-from-buffer.\n"))))))))
+      (gptel--update-status " Feedback · send a reply or M-x gptel-runner-complete-call-from-buffer"
+                            'warning))))
 
 (cl-defmethod gptel-runner-driver-await-feedback
   ((_driver gptel-runner-gptel-driver) call)
   "Make completed CALL's transcript available for human feedback."
-  (gptel-runner-gptel--insert-feedback-instructions call))
+  (gptel-runner-gptel--show-feedback-status call))
 
 (defun gptel-runner-gptel--last-response (buffer)
   "Return the last gptel response text found in BUFFER."
@@ -728,14 +889,16 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
       (goto-char (point-max))
       (when-let* ((match (text-property-search-backward
                          'gptel 'response t)))
-        (buffer-substring-no-properties
-         (prop-match-beginning match) (prop-match-end match))))))
+        (when (>= (prop-match-beginning match)
+                  (or gptel-runner-gptel--submitted-end (point-min)))
+          (buffer-substring-no-properties
+           (prop-match-beginning match) (prop-match-end match)))))))
 
 (defun gptel-runner-gptel--feedback-finished (call generation state fsm)
   "Finish CALL's feedback request at GENERATION in STATE using FSM."
   (unless (plist-get (gptel-fsm-info fsm) :runner-feedback-posted)
     (plist-put (gptel-fsm-info fsm) :runner-feedback-posted t)
-    (gptel--handle-post fsm))
+    (unless (eq state 'succeeded) (gptel--handle-post fsm)))
   (when (eq fsm (gptel-runner-call-fsm call))
     (setf (gptel-runner-call-driver-data call)
           (plist-put (gptel-runner-call-driver-data call) :feedback-active nil)))
@@ -744,8 +907,10 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
     (setf (gptel-runner-call-driver-data call)
           (plist-put (gptel-runner-call-driver-data call) :feedback-active nil))
     (gptel-runner-gptel--stop-supervision call)
+    (gptel-runner-gptel--retire-request call)
     (setf (gptel-runner-call-state call) 'waiting-feedback
           (gptel-runner-call-tool-names call) nil)
+    (gptel-runner-gptel--show-feedback-status call)
     (gptel-runner--deactivate-call call)
     (gptel-runner--emit
      (gptel-runner-call-run call)
@@ -763,7 +928,7 @@ still requires explicit acceptance using
 `gptel-runner-complete-call-from-buffer'."
   (unless (and (gptel-runner-call-p call)
                (memq (gptel-runner-call-state call) '(paused waiting-feedback))
-               (buffer-live-p (gptel-runner-call-buffer call)))
+               (gptel-runner-call-chat-buffer call))
     (user-error "Call is not available for feedback"))
   (unless (and (stringp text) (not (string-blank-p text)))
     (user-error "Feedback must be a non-empty string"))
@@ -795,24 +960,22 @@ still requires explicit acceptance using
                                 :observe observe)
                      :feedback-active t))
     (with-current-buffer (gptel-runner-call-buffer call)
-      (goto-char (point-max))
-      (let ((inhibit-read-only t))
-        (insert "\n\n" (substring-no-properties text) "\n"))
+      (gptel-runner-gptel--insert-turn text)
       (gptel-runner--emit (gptel-runner-call-run call) 'feedback-started
                           (gptel-runner-call-node call) call
                           (list :text text))
       (condition-case err
-          (progn
+          (let ((mark-active nil))
             (gptel-runner-gptel--start-supervision call)
-            (gptel-request
-           nil :buffer (current-buffer) :stream gptel-stream
-           :context call :fsm fsm
-           :transforms gptel-prompt-transform-functions
-           :callback
-           (lambda (response info &optional raw)
-             (when (and (= generation (gptel-runner-call-generation call))
-                        (not (gptel-runner--call-terminal-p call)))
-               (gptel-runner-gptel--callback call observe response info raw)))))
+            (gptel-request nil
+              :buffer (current-buffer) :stream gptel-stream
+              :context call :fsm fsm
+              :transforms gptel-prompt-transform-functions
+              :callback
+              (lambda (response info &optional raw)
+                (when (and (= generation (gptel-runner-call-generation call))
+                           (not (gptel-runner--call-terminal-p call)))
+                  (gptel-runner-gptel--callback call observe response info raw)))))
         (error
          (gptel-runner-gptel--stop-supervision call)
          (setf (gptel-runner-call-state call) 'waiting-feedback)
@@ -842,22 +1005,88 @@ node result and reconstructs the continuation from the workflow AST."
     (user-error "Call %s is not waiting for feedback" (gptel-runner-call-id call)))
   (when (plist-get (gptel-runner-call-driver-data call) :feedback-active)
     (user-error "Wait for the active feedback request before accepting"))
+  (when-let* ((buffer (gptel-runner-call-chat-buffer call)))
+    (with-current-buffer buffer
+      (when (or (cl-some #'gptel--fsm-live-p gptel-runner-gptel--manual-requests)
+                (and (not (eq gptel--fsm-last (gptel-runner-call-fsm call)))
+                     (gptel--fsm-live-p)))
+        (user-error "Wait for your gptel response before accepting"))))
   (setq result
         (or result
-            (and (buffer-live-p (gptel-runner-call-buffer call))
-                 (gptel-runner-gptel--last-response
-                  (gptel-runner-call-buffer call)))))
+            (when-let* ((buffer (gptel-runner-call-chat-buffer call)))
+              (gptel-runner-gptel--last-response buffer))))
   (unless (and (stringp result) (not (string-blank-p result)))
     (user-error "Select a response or continue the gptel conversation first"))
   (let* ((run (gptel-runner-call-run call))
          (resume-afterward (eq (gptel-runner-run-state run) 'paused)))
     (if (gptel-runner-call-on-complete call)
-        (gptel-runner--finish-call call 'succeeded result)
-      (gptel-runner--complete-restored-call call result))
-    (when (and resume-afterward
-               (eq (gptel-runner-run-state run) 'paused))
-      (gptel-runner-resume-run run)))
+        (progn
+          (gptel-runner--finish-call call 'succeeded result)
+          (when (and resume-afterward (eq (gptel-runner-run-state run) 'paused))
+            (gptel-runner-resume-run run)))
+      (gptel-runner--complete-restored-call call result)))
   call)
+
+(defun gptel-runner-gptel--before-send (&optional arg)
+  "Guard live node chats from duplicate sends, allowing menus and steering ARG."
+  (when (and (not (member arg '(0 (4)))) (gptel-runner-call-p gptel-runner--call)
+             (memq (gptel-runner-call-state gptel-runner--call)
+                   '(ready running retry-wait waiting-tool waiting-confirmation)))
+    (user-error "This node is running; pause it to send feedback")))
+
+(defun gptel-runner-gptel--wake-chat-queue ()
+  "Wake the chat's queued workflow turns after gptel or buffer cleanup."
+  (when-let* ((call gptel-runner--call)
+              (run (gptel-runner-call-run call))
+              ((gptel-runner-run-queue run)))
+    (run-at-time 0 nil #'gptel-runner--drain-queue run)))
+
+(defun gptel-runner-gptel--release-send (buffer fsm)
+  "Release FSM's reservation of BUFFER, then admit waiting workflow turns."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq gptel-runner-gptel--manual-requests (delq fsm gptel-runner-gptel--manual-requests))
+      (unless gptel-runner-gptel--manual-requests
+        (remove-hook 'kill-buffer-hook #'gptel-runner-gptel--wake-chat-queue t)
+        (when-let* ((call gptel-runner--call)
+                    (run (gptel-runner-call-run call))
+                    ((gptel-runner-run-queue run)))
+          (gptel-runner--drain-queue run))))))
+
+(defun gptel-runner-gptel--track-send (original &optional prompt &rest args)
+  "Track an ordinary send through ORIGINAL with PROMPT and ARGS in a node chat."
+  (let* ((buffer (or (plist-get args :buffer) (current-buffer)))
+         (fsm (plist-get args :fsm)))
+    (if (not (and (buffer-live-p buffer) (buffer-local-value 'gptel-runner--call buffer)
+                  fsm (eq (gptel-fsm-handlers fsm) gptel-send--handlers)
+                  (not (plist-get args :dry-run))))
+        (apply original prompt args)
+      (with-current-buffer buffer
+        (gptel-runner-gptel--before-send)
+        ;; Reserve the conversation before asynchronous prompt preparation.
+        (push fsm gptel-runner-gptel--manual-requests)
+        (add-hook 'kill-buffer-hook #'gptel-runner-gptel--wake-chat-queue nil t))
+      (condition-case err
+          (prog1 (apply original prompt args)
+            (if (gptel--fsm-live-p fsm)
+                (let* ((info (gptel-fsm-info fsm))
+                       ;; Keep the reservation until the terminal handlers unwind.
+                       (release (lambda (&rest _)
+                                  (run-at-time 0 nil #'gptel-runner-gptel--release-send buffer fsm))))
+                  (plist-put info :post (cons release (plist-get info :post))))
+              (gptel-runner-gptel--release-send buffer fsm)))
+        ((error quit)
+         (gptel-runner-gptel--release-send buffer fsm)
+         (signal (car err) (cdr err)))))))
+
+(defun gptel-runner-gptel--admit-chat (call)
+  "Admit CALL when its node chat is free of ordinary sends."
+  (let ((chat (gethash (gptel-runner-node-id (gptel-runner-call-node call))
+                       (gptel-runner-run-chats (gptel-runner-call-run call)))))
+    (not (and (buffer-live-p chat)
+              (buffer-local-value 'gptel-runner-gptel--manual-requests chat)))))
+
+(add-hook 'gptel-runner-call-admission-functions #'gptel-runner-gptel--admit-chat)
 
 (defun gptel-runner-gptel--around-abort (original &optional buffer)
   "Integrate ORIGINAL `gptel-abort' with runner worker BUFFER."
@@ -890,6 +1119,10 @@ RESPONSE and OVERLAY are the arguments accepted by
   "Install conditional runner integration around gptel commands."
   (interactive)
   (gptel-runner-gptel--check-api)
+  (unless (advice-member-p #'gptel-runner-gptel--before-send 'gptel-send)
+    (advice-add 'gptel-send :before #'gptel-runner-gptel--before-send))
+  (unless (advice-member-p #'gptel-runner-gptel--track-send 'gptel-request)
+    (advice-add 'gptel-request :around #'gptel-runner-gptel--track-send))
   (unless (advice-member-p #'gptel-runner-gptel--around-abort 'gptel-abort)
     (advice-add 'gptel-abort :around #'gptel-runner-gptel--around-abort))
   (unless (advice-member-p #'gptel-runner-gptel--around-accept-tool-calls

@@ -1,4 +1,4 @@
-;;; gptel-runner.el --- Deterministic stateless agent workflows -*- lexical-binding: t; -*-
+;;; gptel-runner.el --- Workflows over gptel conversations -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1") (gptel "0.9.9.6"))
@@ -6,7 +6,7 @@
 
 ;;; Commentary:
 
-;; gptel-runner schedules inspectable workflow ASTs over stateless agent calls
+;; gptel-runner schedules inspectable workflow ASTs over per-node gptel conversations
 ;; and synchronous Elisp steps with explicit outputs.
 ;; It provides sequence, branch, bounded repeat, and parallel nodes together
 ;; with budgets, retries, cancellation, durable snapshots, human feedback,

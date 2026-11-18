@@ -1,11 +1,15 @@
 # gptel-runner
 
-`gptel-runner` is a deterministic workflow engine for stateless Emacs AI
-agent calls and local Elisp steps, with durable checkpoints and inspectable
-results and agent transcripts.  It
-composes registered gptel presets into sequences,
-branches, bounded review loops, and parallel fan-out/synthesis workflows while
-keeping budgets, retries, cancellation, and terminal decisions in Emacs Lisp.
+`gptel-runner` runs Emacs workflows in which each agent node has an ordinary
+gptel chat. Open two parallel reviewers and you get two independent conversations.
+When the workflow returns to a reviewer, its next turn continues in the same
+buffer. Elisp coordinates the handoffs, budgets, approvals, and retries.
+
+Use `M-x gptel-runner-show-dashboard` and press `RET` on an agent row to open
+its chat. From there, `M-x gptel-runner-visit-node-chat` switches nodes.
+For a named workflow, `M-x gptel-runner-save-session` saves the whole run.
+After restarting Emacs, load the workflow definition and use
+`M-x gptel-runner-open-session` to choose it by workflow, date, or goal.
 
 The package requires Emacs 29.1 or newer and, for live calls, gptel 0.9.9.6 or
 newer.  Tests use the included fake driver and make no network requests.
@@ -42,7 +46,7 @@ Register agents after defining their gptel presets:
 See [examples/three-stage-handoff.el](examples/three-stage-handoff.el) for a
 linear researcher-to-planner-to-implementer handoff.  The
 [natural-language review loop](examples/natural-language-review-loop.el)
-shows fresh implementer/reviewer calls communicating through a minimal file
+shows implementer and reviewer nodes communicating through a minimal file
 without `gptel-runner-review`.  The
 [dual-review loop](examples/dual-review-loop.el) demonstrates a writer followed
 by two parallel independent reviewers, strict verdict parsing, automatic
@@ -84,6 +88,7 @@ throughout a pipeline; job definitions handle launching and scheduling.
 | Supply and read named data | `:inputs`, `gptel-runner-get` |
 | Save a step result or another value | `:save-as`, `gptel-runner-put` |
 | Inspect named values | `gptel-runner-outputs` (alist, including inputs and history) |
+| Open a local node’s chat | `gptel-runner-node-buffer` (run and node object or ID) |
 | Inspect a node | `gptel-runner-node-state`, `-outcome`, `-result`, `-error` |
 | Resolve a node's workspace | `gptel-runner-node-workspace` (node object or ID) |
 | Retain an existing file | `gptel-runner-publish-artifact` |
@@ -509,7 +514,7 @@ concurrently up to `:max-concurrency`.
 ### Starting context and artifacts
 
 Add `:context` at any workflow level to prepend stable project knowledge to
-the stateless prompt of each affected agent call.  A context value is one
+the next workflow prompt for each affected agent node.  A context value is one
 source or a list of sources.  Each source can be an inline string, a function
 of `(run node)` that returns a string (or nil to omit itself), or a file
 descriptor produced by `gptel-runner-context-file` or
@@ -616,7 +621,7 @@ The dashboard keeps its permanent keymap small:
 
 | Key | Dashboard action |
 | --- | --- |
-| `RET` / click | Open a background node panel; local calls open their transcript |
+| `RET` / click | Open the node chat or the controls for a background run |
 | `TAB` | Expand or collapse a run's nodes |
 | `?` | Open the dashboard action menu |
 | `g` | Refresh the dashboard |
@@ -677,21 +682,19 @@ explicitly chosen.  Programmatically use `gptel-runner-abort-call` and
 `gptel-runner-unregister-workflow`.  Every appended `gptel-runner-event` is
 also passed to `gptel-runner-event-hook`.
 
-Each gptel call has a visible buffer named
-`*gptel-runner:RUN:NODE:CALL*`.  It displays the exact prompt, reasoning when
-enabled by gptel, proposed tool calls and confirmation controls, tool results,
-and the final response.  These buffers are retained by default for human
-inspection but are not reused as agent memory.  Set
-`gptel-runner-retain-worker-buffers` to nil to remove them automatically when
-calls finish.  Events and runtime state remain authoritative; editing a
-transcript does not alter the run.
+Each agent node owns a gptel buffer named `*gptel:WORKFLOW/NODE*`. The buffer
+contains the prompt, assistant replies, and the tool and reasoning blocks
+enabled by your gptel settings. You can edit or continue the conversation
+with the usual gptel commands. An accepted workflow result changes when the
+runner completes a new turn or you explicitly accept a revision. Set
+`gptel-runner-retain-worker-buffers` to nil to close the buffers when the run
+finishes. Elisp and control-flow nodes have inspectable outcomes.
 
 ### Human feedback in an agent buffer
 
 Use `M-x gptel-runner-pause-call` in an active worker buffer, or select its
 dashboard row and choose `p` from the `?` action menu.  The provider request is
-stopped without failing the workflow node and the buffer becomes an ordinary
-gptel conversation.  Add your correction, use the normal gptel commands to
+stopped and the node waits for your input in its chat.  Add your correction, use the normal gptel commands to
 obtain a new response, then run
 `M-x gptel-runner-complete-call-from-buffer`.  An active region is used when
 present; otherwise the latest gptel response is returned to the workflow.  The
@@ -712,12 +715,12 @@ the latest gptel response, becomes the actual node result and releases the
 original workflow continuation.  Parsers and validators still apply to that
 accepted result.
 
-The call-level gate keeps the in-memory continuation alive.  For a named
-workflow, you can additionally choose `P` from the dashboard action menu to
-pause and snapshot the whole run; completing the retained call in the same
-Emacs session resumes the run.  A
-snapshot loaded in a later session has no retained transcript or continuation,
-so the unfinished gated node restarts statelessly on resume.
+For a named workflow, save the session while the gate is waiting. After
+reopening it, visit the node, revise the answer if needed, then run
+`gptel-runner-complete-call-from-buffer`. The runner validates the answer
+and continues from that node. If parallel reviewers are waiting for feedback,
+accept each saved answer before the workflow advances. Explicitly resuming
+the entire run starts fresh turns for unfinished nodes.
 
 ### Collecting loop history for a final summary
 
@@ -863,7 +866,7 @@ and repeat limits still apply.
 `:feedback` also works without `:from-node`, in which case it is included in
 the next dispatched agent prompt.  After restarting Emacs, load a saved run
 with `gptel-runner-load-run`, then use `gptel-runner-retry` with its run object
-and node ID; restored snapshots do not contain historical call rows.  Durable
+and node ID, or select the saved agent row in the dashboard.  Durable
 recovery requires enabling `:persist t` before leaving the original session.
 
 `gptel-runner-retry` deliberately rejects exhausted request, call, duration,
@@ -953,7 +956,7 @@ charged.  Use `:additional-requests`, `:additional-calls`, or
 An optional `:callback` is invoked at the extended run's next terminal state;
 the callback already invoked for the original failure is not called again.
 
-### Durable snapshots and overnight resume
+### Saving a session and resuming overnight
 
 Persistent runs must use a named workflow and stable explicit node IDs.  Add
 `:persist t` to the workflow defaults or start call:
@@ -1005,14 +1008,21 @@ After restarting Emacs, load the same workflow and agent definitions, then:
 
 Alternatively, choose `l` and then `r` from the dashboard action menu.
 
-Version 2 snapshots preserve execution state and current node outcomes: the
-goal, canonical workspace, blackboard, node states and outcome values, repeat
-iterations, budgets, and timing/options data.  Historical calls, event journals,
-and transcripts remain available for inspection in the original Emacs session
-but are not restored.
-The dashboard therefore has no historical call rows immediately after loading;
-new rows appear when an extended or resumed run dispatches calls.  An
-unfinished call restarts statelessly from its workflow node.
+Version 3 saves the node conversations and workflow progress together in one
+file. Opening it restores the run and its chat rows. A conversation becomes
+an editable buffer when you visit it. Loading a session makes no provider
+request. Chats saved with the companion gptel-agent checkout use its native
+session records, including assistant and tool boundaries, settings, and drafts.
+Load the updated `gptel-agent` package to use this integration. Plain gptel
+uses its own saved-chat format. The runner works independently of the global
+`gptel-agent-session-mode`. When you enable that mode, live node chats also
+appear in `M-x gptel-agent-sessions`. Use the runner’s session picker to
+reopen the workflow and its pending feedback together.
+
+Existing version 2 checkpoints still load with the workflow state, results,
+and budgets they originally recorded. Chat history is available from the
+first save made with the new version while those chats are present.
+
 Use `gptel-runner-node-result` to read a completed node's output after
 restoration, or keep using named blackboard entries with `:save-as`.
 All outcome values and blackboard entries in persistent runs must be readable
@@ -1167,14 +1177,18 @@ include the invocation and worker generation to avoid cross-process collisions.
 
 ### Inspect and control background work
 
-The dashboard displays external invocations alongside local runs.  Opening
-a background row shows a live run or node panel without restoring its
-checkpoint in your interactive Emacs.  A run panel links to its nodes; a node
-panel shows its task, result, transcript link, available controls, and pending
-tool requests with their arguments.  `n` and `p` move between nodes, `TAB`
-moves between buttons, and `q` returns to the dashboard.  Its action menu sends commands to the
-owning worker, including pause, resume, cancel, retry, continue, budget
-extensions, decisions, call feedback, and tool approval or rejection.
+The dashboard displays background invocations alongside local runs. Press
+`RET` on an agent node to open its published conversation. The header says
+**Local chat copy**. You can send follow-ups in this copy, and its edits stay
+in your Emacs. To revise the answer used by the workflow, follow **Worker
+controls** or use `? w` in the background dashboard. From there, **Feedback**
+asks the worker for a revision and **Accept** returns its answer to the
+workflow. Older invocations still open their saved text transcripts.
+
+A background run row opens its controls. The panel links to the node chats,
+shows pending tool requests, and sends actions to the owning worker.
+Use `n` and `p` to move between nodes, `TAB` to move between buttons, and
+`q` to return to the dashboard.
 
 Requests are grouped by node, including requests from its child conversations.
 Choose **Approve once** for an individual request, or **Approve all N pending**
@@ -1361,9 +1375,9 @@ and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/ar
 
 ## Semantics and safety
 
-- Calls are stateless.  Prompts must explicitly include the goal, workspace,
-  iteration, selected blackboard inputs, and prior findings.  Agents should
-  reinspect files instead of trusting earlier reports.
+- Each node has its own conversation for the lifetime of a run. Repeats,
+  semantic retries, and output repairs add turns to that conversation.
+  Pass results between nodes through the blackboard, artifacts, or prompts.
 - Decision memory is run-local and append-only.  A recorded decision is added
   to prompts resolved after it was saved.  It cannot alter an agent call that
   is already running; parallel branches should converge before a decision is
@@ -1393,12 +1407,11 @@ and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/ar
   and fails the node if those limits are exhausted.
   If it returns only `nil` or whitespace (for example, after ending on a tool
   call), the runner marks that call failed, asks the same agent once for a
-  stateless repaired answer, and fails the node immediately if that answer is
+  repaired answer, and fails the node immediately if that answer is
   also empty.  Downstream nodes never receive the empty value.
-- Runtime state is authoritative.  Compact snapshots are versioned execution
-  projections written at safe checkpoints; they do not preserve session audit
-  history, Lisp continuations, provider connections, timers, or external tool
-  processes.
+- Checkpoints preserve chat history and the workflow’s accepted results.
+  Active requests, approval callbacks, timers, and external tool processes
+  end with their owning Emacs session.
 
 ## Extension points
 

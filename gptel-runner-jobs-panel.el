@@ -109,8 +109,10 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
   "Insert inspection links and available controls for CALL in RUN."
   (let ((target (gptel-runner-panel--target run call)))
     (dolist (spec (append
-                  (when (plist-get call :transcript)
-                    '(("Transcript" . gptel-runner-background-transcript)))
+                  (cond ((plist-get call :chat)
+                         '(("Open node chat" . gptel-runner-background-transcript)))
+                        ((plist-get call :transcript)
+                         '(("Transcript" . gptel-runner-background-transcript))))
                   '(("Outputs" . gptel-runner-background-outputs)
                     ("Events" . gptel-runner-background-events)
                     ("More actions…" . gptel-runner-background-menu))))
@@ -281,7 +283,7 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
         (let ((target (gptel-runner-panel--target run item)))
           (gptel-runner-panel--button
            (format "Open %s" (plist-get item :node)) target
-           (lambda () (gptel-runner-background-open target)))
+           (lambda () (gptel-runner-background-visit target)))
           (insert (format " · %s · " (or (plist-get item :agent) "Elisp")))
           (insert (gptel-runner-ui--state (plist-get item :state)))
           (let ((count (length (gptel-runner-panel--interactions run item))))
