@@ -1509,14 +1509,32 @@ and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/ar
   expected to constrain their downstream work.
 - A writable workflow is rejected unless the start call includes
   `:allow-writes t`.  Writers sharing a canonical workspace are serialized.
-- `workspace-mode` is orchestration metadata, **not a security sandbox**.  Tool
-  lists and gptel confirmation policy remain the real capability boundary.
+- `workspace-mode` is orchestration metadata. Tool lists, argument policies
+  and gptel confirmations govern the tool calls a worker can submit.
   The runner does not create isolated worktrees or enforce read-only access;
   provision separate directories and tool restrictions as needed.
-- Tool confirmation remains enabled unless callers also explicitly request
-  `:allow-unconfirmed-tools t`.  Side-effecting tools should be idempotent:
-  transport retries have at-least-once semantics, and arbitrary asynchronous
-  tool effects cannot be rolled back generically.
+- Set `:allow-unconfirmed-tools t` in `gptel-runner-defworkflow` or in
+  `gptel-runner-start` to disable ordinary tool confirmations. With a version
+  of `gptel-agent` that supports supervised outside reads, the node and its
+  delegated workers and discussions can also use `Read`, `Glob`, `Grep`,
+  and `PathInfo` on local paths outside their working directories without
+  prompting. Outside edits and other file mutations still require approval.
+  Pass `:allow-unconfirmed-tools nil` at startup to override a workflow's
+  opt-in for one run.
+- A gptel preset can select a named gptel-agent argument policy with
+  `:agent-tool-policy 'mr-review`. Define the policy in trusted Emacs
+  configuration loaded by the worker. Its allow and deny rules apply even
+  with `:allow-unconfirmed-tools t`, including on a transport retry. A chat
+  checkpoint retains the policy names and their original workspace roots.
+  A node chat saved before its preset gained a policy resumes with its
+  saved settings. Start a new invocation to use the newly protected preset.
+  For tool-based completion the runner authorizes its own request's
+  `RunnerHandoff` tool. To permit follow-up questions, include
+  `RunnerAskPrevious` in the argument policy. Workflow-authored Lisp steps
+  execute as trusted code in the owning Emacs.
+- Side-effecting tools should be idempotent because transport retries have
+  at-least-once semantics and arbitrary asynchronous tool effects cannot be
+  rolled back generically.
 - Request retries reuse one logical call and consume request attempts.  An
   agent-step retry creates a new call.  An implementation revision is a new
   workflow iteration.  These are intentionally separate counters.

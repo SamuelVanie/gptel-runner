@@ -21,13 +21,13 @@
 (autoload 'gptel-runner-gptel-chat-from-text "gptel-runner-gptel")
 (autoload 'gptel-runner-gptel-save-chat "gptel-runner-gptel")
 (autoload 'gptel-runner-gptel-open-chat "gptel-runner-gptel")
+(autoload 'gptel-runner-gptel-protected-request "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-submitted-end "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-rendered-end "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-restore-submitted-end "gptel-runner-gptel")
 
 (declare-function gptel-agent-session-buffer-record "gptel-agent-session")
 (declare-function gptel-agent-session-buffer-from-record "gptel-agent-session")
-(declare-function gptel-agent-session-export-buffer "gptel-agent-session")
 (declare-function gptel-agent-session-write-record "gptel-agent-session")
 (declare-function gptel-agent-session-import-buffer "gptel-agent-session")
 
@@ -96,7 +96,10 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (defun gptel-runner-store--archive (buffer)
   "Capture BUFFER in its native chat format."
   (if (gptel-runner-store--agent-sessions-p)
-      (cons 'gptel-agent (gptel-agent-session-buffer-record buffer))
+      (cons 'gptel-agent
+            (if-let* ((fsm (gptel-runner-gptel-protected-request buffer)))
+                (gptel-agent-session-buffer-record buffer fsm)
+              (gptel-agent-session-buffer-record buffer)))
     (cons 'gptel (gptel-runner-gptel-chat-text buffer))))
 
 (defun gptel-runner-store--import-agent-chat (function data)
@@ -122,10 +125,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
      (gptel-agent-session-write-record record file)
      'gptel-agent)
     (`(gptel . ,text) (gptel-runner-gptel-save-chat text file) 'gptel)
-    (_ (if (gptel-runner-store--agent-sessions-p)
-           (progn (gptel-agent-session-export-buffer chat file) 'gptel-agent)
-         (gptel-runner-gptel-save-chat chat file)
-         'gptel))))
+    (_ (gptel-runner-store-export-chat (gptel-runner-store--archive chat) file))))
 
 (defun gptel-runner-store-open-chat (file format)
   "Open FILE in FORMAT as a fresh, independently editable chat."

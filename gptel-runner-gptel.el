@@ -66,6 +66,9 @@
 (defvar gptel--schema)
 (defvar gptel-agent-child-buffer-functions)
 (defvar gptel-agent-session-managed-externally)
+;; gptel ignores unknown preset keys.  Retain an explicitly selected policy
+;; even in a plain runner process so it cannot dispatch without enforcement.
+(defvar gptel-agent-tool-policy nil)
 ;; Set before gptel enables its major and minor modes, including when
 ;; gptel-agent is loaded later during an existing workflow.
 (put 'gptel-agent-session-managed-externally 'permanent-local t)
@@ -82,11 +85,16 @@
 ;; Optional integration uses only public gptel-agent APIs.  Agent lifecycle
 ;; objects and callbacks stay out of scheduler records and persisted jobs.
 (declare-function gptel-agent-supervise "gptel-agent-tools")
+(declare-function gptel-agent-supervision-allow-outside-reads "gptel-agent-tools" (scope fsm))
 (declare-function gptel-agent-supervision-stop "gptel-agent-tools")
 (declare-function gptel-agent-supervision-retry "gptel-agent-tools")
 (declare-function gptel-agent-supervision-request-live-p "gptel-agent-tools")
 (declare-function gptel-agent-allow-outside-access "gptel-agent-access")
 (declare-function gptel-agent-revoke-outside-access "gptel-agent-access")
+(declare-function gptel-agent-policy-request-trust-tool "gptel-agent-policy-request" (fsm tool))
+(declare-function gptel-agent-policy-buffer-ceiling "gptel-agent-policy" (&optional buffer))
+(declare-function gptel-agent-policy-inherit "gptel-agent-policy" (ceiling))
+(declare-function gptel-agent-policy-request-ceiling "gptel-agent-policy-request" (fsm))
 
 (cl-defstruct (gptel-runner-gptel-driver
                (:constructor gptel-runner-gptel-driver-create))
@@ -364,7 +372,7 @@ created by these tools are never included.  Every execution rechecks liveness."
          missing))
 
 (defun gptel-runner-gptel--start-supervision (call)
-  "Attach optional gptel-agent supervision to CALL's worker conversation."
+  "Return the gptel-agent supervisor for CALL, attaching one if available."
   (when (featurep 'gptel-agent-tools)
     (dolist (function '(gptel-agent-supervise gptel-agent-supervision-stop
                         gptel-agent-supervision-retry
@@ -395,7 +403,8 @@ created by these tools are never included.  Every execution rechecks liveness."
                     t)
                    (t
                     (setq gptel-runner-gptel--approval-owner (list call fsm scope))
-                    nil))))))))))
+                    nil))))))))
+    (plist-get (gptel-runner-call-driver-data call) :agent-supervision)))
 
 (defun gptel-runner-gptel--stop-supervision (call)
   "Release CALL's optional agent supervisor and pending approvals."
@@ -546,6 +555,15 @@ created by these tools are never included.  Every execution rechecks liveness."
       (gptel-runner-store-track-chat call buffer))
     buffer))
 
+(defun gptel-runner-gptel-protected-request (buffer)
+  "Return the protected workflow request owned by BUFFER, if any."
+  (when-let* (((fboundp 'gptel-agent-policy-request-ceiling))
+              (call (buffer-local-value 'gptel-runner--call buffer))
+              ((eq buffer (gptel-runner-call-buffer call)))
+              (fsm (gptel-runner-call-fsm call))
+              ((gptel-agent-policy-request-ceiling fsm)))
+    fsm))
+
 (defun gptel-runner-gptel-chat-text (buffer)
   "Return BUFFER as a native gptel chat file, leaving its live text untouched."
   (with-current-buffer buffer
@@ -557,7 +575,12 @@ created by these tools are never included.  Every execution rechecks liveness."
             (submitted (gptel-runner-gptel-submitted-end buffer))
             (rendered (gptel-runner-gptel-rendered-end buffer))
             (workspace default-directory)
-            (confirmation gptel-confirm-tool-calls))
+            (confirmation gptel-confirm-tool-calls)
+            (ceiling (and (fboundp 'gptel-agent-policy-buffer-ceiling)
+                          (cl-union (gptel-agent-policy-buffer-ceiling buffer)
+                                    (when-let* ((fsm (gptel-runner-gptel-protected-request buffer)))
+                                      (gptel-agent-policy-request-ceiling fsm))
+                                    :test #'equal))))
         (with-temp-buffer
           (if (eq mode 'org) (org-mode) (text-mode))
           (dolist (setting '(gptel--preset gptel-backend gptel-model
@@ -575,6 +598,8 @@ created by these tools are never included.  Every execution rechecks liveness."
             (insert "\n;; Local Variables:\n;; mode: " (symbol-name mode) "\n;; End:\n")
             (add-file-local-variable 'gptel-runner-directory workspace)
             (add-file-local-variable 'gptel-confirm-tool-calls confirmation)
+            (when ceiling
+              (add-file-local-variable 'gptel-runner-tool-policy-ceiling ceiling))
             (when submitted
               (add-file-local-variable 'gptel-runner-submitted-end
                                        (marker-position submitted)))
@@ -606,7 +631,7 @@ created by these tools are never included.  Every execution rechecks liveness."
         (while (re-search-forward "^;; \\([^ :\n]+\\):[ \t]*" nil t)
           (let ((key (intern-soft (match-string 1))))
             (when (memq key '(mode gptel-runner-submitted-end gptel-runner-rendered-end
-                              gptel-runner-directory
+                              gptel-runner-directory gptel-runner-tool-policy-ceiling
                               gptel-confirm-tool-calls gptel-model
                               gptel--preset gptel--backend-name gptel-system-prompt
                               gptel--tool-names gptel--bounds gptel-max-tokens
@@ -636,6 +661,10 @@ created by these tools are never included.  Every execution rechecks liveness."
             (when-let* ((workspace (alist-get 'gptel-runner-directory settings))
                         ((stringp workspace)) ((file-name-absolute-p workspace)))
               (setq-local default-directory (file-name-as-directory workspace)))
+            (when-let* ((ceiling (alist-get 'gptel-runner-tool-policy-ceiling settings)))
+              (unless (require 'gptel-agent-policy-request nil t)
+                (user-error "Install gptel-agent with tool policy support to restore this chat"))
+              (gptel-agent-policy-inherit ceiling))
             (when-let* ((entry (assq 'gptel-confirm-tool-calls settings))
                         ((memq (cdr entry) '(auto t nil))))
               (setq-local gptel-confirm-tool-calls (cdr entry)))
@@ -678,6 +707,9 @@ preset setter is private and has changed across releases."
       (gptel-runner-gptel--compatibility-error 'gptel--apply-preset))
     (gptel--apply-preset
      preset (lambda (symbol value)
+              (when (and (eq symbol 'gptel-agent-tool-policy) value
+                         (not (require 'gptel-agent-policy-request nil t)))
+                (user-error "This preset requires gptel-agent tool policy support"))
               (set (make-local-variable symbol) value))))
    (t (gptel-runner-gptel--compatibility-error 'preset-shape))))
 
@@ -750,6 +782,9 @@ preset setter is private and has changed across releases."
   "Add private pipeline tools and their instructions to FSM's prompt buffer."
   (let* ((info (gptel-fsm-info fsm))
          (call (plist-get info :context))
+         (handoff (gptel-runner-gptel--communication-tool
+                   fsm "RunnerHandoff" "message"
+                   "Deliver your complete final answer to the workflow." 'success))
          (previous (gptel-runner-previous-agent (gptel-runner-call-run call)
                                                 (gptel-runner-call-node call)))
          (directive (gptel--parse-directive gptel-system-prompt 'raw))
@@ -767,11 +802,12 @@ preset setter is private and has changed across releases."
                   (when schema
                     (concat " Encode the handoff message as JSON with this shape: "
                             (if (stringp schema) schema (json-encode schema)))))))
+    ;; Only this turn's private completion closure can deliver its result.
+    (when (fboundp 'gptel-agent-policy-request-trust-tool)
+      (gptel-agent-policy-request-trust-tool fsm handoff))
     (setq-local gptel-tools
                 (append
-                 (list (gptel-runner-gptel--communication-tool
-                        fsm "RunnerHandoff" "message"
-                        "Deliver your complete final answer to the workflow." 'success))
+                 (list handoff)
                  (when previous
                    (list (gptel-runner-gptel--communication-tool
                           fsm "RunnerAskPrevious" "question"
@@ -786,10 +822,25 @@ preset setter is private and has changed across releases."
                       (cdr directive)))))
 
 (defun gptel-runner-gptel--before-realize-query (fsm)
-  "Apply the host communication policy to FSM after all prompt transforms."
+  "Apply the workflow's tool policy to FSM after all prompt transforms."
   (let* ((info (gptel-fsm-info fsm))
          (call (plist-get info :context))
          (source (plist-get info :buffer)))
+    (when (and (gptel-runner-call-p call)
+               (not (featurep 'gptel-agent-policy-request))
+               (or (buffer-local-value 'gptel-agent-tool-policy source)
+                   (buffer-local-value 'gptel-agent-tool-policy (plist-get info :data))))
+      (user-error "Load gptel-agent tool policy support for this protected request"))
+    ;; Presets can replace the transform that normally registers the request
+    ;; with gptel-agent.  Attach the finalized root request in either case.
+    (when-let* (((gptel-runner-call-p call))
+                ((eq fsm (gptel-runner-call-fsm call)))
+                ((eq (gptel-runner-call-state call) 'running))
+                ((plist-get (gptel-runner-run-options (gptel-runner-call-run call))
+                            :allow-unconfirmed-tools))
+                ((fboundp 'gptel-agent-supervision-allow-outside-reads))
+                (scope (gptel-runner-gptel--start-supervision call)))
+      (gptel-agent-supervision-allow-outside-reads scope fsm))
     (cond
      ((and (gptel-runner-call-p call)
            (eq fsm (plist-get (gptel-runner-call-driver-data call) :discussion-fsm)))

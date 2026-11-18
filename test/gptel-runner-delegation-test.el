@@ -7,6 +7,10 @@
 
 (defvar gptel-runner-delegation-test--stream nil)
 (defvar gptel-runner-delegation-test--completion 'response)
+(defvar gptel-runner-delegation-test--start-arguments nil)
+(defvar gptel-runner-delegation-test--tool-names '("Agent" "Discussion" "DiscussionControl"))
+(defvar gptel-runner-delegation-test--prompt-transforms
+  '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize))
 
 (defmacro gptel-runner-delegation-test--with-run (&rest body)
   "Run BODY using real runner and agent handlers with queued transport."
@@ -26,11 +30,10 @@
             (gptel-pre-response-hook nil)
             (gptel-pre-tool-call-functions nil)
             (gptel-post-tool-call-functions nil)
-            (gptel-prompt-transform-functions
-             '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize))
+            (gptel-prompt-transform-functions gptel-runner-delegation-test--prompt-transforms)
             executions interactions
             (gptel-tools
-             (append (mapcar #'gptel-get-tool '("Agent" "Discussion" "DiscussionControl"))
+             (append (mapcar #'gptel-get-tool gptel-runner-delegation-test--tool-names)
                      (list (gptel-make-tool
                             :name "delegation_probe" :description "Record execution context."
                             :args nil :include t :confirm t
@@ -43,11 +46,12 @@
             (initial-buffers (buffer-list)))
        (gptel-runner-register-agent 'coordinator :preset nil)
        (let* ((pipeline
-               (gptel-runner-start
-                (gptel-runner-agent-step :id 'coordinate :agent 'coordinator
-                                         :prompt "Investigate together"
-                                         :completion gptel-runner-delegation-test--completion)
-                :driver (gptel-runner-gptel-driver-create)))
+               (apply #'gptel-runner-start
+                      (gptel-runner-agent-step :id 'coordinate :agent 'coordinator
+                                               :prompt "Investigate together"
+                                               :completion gptel-runner-delegation-test--completion)
+                      :driver (gptel-runner-gptel-driver-create)
+                      gptel-runner-delegation-test--start-arguments))
               (call (car (gptel-runner-run-calls pipeline)))
               (fsm (gptel-runner-call-fsm call))
               (parent (gptel-runner-call-buffer call)))
@@ -73,6 +77,75 @@
 (defun gptel-runner-delegation-test--answer (fsm text)
   "Finish FSM's current response with TEXT."
   (gptel-runner-gptel-test--reply fsm text "stop"))
+
+(ert-deftest gptel-runner-delegation-policy-survives-unconfirmed-retry-and-handoff ()
+  (gptel-runner-gptel-test--with-transport
+    (let* ((gptel-default-mode 'text-mode)
+           (gptel-agent-use-project-instructions nil)
+           executions
+           (tool (gptel-make-tool
+                  :name "runner_policy_probe" :description "Record the input."
+                  :args '((:name "value" :type string :description "Input"))
+                  :function (lambda (value) (push value executions) value)))
+           (gptel-tools (list tool)))
+      (gptel-agent-define-tool-policy 'runner-test-guard
+        :allow '((:tool "runner_policy_probe" :args (:value "allowed"))))
+      (gptel-runner-register-agent 'guarded :preset '(:agent-tool-policy runner-test-guard))
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'review :agent 'guarded :prompt "Inspect")
+                   :allow-unconfirmed-tools t :driver (gptel-runner-gptel-driver-create)))
+             (call (car (gptel-runner-run-calls run)))
+             (fsm (pop requests))
+             (info (gptel-fsm-info fsm))
+             (buffer (gptel-runner-call-buffer call)))
+        (should (gptel-agent-policy-request-ceiling fsm))
+        ;; A temporary transport failure resumes the original request even
+        ;; after its source configuration has been changed.
+        (with-current-buffer buffer (setq-local gptel-agent-tool-policy nil))
+        (gptel-runner-gptel-test--reply fsm "Checking" "tool_calls")
+        (should (eq (gptel-runner-call-state call) 'retry-wait))
+        (gptel-runner-gptel-test--retry call)
+        (should (eq fsm (pop requests)))
+        (dolist (value '("blocked" "allowed"))
+          (gptel-runner-delegation-test--tool fsm "runner_policy_probe" (list :value value))
+          (should (eq fsm (pop requests))))
+        (should (equal executions '("allowed")))
+        ;; Both archive formats retain this request's ceiling, including
+        ;; the policy removed from the live buffer after dispatch.
+        (dolist (copy (list (gptel-runner-gptel-chat-from-text
+                             (gptel-runner-gptel-chat-text buffer))
+                            (gptel-agent-session-buffer-from-record
+                             (cdr (gptel-runner-store--archive buffer)) t)))
+          (unwind-protect
+              (with-current-buffer copy
+                (should (equal (gptel-agent-policy-request-ceiling fsm)
+                               (gptel-agent-policy-buffer-ceiling copy)))
+                (let ((restored (gptel-request "Check again" :buffer copy :transforms nil
+                                               :callback #'ignore :stream nil)))
+                  (should (eq restored (pop requests)))
+                  (should (member "runner_policy_probe"
+                                  (mapcar #'gptel-tool-name (plist-get (gptel-fsm-info restored) :tools))))
+                  (gptel-runner-delegation-test--tool restored "runner_policy_probe"
+                                                     '(:value "blocked after restore"))
+                  (should (eq restored (pop requests)))
+                  (should (equal executions '("allowed")))
+                  (gptel-runner-delegation-test--answer restored "Done")))
+            (kill-buffer copy)))
+        (let* ((real-tools (plist-get info :tools))
+               (fake (gptel--make-tool
+                      :name "RunnerHandoff" :category "gptel-runner"
+                      :args '((:name "message" :type string :description "Result"))
+                      :function (lambda (message) (push message executions)))))
+          (unwind-protect
+              (progn
+                (plist-put info :tools (list fake))
+                (gptel-runner-delegation-test--tool fsm "RunnerHandoff" '(:message "impostor"))
+                (should (eq fsm (pop requests)))
+                (should (equal executions '("allowed"))))
+            (plist-put info :tools real-tools)))
+        (gptel-runner-gptel-test--handoff fsm "Finished")
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal (gptel-runner-call-result call) "Finished"))))))
 
 (defun gptel-runner-delegation-test--agent (fsm &optional background)
   "Spawn a worker from FSM, optionally in BACKGROUND."
@@ -302,6 +375,54 @@
              call (list (plist-get (car interactions) :id)) t)
             (gptel-runner-pause-call call)
             (should-not (buffer-local-value 'gptel-agent-access--grant parent))))
+      (delete-file outside))))
+
+(ert-deftest gptel-runner-delegation-unconfirmed-outside-reads ()
+  (let ((outside (make-temp-file "runner-outside-" nil ".txt" "External evidence"))
+        (gptel-runner-delegation-test--tool-names '("Agent" "Discussion" "Read"))
+        (gptel-runner-delegation-test--start-arguments '(:allow-unconfirmed-tools t)))
+    (unwind-protect
+        (gptel-runner-delegation-test--with-run
+          (let* ((worker (gptel-runner-delegation-test--agent fsm t))
+                 (discussion (gptel-runner-delegation-test--discussion fsm)))
+            (dolist (request (list fsm (gptel-agent--run-fsm worker)
+                                   (gptel-agent-discussion--chat-fsm discussion)))
+              (let ((info (gptel-fsm-info request)))
+                (gptel-runner-delegation-test--tool request "Read" (list :file_path outside))
+                (should-not interactions)
+                (should-not (gptel-runner-gptel-pending-interactions call))
+                (let* ((messages (plist-get (plist-get info :data) :messages))
+                       (result (aref messages (1- (length messages)))))
+                  (should (equal (plist-get result :role) "tool"))
+                  (should (equal (plist-get result :content) "External evidence")))))))
+      (delete-file outside))))
+
+(ert-deftest gptel-runner-delegation-unconfirmed-outside-read-with-write ()
+  (let ((outside (make-temp-file "runner-outside-" nil ".txt" "Original"))
+        (gptel-runner-delegation-test--tool-names '("Read" "Write"))
+        (gptel-runner-delegation-test--prompt-transforms nil)
+        (gptel-runner-delegation-test--start-arguments '(:allow-unconfirmed-tools t)))
+    (unwind-protect
+        (gptel-runner-delegation-test--with-run
+          (let* ((info (gptel-fsm-info fsm))
+                 (read-args (list :file_path outside))
+                 (write-args (list :file_path outside :content "Changed")))
+            (gptel-runner-gptel-test--reply
+             fsm nil "tool_calls"
+             (vector (list :id "read" :type "function"
+                           :function (list :name "Read" :arguments (gptel--json-encode read-args)))
+                     (list :id "write" :type "function"
+                           :function (list :name "Write" :arguments (gptel--json-encode write-args)))))
+            (let ((read-call (cl-find "Read" (plist-get info :tool-use)
+                                      :key (lambda (item) (plist-get item :name)) :test #'equal)))
+              (should (equal (plist-get read-call :result) "Original")))
+            (let ((pending (gptel-runner-gptel-pending-interactions call)))
+              (should (= (length pending) 1))
+              (should (plist-get (car pending) :outside-access))
+              (should (equal (plist-get (car pending) :tools)
+                             (list (list :name "Write" :args write-args)))))
+            (should (equal (with-temp-buffer (insert-file-contents outside) (buffer-string))
+                           "Original"))))
       (delete-file outside))))
 
 (ert-deftest gptel-runner-delegation-outside-grant-belongs-only-to-requesting-child ()

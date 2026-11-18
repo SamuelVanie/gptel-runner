@@ -1357,7 +1357,9 @@ DRIVER defaults to
 MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
 MAX-DURATION override workflow defaults.  ALLOW-WRITES must be explicitly
 non-nil for any workflow containing a write step.
-ALLOW-UNCONFIRMED-TOOLS disables gptel confirmation only when explicitly set.
+Non-nil ALLOW-UNCONFIRMED-TOOLS skips gptel tool confirmations, including
+approval for reads outside the working directory.  It defaults to the
+workflow's setting.  Pass nil to restore the usual policy for this run.
 DECISION-MEMORY controls automatic propagation of recorded decisions and
 defaults to non-nil.
 CONTEXT adds run-wide starting context to the workflow's own context.
@@ -1400,7 +1402,8 @@ CALLBACK runs exactly once with the terminal run."
                 :max-duration
                 (gptel-runner--option :max-duration arguments defaults nil)
                 :allow-writes allow-writes
-                :allow-unconfirmed-tools allow-unconfirmed-tools
+                :allow-unconfirmed-tools
+                (gptel-runner--option :allow-unconfirmed-tools arguments defaults nil)
                 :completion (gptel-runner--option :completion arguments defaults 'handoff)
                 :decision-memory (gptel-runner--option
                                   :decision-memory arguments defaults t)

@@ -137,6 +137,15 @@
                              "b"))))
         (delete-directory workspace t)))))
 
+(ert-deftest gptel-runner-unconfirmed-tools-workflow-default-and-override ()
+  (gptel-runner-test--isolated
+    (gptel-runner-defworkflow autonomous (:allow-unconfirmed-tools t)
+      (gptel-runner-elisp-step :id 'work :function #'ignore))
+    (let ((automatic (gptel-runner-start 'autonomous))
+          (guarded (gptel-runner-start 'autonomous :allow-unconfirmed-tools nil)))
+      (should (plist-get (gptel-runner-run-options automatic) :allow-unconfirmed-tools))
+      (should-not (plist-get (gptel-runner-run-options guarded) :allow-unconfirmed-tools)))))
+
 (ert-deftest gptel-runner-node-workspaces-validate-before-dispatch ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
