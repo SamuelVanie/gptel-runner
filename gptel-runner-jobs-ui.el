@@ -14,9 +14,6 @@
 (require 'gptel-runner-ui)
 (require 'gptel-runner-jobs)
 
-(declare-function gptel-runner-launchd-install "gptel-runner-launchd")
-(declare-function gptel-runner-launchd-disable "gptel-runner-launchd")
-(declare-function gptel-runner-launchd-remove "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-diagnostics "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-reap "gptel-runner-launchd")
 (declare-function gptel-runner-invocation-outputs "gptel-runner-jobs")
@@ -26,8 +23,6 @@
 (declare-function gptel-runner-invocation-get "gptel-runner-jobs")
 (declare-function gptel-runner-job-list "gptel-runner-jobs")
 (declare-function gptel-runner-job-get "gptel-runner-jobs")
-(declare-function gptel-runner-job-save "gptel-runner-jobs")
-(declare-function gptel-runner-job-delete "gptel-runner-jobs")
 (declare-function gptel-runner-job-run "gptel-runner-jobs")
 (declare-function gptel-runner-job-command "gptel-runner-jobs")
 (autoload 'gptel-runner-background-open "gptel-runner-jobs-panel" nil t)
@@ -41,9 +36,6 @@
 
 (defvar gptel-runner-jobs-ui--last-reap-time nil
   "Time of the last attempted asynchronous registration cleanup.")
-
-(defvar-local gptel-runner-job-edit--id nil
-  "Identity of the job being edited, or nil for a new job.")
 
 (defvar-local gptel-runner-background--target nil
   "External invocation and call identity associated with this buffer.")
@@ -576,8 +568,7 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
            (vector (or (plist-get job :name) (plist-get job :id))
                    (format "%s" (plist-get job :workflow))
                    (format "%s" (or (plist-get (plist-get job :scheduler) :state)
-                                     (if (plist-get job :enabled)
-                                         'enabled 'disabled)))
+                                    'uninstalled))
                    (gptel-runner-jobs-ui--schedule job)
                    (format "%s" (or (plist-get job :revision) 1)))))
    (gptel-runner-job-list)))
@@ -635,74 +626,14 @@ No timer is installed: cleanup is requested only when the jobs view refreshes."
       (user-error "Select a saved background job")))
 
 (define-derived-mode gptel-runner-jobs-mode tabulated-list-mode "Runner-Jobs"
-  "Manage background jobs and their macOS schedules."
+  "View registered background jobs and their schedules."
   (setq tabulated-list-format
-        [("Job" 26 t) ("Workflow" 24 t) ("State" 10 t)
+        [("Job" 26 t) ("Workflow" 24 t) ("State" 12 t)
          ("Schedule" 35 nil) ("Revision" 8 t)]
         tabulated-list-entries #'gptel-runner-jobs-ui--job-entries
         tabulated-list-padding 2)
   (add-hook 'tabulated-list-revert-hook #'gptel-runner-jobs-refresh nil t)
   (tabulated-list-init-header))
-
-(define-derived-mode gptel-runner-job-edit-mode emacs-lisp-mode "Runner-Job"
-  "Edit one job data plist.
-Use `gptel-runner-job-edit-save' to parse and save without evaluating forms."
-  (setq-local header-line-format "Job data — C-c C-c save; C-c C-k close"))
-
-(defun gptel-runner-jobs-ui--edit (job)
-  "Open JOB in a dedicated data editor."
-  (let ((buffer (generate-new-buffer "*gptel-runner job definition*")))
-    (with-current-buffer buffer
-      (gptel-runner-job-edit-mode)
-      (setq-local gptel-runner-job-edit--id (plist-get job :id))
-      (insert (pp-to-string job))
-      (goto-char (point-min))
-      (set-buffer-modified-p nil))
-    (pop-to-buffer buffer)))
-
-(defun gptel-runner-jobs-create ()
-  "Create a background job by editing its data definition."
-  (interactive)
-  (gptel-runner-jobs-ui--edit
-   (list :name "New pipeline job" :workflow 'my-workflow
-         :init-file (expand-file-name "runner-init.el" user-emacs-directory)
-         :arguments (list :goal "Describe the pipeline goal"
-                          :workspace (expand-file-name default-directory))
-         :schedule nil :enabled nil
-         :emacs (or (executable-find "emacs") invocation-name))))
-
-(defun gptel-runner-jobs-edit ()
-  "Edit the selected job's saved data definition."
-  (interactive)
-  (gptel-runner-jobs-ui--edit (gptel-runner-jobs-ui--job)))
-
-(defun gptel-runner-job-edit-save ()
-  "Parse and save the job data without evaluating any buffer forms."
-  (interactive)
-  (unless (derived-mode-p 'gptel-runner-job-edit-mode)
-    (user-error "Run this command from a job definition buffer"))
-  (let* ((data (save-excursion
-                 (goto-char (point-min))
-                 (let ((value (read (current-buffer))))
-                   (forward-comment (point-max))
-                   (unless (eobp) (user-error "Expected exactly one job plist"))
-                   value)))
-         (id (and (listp data) (plist-get data :id))))
-    (unless (and (listp data) (keywordp (car data)))
-      (user-error "Expected a job property list"))
-    (when (and gptel-runner-job-edit--id
-               (not (equal id gptel-runner-job-edit--id)))
-      (user-error "Editing a job cannot change its identity"))
-    (let ((saved (gptel-runner-job-save data)))
-      (setq-local gptel-runner-job-edit--id (plist-get saved :id))
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert (pp-to-string saved))
-        (goto-char (point-min))
-        (set-buffer-modified-p nil))
-      (message "Saved job %s; use Apply schedule to install schedule changes"
-               (plist-get saved :name))
-      saved)))
 
 (defun gptel-runner-jobs-run ()
   "Start the selected job in an isolated Emacs worker now."
@@ -714,29 +645,6 @@ Use `gptel-runner-job-edit-save' to parse and save without evaluating forms."
       (message "Started background invocation %s" (plist-get run :id)))
     (gptel-runner-show-dashboard)))
 
-(defun gptel-runner-jobs-install ()
-  "Enable and install the selected job's user LaunchAgent schedule."
-  (interactive)
-  (require 'gptel-runner-launchd)
-  (gptel-runner-launchd-install (gptel-runner-jobs-ui--job))
-  (gptel-runner-jobs-refresh))
-
-(defun gptel-runner-jobs-disable ()
-  "Disable the selected job's installed schedule."
-  (interactive)
-  (require 'gptel-runner-launchd)
-  (gptel-runner-launchd-disable (gptel-runner-jobs-ui--job))
-  (gptel-runner-jobs-refresh))
-
-(defun gptel-runner-jobs-remove ()
-  "Remove the selected job and its schedule while preserving run history."
-  (interactive)
-  (let ((job (gptel-runner-jobs-ui--job)))
-    (when (yes-or-no-p (format "Remove job %s and its schedule? "
-                              (plist-get job :name)))
-      (gptel-runner-job-delete (plist-get job :id))
-      (gptel-runner-jobs-refresh))))
-
 (defun gptel-runner-jobs-diagnostics ()
   "Show scheduler diagnostics for the selected job."
   (interactive)
@@ -746,33 +654,22 @@ Use `gptel-runner-job-edit-save' to parse and save without evaluating forms."
    (gptel-runner-launchd-diagnostics (gptel-runner-jobs-ui--job))))
 
 (transient-define-prefix gptel-runner-jobs-menu ()
-  "Manage background jobs and schedules."
+  "Run registered jobs and inspect schedule diagnostics."
   [["Job"
-    ("n" "New job" gptel-runner-jobs-create)
-    ("e" "Edit definition" gptel-runner-jobs-edit)
     ("r" "Run now" gptel-runner-jobs-run)
-    ("x" "Remove job" gptel-runner-jobs-remove)]
-   ["Schedule"
-    ("a" "Enable / apply schedule" gptel-runner-jobs-install)
-    ("d" "Disable schedule" gptel-runner-jobs-disable)
-    ("i" "Diagnostics" gptel-runner-jobs-diagnostics)]
+    ("i" "Schedule diagnostics" gptel-runner-jobs-diagnostics)]
    ["View"
     ("g" "Refresh" gptel-runner-jobs-refresh)
     ("R" "Runs" gptel-runner-show-dashboard)]])
 
 (let ((map gptel-runner-jobs-mode-map))
   (define-key map (kbd "?") #'gptel-runner-jobs-menu)
-  (define-key map (kbd "RET") #'gptel-runner-jobs-edit)
-  (define-key map (kbd "g") #'gptel-runner-jobs-refresh)
-  (define-key map (kbd "n") #'gptel-runner-jobs-create))
-
-(define-key gptel-runner-job-edit-mode-map (kbd "C-c C-c")
-            #'gptel-runner-job-edit-save)
-(define-key gptel-runner-job-edit-mode-map (kbd "C-c C-k") #'kill-current-buffer)
+  (define-key map (kbd "RET") #'gptel-runner-jobs-menu)
+  (define-key map (kbd "g") #'gptel-runner-jobs-refresh))
 
 ;;;###autoload
 (defun gptel-runner-show-jobs ()
-  "Show saved background jobs and their schedule management controls."
+  "Show registered background jobs, their schedules, and controls to run them."
   (interactive)
   (let ((buffer (get-buffer-create gptel-runner-jobs-buffer)))
     (with-current-buffer buffer

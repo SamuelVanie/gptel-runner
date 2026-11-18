@@ -19,6 +19,7 @@
 (require 'gptel-runner-store)
 
 (declare-function gptel-runner-launchd-start-worker "gptel-runner-launchd")
+(declare-function gptel-runner-launchd-install "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-remove "gptel-runner-launchd")
 (declare-function gptel-runner-gptel-answer-interaction "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-approve-interactions "gptel-runner-gptel")
@@ -182,26 +183,26 @@ executes directly and does not need this launcher."
 					(plist-get b :name)))))))
 
 (defun gptel-runner-jobs--validate-schedule (schedule)
-  "Validate SCHEDULE's portable launchd subset."
-  (when schedule
-    (pcase (car-safe schedule)
-      (:interval
-       (unless (and (= (length schedule) 2)
-                    (integerp (cadr schedule)) (> (cadr schedule) 0))
-         (error "Schedule interval must be positive seconds")))
-      (:calendar
-       (unless (and (= (length schedule) 2) (consp (cadr schedule)))
-         (error "Calendar schedule needs a list of rules"))
-       (dolist (rule (cadr schedule))
-         (unless (and (proper-list-p rule) (cl-evenp (length rule)))
-           (error "Invalid calendar rule: %S" rule))
+  "Validate a recurring job SCHEDULE."
+  (pcase schedule
+    (`(:interval ,seconds)
+     (unless (and (integerp seconds) (> seconds 0))
+       (error "Schedule interval must be positive seconds")))
+    (`(:calendar ,rules)
+     (unless (and rules (proper-list-p rules))
+       (error "Calendar schedule needs a list of rules"))
+     (dolist (rule rules)
+       (unless (and rule (proper-list-p rule) (cl-evenp (length rule)))
+         (error "Invalid calendar rule: %S" rule))
+       (let (seen)
          (cl-loop for (key value) on rule by #'cddr
                   for range = (assq key '((:minute 0 59) (:hour 0 23)
                                           (:day 1 31) (:weekday 0 7) (:month 1 12)))
-                  unless (and range (integerp value)
-                              (<= (cadr range) value (caddr range)))
-                  do (error "Invalid calendar field: %S %S" key value))))
-      (_ (error "Unknown job schedule: %S" schedule)))))
+                  do (unless (and range (not (memq key seen)) (integerp value)
+                                  (<= (cadr range) value (caddr range)))
+                       (error "Invalid calendar field: %S %S" key value))
+                  do (push key seen)))))
+    (_ (error "Expected (:interval SECONDS) or (:calendar (RULE ...))"))))
 
 (defun gptel-runner-jobs--library-paths (paths &optional base)
   "Normalize library PATHS against BASE, excluding bundled Emacs Lisp.
@@ -246,6 +247,11 @@ loading the initialization file."
   (let* ((id (or (plist-get job :id) (gptel-runner-jobs--id)))
          (old (when (file-exists-p (gptel-runner-jobs--definition-file id))
                 (gptel-runner-job-get id)))
+         ;; LaunchAgent labels are per macOS user; named job IDs are per store.
+         ;; Old definitions already have a service identity equal to their ID.
+         (launchd-id (cond (old (or (plist-get old :launchd-id) id))
+                           ((plist-get job :id) (gptel-runner-jobs--id))
+                           (t id)))
          (init (plist-get job :init-file))
          (arguments (copy-tree (plist-get job :arguments)))
          (base (file-name-as-directory
@@ -283,7 +289,8 @@ loading the initialization file."
       (unless (and (consp entry) (stringp (car entry)) (stringp (cdr entry))
                    (string-match-p "\\`[A-Za-z_][A-Za-z_0-9]*\\'" (car entry)))
         (error "Job environment must contain string name/value pairs")))
-    (gptel-runner-jobs--validate-schedule (plist-get job :schedule))
+    (when-let* ((schedule (plist-get job :schedule)))
+      (gptel-runner-jobs--validate-schedule schedule))
     (unless (file-directory-p base)
       (error "Job base directory is not a directory: %s" base))
     (when (plist-member arguments :workspace)
@@ -298,6 +305,7 @@ loading the initialization file."
           job (plist-put job :preload-features preloads)
           job (plist-put job :base-directory base)
           job (plist-put job :id id)
+          job (plist-put job :launchd-id launchd-id)
           job (plist-put job :init-file (expand-file-name init))
           job (plist-put job :emacs emacs)
           job (plist-put job :root (gptel-runner-jobs--root))
@@ -307,13 +315,83 @@ loading the initialization file."
     (unless (plist-member job :enabled) (setq job (plist-put job :enabled t)))
     (gptel-runner-jobs--write (gptel-runner-jobs--definition-file id) job)))
 
+(defun gptel-runner-jobs--update-definition (job function &optional create)
+  "Call FUNCTION on the latest definition of JOB under its store lock.
+JOB is a string ID or saved record.  With CREATE, supply a new definition
+when the ID is unused."
+  (let* ((id (if (stringp job) job (plist-get job :id)))
+         (gptel-runner-job-directory
+          (or (and (listp job) (plist-get job :root)) gptel-runner-job-directory))
+         (file (gptel-runner-jobs--definition-file id))
+         (lock (expand-file-name (concat "locks/definitions/" id)
+                                 (gptel-runner-jobs--root)))
+         result)
+    (unless (gptel-runner-jobs--with-lock-guard
+             lock
+             (lambda ()
+               (let ((definition (if (and create (not (file-exists-p file)))
+                                     (list :id id :name id)
+                                   (gptel-runner-job-get id))))
+                 (setq result (funcall function definition))
+                 t)))
+      (user-error "Job %s is being updated; retry shortly" id))
+    result))
+
+;;;###autoload
+(defun gptel-runner-register-job (id &rest properties)
+  "Define or update the background job with stable string ID.
+Use letters, digits, hyphens, and underscores for ID.
+Supply :workflow and :init-file for a new job.  Its :name defaults to ID.
+PROPERTIES are the job options documented by `gptel-runner-job-save'.
+Only supplied fields are replaced, including the entire :arguments plist
+when present.  Return the saved definition.  Use `gptel-runner-job-run'
+to launch it or `gptel-runner-job-schedule' to install its schedule."
+  (gptel-runner-jobs--valid-id id)
+  (unless (cl-evenp (length properties))
+    (error "Job properties must be keyword/value pairs"))
+  (gptel-runner-jobs--update-definition
+   id (lambda (job)
+        (let (seen)
+          (cl-loop for (key value) on properties by #'cddr
+                   do (unless (memq key '(:name :workflow :init-file :arguments
+                                          :schedule :environment :emacs :base-directory
+                                          :enabled :load-path :preload-features))
+                        (error "Unknown job property: %S" key))
+                   do (when (memq key seen) (error "Duplicate job property: %S" key))
+                   do (push key seen)
+                   do (setq job (plist-put job key value))))
+        (gptel-runner-job-save job))
+   t))
+
+;;;###autoload
+(defun gptel-runner-job-schedule (job &optional schedule)
+  "Install or update JOB's recurring macOS schedule and return the saved job.
+JOB is its string ID or a saved record.  Use its latest saved schedule
+unless SCHEDULE supplies a new (:interval SECONDS) or (:calendar (RULE ...))
+value.  Installing a schedule does not run the job immediately."
+  (require 'gptel-runner-launchd)
+  (gptel-runner-jobs--update-definition
+   job (lambda (definition)
+         (setq schedule (or schedule (plist-get definition :schedule)))
+         (gptel-runner-jobs--validate-schedule schedule)
+         (gptel-runner-launchd-install (plist-put definition :schedule schedule)))))
+
+;;;###autoload
+(defun gptel-runner-job-unschedule (job)
+  "Remove JOB's recurring macOS trigger and return the updated saved job.
+JOB is its string ID or a saved record.  Keep its schedule rule, invocation
+history, and running workers."
+  (require 'gptel-runner-launchd)
+  (gptel-runner-jobs--update-definition job #'gptel-runner-launchd-remove))
+
 (defun gptel-runner-job-delete (id)
   "Remove job ID and its schedule, retaining all invocation history."
-  (let ((job (gptel-runner-job-get id)))
-    (when (eq system-type 'darwin)
-      (require 'gptel-runner-launchd)
-      (gptel-runner-launchd-remove job))
-    (delete-file (gptel-runner-jobs--definition-file id))))
+  (gptel-runner-jobs--update-definition
+   id (lambda (job)
+        (when (eq system-type 'darwin)
+          (require 'gptel-runner-launchd)
+          (gptel-runner-launchd-remove job))
+        (delete-file (gptel-runner-jobs--definition-file (plist-get job :id))))))
 
 (defun gptel-runner-jobs--manifest-file (invocation)
   "Return manifest filename for INVOCATION."

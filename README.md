@@ -1144,10 +1144,11 @@ exception whose package fallback is `t`; use an explicit nil value to opt out.
 
 ## Background jobs and macOS schedules
 
-A job is a reusable invocation of any named workflow.  It specifies the
-workflow, an initialization file for a fresh worker Emacs, start arguments,
-and optionally a recurring schedule.  Jobs do not depend on a repository
-hosting service or a particular kind of agent.
+A job specifies a named workflow, an initialization file for a fresh worker
+Emacs, start arguments, and an optional recurring schedule. Register jobs and
+apply schedules from your Emacs Lisp configuration. Put the workflow and its
+agent definitions in the worker's initialization file, which loads on every
+invocation.
 
 Each invocation runs in a separate `emacs -Q --batch` process.  Parallel nodes
 still execute concurrent agent requests inside that worker.  Your ordinary
@@ -1156,36 +1157,51 @@ of the worker's executable run.  Connecting another `emacsclient` to your
 ordinary Emacs server would share its process and would not provide this
 isolation.
 
-### Define and run a job
+### Register a job from Emacs Lisp
 
-The bundled [background example](examples/background-jobs.el) uses the fake
-driver and makes no network requests.  It runs two agents in parallel, saves
-both results, synthesizes a report, and publishes a report file:
+The bundled example runs two fake agents in parallel, saves both results, and
+publishes a report file. With the checkout on `load-path`, evaluate this
+definition in your editor or include it in your Emacs configuration.
+[Example workflow](examples/background-jobs.el)
 
 ```elisp
-(require 'gptel-runner-jobs)
-(require 'gptel-runner-jobs-ui)
+(require 'gptel-runner)
 
-(setq my-background-job
-      (gptel-runner-job-save
-       (list :name "Parallel example"
-             :workflow 'background-example
-             :init-file "/path/to/gptel-runner/examples/background-jobs.el"
-             :preload-features nil ; This fake example needs no agent packages.
-             :arguments
-             '(:goal "Demonstrate a background pipeline"
-               :workspace "/path/to/workspace/"
-               :inputs ((subject . "my project")))
-             :schedule '(:interval 3600))))
-
-;; On macOS, launchd owns this worker, so it survives closing the editor.
-(setq my-invocation (gptel-runner-job-run my-background-job))
-(gptel-runner-show-dashboard)
+(gptel-runner-register-job
+ "parallel-example"
+ :name "Parallel example"
+ :workflow 'background-example
+ :init-file (expand-file-name "examples/background-jobs.el"
+                              (file-name-directory (locate-library "gptel-runner")))
+ :preload-features nil
+ :arguments '(:goal "Demonstrate a background pipeline"
+              :inputs ((subject . "my project")))
+ :schedule '(:interval 3600))
 ```
 
-Saving a job does not install its schedule or execute it.  The saved record
-has a stable `:id`; pass that identifier or the record to job commands.  Use
-`M-x gptel-runner-show-jobs` to manage definitions and schedules.
+The first argument is a stable string ID made of letters, digits, hyphens,
+or underscores. Registering a new job requires
+`:workflow` and `:init-file`. The display name defaults to the ID.
+Re-evaluating the definition updates the same job and returns its saved
+record. You can update individual top-level properties in later calls.
+Supplying `:arguments` replaces the entire argument plist.
+
+```elisp
+(gptel-runner-register-job "parallel-example" :name "Project report")
+(gptel-runner-job-get "parallel-example")
+```
+
+Registration only saves the definition. To start one invocation now on macOS,
+evaluate the following form when you want the worker to run. To enable
+recurring triggers, use `gptel-runner-job-schedule` as described below.
+
+```elisp
+(setq my-invocation (gptel-runner-job-run "parallel-example"))
+```
+
+Use `M-x gptel-runner-show-jobs` to inspect registered jobs and their
+schedules or start a run. Use `M-x gptel-runner-show-dashboard` to follow
+invocations and interact with running workflows.
 
 Workers automatically load `gptel` and `gptel-agent` **before** the job's
 `:init-file`, then call `gptel-agent-update` to discover agent definitions
@@ -1402,7 +1418,7 @@ recorded as skipped rather than queued.  Different jobs may run concurrently;
 background calls declared as writers coordinate access to the same canonical
 workspace.  This is orchestration, not a filesystem security boundary.
 
-### Run from a shell or cron
+### Run a registered job from a shell
 
 The generic batch entry point can execute a saved job without launchd:
 
@@ -1412,13 +1428,13 @@ The generic batch entry point can execute a saved job without launchd:
   run JOB-ID --root /absolute/path/to/job-store/
 ```
 
-Use the `:id` returned by `gptel-runner-job-save`; the default store is
+Use the string ID passed to `gptel-runner-register-job` or the `:id` of an
+existing saved definition. The default store is
 `~/.emacs.d/gptel-runner/jobs/` unless `gptel-runner-job-directory` is changed.
 `run` keeps that Emacs process alive until the pipeline finishes, including
 human-input waits.  It returns exit code `0` for success or a skipped duplicate,
 `1` for another terminal pipeline outcome, and `2` for startup or persistence
-failure.  This same command can be placed in a user crontab with appropriate
-stdout/stderr redirection.  It does not require an interactive Emacs server.
+failure. The command runs independently of an interactive Emacs server.
 
 On macOS, the `trigger JOB-ID --root STORE` command dispatches through the
 detached launcher and returns after the worker has adopted ownership.  That
@@ -1428,29 +1444,36 @@ the reservation is released.  If stopping cannot be confirmed, the invocation
 remains visibly uncertain and its reservation stays held until absence is
 confirmed; it is not silently retried.
 
-### Manage user schedules on macOS
+### Schedule a registered job on macOS
 
-macOS supports per-user cron jobs through `crontab -e`, without requiring root.
-The integrated scheduler uses user LaunchAgents, Apple's recommended mechanism
-for scheduled work.  It manages only package-owned property lists in
-`~/Library/LaunchAgents` and services in the current user's `gui/<uid>` domain.
-No system daemon is installed.
+The package schedules recurring work through a LaunchAgent in the current
+user's `gui/<uid>` domain. Its property list lives in `~/Library/LaunchAgents`.
+
+Install the hourly rule from the definition above with
+`gptel-runner-job-schedule`. Supply a rule as the second argument to save
+and install a different schedule in one call.
 
 ```elisp
-(require 'gptel-runner-launchd)
+(gptel-runner-job-schedule "parallel-example")
 
-;; Enable or update the saved recurring schedule.
-(gptel-runner-launchd-install my-background-job)
-
-;; Disable future triggers; an active worker continues.
-(gptel-runner-launchd-disable my-background-job)
-
-;; Remove the installed schedule without deleting job/history data.
-(gptel-runner-launchd-remove my-background-job)
-
-;; Obtain raw launchctl diagnostics and the last installation result.
-(gptel-runner-launchd-diagnostics my-background-job)
+;; Change the trigger to 09:00 every Monday.
+(gptel-runner-job-schedule "parallel-example"
+                           '(:calendar ((:weekday 1 :hour 9 :minute 0))))
 ```
+
+After changing a registered job's `:schedule`, call
+`gptel-runner-job-schedule` to apply the new rule. To stop future triggers,
+remove the installed schedule with the following call. The saved rule stays
+available to reinstall, active workers continue, and run history stays on disk.
+Both `gptel-runner-job-schedule` and `gptel-runner-job-unschedule` accept a
+job ID or saved record and return the updated record.
+
+```elisp
+(gptel-runner-job-unschedule "parallel-example")
+```
+
+To retire the job entirely, call `(gptel-runner-job-delete "parallel-example")`.
+This removes its definition and schedule and preserves its invocation history.
 
 Schedules support positive integer intervals such as `(:interval 900)` and
 calendar rules such as `(:calendar ((:hour 9 :minute 0)))`.  Multiple calendar
@@ -1463,8 +1486,9 @@ local timezone.  Future one-off scheduling is not provided.
 Scheduled triggers exit after dispatching a separate invocation service.  This
 lets schedule disabling and worker cancellation remain independent operations.
 Completed worker registrations are removed during later launches or jobs-view
-refreshes; their history stays on disk.  Installation failures are stored in
-the job's scheduler status and are visible in diagnostics.
+refreshes; their history stays on disk. Inspect the registered job's
+`:scheduler` property for the last installation result, or open diagnostics
+from the jobs view for the underlying `launchctl` output.
 
 User LaunchAgents require the login session.  Calendar triggers missed while
 the Mac sleeps coalesce into one trigger on wake; interval triggers can be

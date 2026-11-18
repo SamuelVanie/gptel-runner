@@ -55,8 +55,11 @@
 - Add generic isolated background jobs, durable invocation/agent history,
   published file artifacts, command receipts, and remote lifecycle controls.
 - Add start-time `:inputs` and workflow-level default workspaces.
-- Add macOS user LaunchAgent schedules and separate invocation services, with
-  Emacs job management and external runs in the dashboard.
+- Register background jobs by stable ID from Emacs Lisp with
+  `gptel-runner-register-job`. Install or remove recurring macOS LaunchAgent
+  schedules with `gptel-runner-job-schedule` and `gptel-runner-job-unschedule`.
+  Each invocation runs in a separate service. The jobs view supports inspection,
+  manual runs, and diagnostics.
 - Add headless feedback and exact-interaction tool approval, cross-process
   writer coordination, and a network-free parallel background example.
 - Add per-agent-step `:workspace` overrides with run-workspace fallback,

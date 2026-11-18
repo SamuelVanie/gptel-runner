@@ -120,6 +120,15 @@
       (gptel-runner-jobs-run)
       (should (string-prefix-p "Skipped background invocation invocation-1" reported)))))
 
+(ert-deftest gptel-runner-jobs-ui-shows-recorded-scheduler-state ()
+  (cl-letf (((symbol-function 'gptel-runner-job-list)
+             (lambda ()
+               '((:id "proposed" :workflow checks :enabled t :schedule (:interval 60))
+                 (:id "active" :workflow checks :scheduler (:state installed))))))
+    (let ((rows (gptel-runner-jobs-ui--job-entries)))
+      (should (equal (cadar rows) ["proposed" "checks" "uninstalled" "every 60s" "1"]))
+      (should (equal (aref (cadr (cadr rows)) 2) "installed")))))
+
 (ert-deftest gptel-runner-jobs-ui-commands-address-the-observed-call-epoch ()
   (let ((run '(:id "invocation-1" :epoch 3 :state running
                :calls ((:id "call-2" :epoch 2 :state waiting-feedback))))
@@ -235,30 +244,21 @@
             (should-error (call-interactively (key-binding (kbd "a"))) :type 'user-error))
         (when (buffer-live-p review) (kill-buffer review))))))
 
-(ert-deftest gptel-runner-jobs-ui-editor-reads-data-without-evaluation ()
-  (let (saved)
-    (with-temp-buffer
-      (gptel-runner-job-edit-mode)
-      (insert "(:name \"Example\" :workflow demo :arguments (:goal (error \"executed\")))")
-      (cl-letf (((symbol-function 'gptel-runner-job-save)
-                 (lambda (data) (setq saved data) (plist-put data :id "job-1"))))
-        (gptel-runner-job-edit-save)
-        (should (equal (plist-get (plist-get saved :arguments) :goal)
-                       '(error "executed")))
-        (should (equal gptel-runner-job-edit--id "job-1"))
-        (should-not (buffer-modified-p))))))
-
-(ert-deftest gptel-runner-jobs-ui-editor-rejects-trailing-forms-and-id-changes ()
+(ert-deftest gptel-runner-jobs-ui-definitions-and-schedules-are-api-only ()
   (with-temp-buffer
-    (gptel-runner-job-edit-mode)
-    (cl-letf (((symbol-function 'gptel-runner-job-save)
-               (lambda (_) (ert-fail "Invalid editor input reached save"))))
-      (insert "(:name \"Example\") (message \"extra\")")
-      (should-error (gptel-runner-job-edit-save) :type 'user-error)
-      (erase-buffer)
-      (setq-local gptel-runner-job-edit--id "job-1")
-      (insert "(:id \"job-2\" :name \"Example\")")
-      (should-error (gptel-runner-job-edit-save) :type 'user-error))))
+    (gptel-runner-jobs-mode)
+    (should (eq (key-binding (kbd "RET")) #'gptel-runner-jobs-menu))
+    (should (eq (key-binding (kbd "n"))
+                (lookup-key tabulated-list-mode-map (kbd "n")))))
+  (dolist (command '(gptel-runner-jobs-create gptel-runner-jobs-edit
+                     gptel-runner-job-edit-save gptel-runner-jobs-install
+                     gptel-runner-jobs-disable gptel-runner-jobs-remove))
+    (should-not (commandp command)))
+  (dolist (binding '(("r" gptel-runner-jobs-run)
+                     ("i" gptel-runner-jobs-diagnostics)))
+    (should (eq (plist-get (cdr (transient-get-suffix 'gptel-runner-jobs-menu
+                                                     (car binding))) :command)
+                (cadr binding)))))
 
 (ert-deftest gptel-runner-jobs-ui-artifacts-cannot-escape-invocation ()
   (let ((directory (make-temp-file "runner-ui-artifacts-" t))

@@ -18,6 +18,7 @@
 
 (declare-function gptel-runner-job-get "gptel-runner-jobs")
 (declare-function gptel-runner-job-save "gptel-runner-jobs")
+(declare-function gptel-runner-jobs--validate-schedule "gptel-runner-jobs")
 (declare-function gptel-runner-invocation-list "gptel-runner-jobs")
 (declare-function gptel-runner-invocation-live-p "gptel-runner-jobs")
 (declare-function gptel-runner-invocation-get "gptel-runner-jobs")
@@ -47,11 +48,6 @@
 
 (defconst gptel-runner-launchd--prefix "org.gnu.emacs.gptel-runner."
   "Namespace reserved for this package's launchd services.")
-
-(defconst gptel-runner-launchd--calendar-keys
-  '((:minute "Minute" 0 59) (:hour "Hour" 0 23) (:day "Day" 1 31)
-    (:weekday "Weekday" 0 7) (:month "Month" 1 12))
-  "Supported calendar fields with their launchd name and bounds.")
 
 (defun gptel-runner-launchd--require-macos ()
   "Reject schedule mutations on systems without user launchd services."
@@ -173,36 +169,19 @@ Alists represent dictionaries and vectors represent arrays."
 
 (defun gptel-runner-launchd--schedule (schedule)
   "Validate SCHEDULE and return its launchd dictionary entry."
-  (unless (and (listp schedule) (= (length schedule) 2))
-    (error "Schedule must be (:interval SECONDS) or (:calendar (RULE ...))"))
+  (require 'gptel-runner-jobs)
+  (gptel-runner-jobs--validate-schedule schedule)
   (pcase (car schedule)
-    (:interval
-     (unless (and (integerp (cadr schedule)) (> (cadr schedule) 0))
-       (error "Schedule interval must be a positive integer"))
-     (cons "StartInterval" (cadr schedule)))
+    (:interval (cons "StartInterval" (cadr schedule)))
     (:calendar
-     (unless (and (listp (cadr schedule)) (cadr schedule))
-       (error "Calendar schedule must contain at least one rule"))
      (cons
       "StartCalendarInterval"
       (vconcat
        (mapcar
         (lambda (rule)
-          (unless (and (proper-list-p rule) rule (cl-evenp (length rule)))
-            (error "Calendar rule must be a non-empty property list"))
-          (let (dictionary seen)
-            (while rule
-              (let* ((key (pop rule)) (value (pop rule))
-                     (spec (assq key gptel-runner-launchd--calendar-keys)))
-                (unless (and spec (not (memq key seen))
-                             (integerp value) (<= (nth 2 spec) value)
-                             (<= value (nth 3 spec)))
-                  (error "Invalid calendar field %S: %S" key value))
-                (push key seen)
-                (push (cons (nth 1 spec) value) dictionary)))
-            (nreverse dictionary)))
-        (cadr schedule)))))
-    (_ (error "Unknown schedule kind %S" (car schedule)))))
+          (cl-loop for (key value) on rule by #'cddr
+                   collect (cons (capitalize (substring (symbol-name key) 1)) value)))
+        (cadr schedule)))))))
 
 (defun gptel-runner-launchd--arguments (job &rest operation)
   "Build Emacs arguments for JOB and batch OPERATION."
@@ -235,10 +214,15 @@ Alists represent dictionaries and vectors represent arrays."
    (when-let* ((environment (gptel-runner-launchd--environment job)))
      (list (cons "EnvironmentVariables" environment)))))
 
+(defun gptel-runner-launchd--schedule-label (job)
+  "Return the user-wide schedule label for JOB, including older definitions."
+  (gptel-runner-launchd--label "schedule" (or (plist-get job :launchd-id)
+                                              (plist-get job :id))))
+
 (defun gptel-runner-launchd--schedule-file (job)
   "Return the scheduled trigger property-list filename for JOB."
   (expand-file-name
-   (concat (gptel-runner-launchd--label "schedule" (plist-get job :id)) ".plist")
+   (concat (gptel-runner-launchd--schedule-label job) ".plist")
    gptel-runner-launchd-directory))
 
 (defun gptel-runner-launchd--status (job state operation &optional error-data)
@@ -257,7 +241,7 @@ This does not start the pipeline immediately.  Return the saved job record."
   (condition-case err
       (let* ((id (plist-get job :id))
              (root (or (plist-get job :root) gptel-runner-job-directory))
-             (label (gptel-runner-launchd--label "schedule" id))
+             (label (gptel-runner-launchd--schedule-label job))
              (logs (expand-file-name (concat "scheduler/" id "/") root))
              (file (gptel-runner-launchd--schedule-file job))
              (dictionary
@@ -282,7 +266,7 @@ This does not start the pipeline immediately.  Return the saved job record."
   (gptel-runner-launchd--require-macos)
   (setq job (gptel-runner-launchd--job job))
   (condition-case err
-      (let ((label (gptel-runner-launchd--label "schedule" (plist-get job :id))))
+      (let ((label (gptel-runner-launchd--schedule-label job)))
         (gptel-runner-launchd--checked "disable" (gptel-runner-launchd--target label))
         (gptel-runner-launchd--unload label)
         (gptel-runner-launchd--status (plist-put job :enabled nil) 'disabled 'disable))
@@ -301,7 +285,7 @@ This does not start the pipeline immediately.  Return the saved job record."
   "Return schedule diagnostics for JOB without changing its state.
 The raw launchctl display is intended for people, not parsed as an API."
   (setq job (gptel-runner-launchd--job job))
-  (let* ((label (gptel-runner-launchd--label "schedule" (plist-get job :id)))
+  (let* ((label (gptel-runner-launchd--schedule-label job))
          (result (gptel-runner-launchd--invoke
                   "print" (gptel-runner-launchd--target label))))
     (append (list :label label :file (gptel-runner-launchd--schedule-file job)
