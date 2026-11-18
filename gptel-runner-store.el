@@ -22,6 +22,7 @@
 (autoload 'gptel-runner-gptel-save-chat "gptel-runner-gptel")
 (autoload 'gptel-runner-gptel-open-chat "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-submitted-end "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-rendered-end "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-restore-submitted-end "gptel-runner-gptel")
 
 (declare-function gptel-agent-session-buffer-record "gptel-agent-session")
@@ -143,20 +144,39 @@ terminal run transitions bypass it, but their writes are still asynchronous."
   (when gptel-runner--call
     (gptel-runner--checkpoint (gptel-runner-call-run gptel-runner--call))))
 
-(defun gptel-runner-store--close-chat ()
-  "Retain a session record when a node conversation is closed."
+(defun gptel-runner-store--chat-owner ()
+  "Return the call whose run owns the current node chat, if any."
   (when-let* ((call gptel-runner--call)
               (run (gptel-runner-call-run call))
               (id (gptel-runner-node-id (gptel-runner-call-node call)))
-              (chats (gptel-runner-run-chats run))
-              ((eq (current-buffer) (gethash id chats))))
+              ((eq (current-buffer) (gethash id (gptel-runner-run-chats run)))))
+    call))
+
+(defun gptel-runner-store--allow-chat-kill-p ()
+  "Allow killing this chat once its run has finished or released it."
+  (if-let* ((call (gptel-runner-store--chat-owner))
+            (run (gptel-runner-call-run call))
+            ((eq run (gptel-runner-find-run (gptel-runner-run-id run))))
+            ((not (gptel-runner--run-terminal-p run))))
+      (progn
+        (message "Bury this node chat to hide it. Use ? in the runner dashboard to pause or abort.")
+        nil)
+    t))
+
+(defun gptel-runner-store--close-chat ()
+  "Retain a session record when a node conversation is closed."
+  (when-let* ((call (gptel-runner-store--chat-owner))
+              (run (gptel-runner-call-run call))
+              (id (gptel-runner-node-id (gptel-runner-call-node call))))
     (when (memq (gptel-runner-call-state call)
                 '(running waiting-confirmation waiting-tool retry-wait))
       (gptel-runner-pause-call call 'chat-closed))
     (setf (gptel-runner-call-driver-data call)
-          (plist-put (gptel-runner-call-driver-data call) :submitted-end
-                     (gptel-runner-gptel-submitted-end (current-buffer))))
-    (puthash id (gptel-runner-store--archive (current-buffer)) chats)
+          (plist-put (plist-put (gptel-runner-call-driver-data call) :submitted-end
+                                (gptel-runner-gptel-submitted-end (current-buffer)))
+                     :rendered-end (gptel-runner-gptel-rendered-end (current-buffer))))
+    (puthash id (gptel-runner-store--archive (current-buffer))
+             (gptel-runner-run-chats run))
     (gptel-runner--checkpoint run)))
 
 (defun gptel-runner-store-track-chat (call buffer)
@@ -167,6 +187,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
   (with-current-buffer buffer
     (setq-local gptel-runner--call call)
     (add-hook 'after-change-functions #'gptel-runner-store--chat-changed nil t)
+    (add-hook 'kill-buffer-query-functions #'gptel-runner-store--allow-chat-kill-p -90 t)
     (add-hook 'kill-buffer-hook #'gptel-runner-store--close-chat nil t))
   buffer)
 
@@ -192,8 +213,9 @@ and for nodes that execute without a gptel conversation."
           ('gptel-agent
            (setq buffer (gptel-runner-store--import-agent-chat
                          #'gptel-agent-session-buffer-from-record (cdr chat)))
-           (gptel-runner-gptel-restore-submitted-end
-            buffer (plist-get (gptel-runner-call-driver-data call) :submitted-end)))
+           (let ((data (gptel-runner-call-driver-data call)))
+             (gptel-runner-gptel-restore-submitted-end
+              buffer (plist-get data :submitted-end) (plist-get data :rendered-end))))
           ('gptel (setq buffer (gptel-runner-gptel-chat-from-text (cdr chat))))
           (_ (user-error "Unknown saved chat format %S" (car chat))))
         (with-current-buffer buffer
@@ -333,6 +355,14 @@ and for nodes that execute without a gptel conversation."
         (list :type (plist-get data :type)))
        (t '(:type other))))))
 
+(defun gptel-runner-store--chat-position (call key accessor)
+  "Read CALL's chat position with ACCESSOR, or use its saved value at KEY."
+  (let ((buffer (gptel-runner-call-buffer call)))
+    (if (and (buffer-live-p buffer)
+             (eq (buffer-local-value 'gptel-runner--call buffer) call))
+        (funcall accessor buffer)
+      (plist-get (gptel-runner-call-driver-data call) key))))
+
 (defun gptel-runner-store--call-record (call)
   "Capture CALL's scheduling metadata for its node's saved chat."
   (list :id (gptel-runner-call-id call)
@@ -340,12 +370,10 @@ and for nodes that execute without a gptel conversation."
         :state (gptel-runner-call-state call)
         :discussion-owner (gptel-runner-call-discussion-owner call)
         :discussion-wait (plist-get (gptel-runner-call-driver-data call) :discussion-wait)
-        :submitted-end
-        (let ((buffer (gptel-runner-call-buffer call)))
-          (if (and (buffer-live-p buffer)
-                   (eq (buffer-local-value 'gptel-runner--call buffer) call))
-              (gptel-runner-gptel-submitted-end buffer)
-            (plist-get (gptel-runner-call-driver-data call) :submitted-end)))
+        :submitted-end (gptel-runner-store--chat-position
+                        call :submitted-end #'gptel-runner-gptel-submitted-end)
+        :rendered-end (gptel-runner-store--chat-position
+                       call :rendered-end #'gptel-runner-gptel-rendered-end)
         :prompt (when-let* ((prompt (gptel-runner-call-prompt call)))
                   (substring-no-properties prompt))
         :result (let ((result (gptel-runner-call-result call)))
@@ -804,6 +832,7 @@ asynchronous."
      :prompt (plist-get record :prompt) :generation (or (plist-get record :generation) 0)
      :repair-p (plist-get record :repair) :request-attempt (or (plist-get record :attempt) 0)
      :driver-data (list :restored t :submitted-end (plist-get record :submitted-end)
+                        :rendered-end (plist-get record :rendered-end)
                         :discussion-wait (plist-get record :discussion-wait)))))
 
 (defun gptel-runner-load-run (file &optional callback driver)

@@ -7,7 +7,8 @@ tools to carry out the plan and report what happened. Elisp defines the
 order of work, budgets, approvals, and retries.
 
 Use `M-x gptel-runner-show-dashboard` and press `RET` on an agent row to open
-its chat. Press `? m` on a run to see the handoffs, questions, and replies.
+its chat or review its pending tool requests. Press `? m` on a run to see
+the handoffs, questions, and replies.
 From a chat, `M-x gptel-runner-visit-node-chat` switches nodes.
 For a named workflow, `M-x gptel-runner-save-session` saves the whole run,
 including node chats and their child transcripts. After restarting Emacs,
@@ -678,7 +679,7 @@ The dashboard keeps its permanent keymap small:
 
 | Key | Dashboard action |
 | --- | --- |
-| `RET` / click | Open the node chat or the controls for a background run |
+| `RET` / click | Review pending tools on a node, otherwise open its chat or the selected run |
 | `TAB` | Expand or collapse a run's nodes |
 | `?` | Open the dashboard action menu |
 | `g` | Refresh the dashboard |
@@ -699,8 +700,11 @@ changes to another major mode.
 While a tool call is in progress, its agent-call row enters the
 `waiting-tool` state and displays `Calling TOOL-NAME...`.  This makes tools
 that wait for user input, such as `AskUserQuestion`, visible without opening
-the agent transcript.  Calls that still need approval continue to display the
-separate `waiting-confirmation` state until they are accepted.
+the agent transcript. When a node needs permission to run tools, its row shows
+the pending approval count. Press `RET`, click the row, or use `? y` to review
+the tool names, arguments, and requesting conversations together. Choose
+**Approve once** for one request or press `a` to approve all requests shown for
+that node. Use `? v` on the dashboard row to open the chat directly.
 
 Dashboard columns are a configurable set.  Their order in the value is
 ignored so the table keeps a stable canonical layout:
@@ -742,7 +746,10 @@ also passed to `gptel-runner-event-hook`.
 Each agent node owns a gptel buffer named `*gptel:WORKFLOW/NODE*`. The buffer
 contains the prompt, assistant replies, and the tool and reasoning blocks
 enabled by your gptel settings. You can edit or continue the conversation
-with the usual gptel commands. An accepted workflow result changes when the
+with the usual gptel commands. While the run is unfinished, its node chats
+stay alive. Close the window or bury the buffer to hide a chat. Use the
+dashboard's `? p` to pause a node for feedback or `? k` to abort it.
+An accepted workflow result changes when the
 runner completes a new turn or you explicitly accept a revision. Set
 `gptel-runner-retain-worker-buffers` to nil to close the buffers when the run
 finishes. Elisp and control-flow nodes have inspectable outcomes.
@@ -756,6 +763,10 @@ obtain a new response, then run
 `M-x gptel-runner-complete-call-from-buffer`.  An active region is used when
 present; otherwise the latest gptel response is returned to the workflow.  The
 workflow then continues from that node's original continuation.
+
+You can also send the correction with `? f` on the waiting node. Feedback
+starts a new user turn after the rendered replies and tool output. Any unsent
+draft stays below that turn and is excluded from the request.
 
 This is deliberately different from `gptel-runner-abort-call`: aborting is a
 terminal cancellation, while pausing enters the `waiting-feedback` state.
@@ -1015,7 +1026,7 @@ the callback already invoked for the original failure is not called again.
 Use `M-x gptel-runner-save-session` for an explicit save or `:persist t`
 for automatic checkpoints. All node chats, child discussions, and delegated
 worker transcripts belong to their run, including while automatic saving
-is off. Look them up in the runner dashboard. On a node row, `RET` opens
+is off. Look them up in the runner dashboard. On a node row, `? v` opens
 its chat and `? j` shows its child transcripts. On a run row, `? j` includes
 children from every node. Saved discussion transcripts and worker diagnostic
 text are available after reopening the run. New agent work is scheduled by
@@ -1263,7 +1274,9 @@ include the invocation and worker generation to avoid cross-process collisions.
 ### Inspect and control background work
 
 The dashboard displays background invocations alongside local runs. Press
-`RET` on an agent node to open its published conversation. The header says
+`RET` on a node with pending tools to review its requests in the worker
+controls. On other agent nodes, `RET` opens the published conversation.
+You can always open a published chat with `? v`. The header says
 **Local chat copy**. You can send follow-ups in this copy, and its edits stay
 in your Emacs. To revise the answer used by the workflow, follow **Worker
 controls** or use `? w` in the background dashboard. From there, **Feedback**

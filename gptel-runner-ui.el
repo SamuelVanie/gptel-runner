@@ -33,6 +33,8 @@
 (declare-function gptel-runner-complete-call-from-buffer
                   "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-feedback "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-pending-interactions "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-approve-interactions "gptel-runner-gptel")
 
 (defconst gptel-runner-dashboard--column-specs
   '((item "Workflow / node" 38)
@@ -165,18 +167,32 @@ An elided value retains its complete unpropertized text as hover help."
      ((or 'running 'ready) 'font-lock-keyword-face)
      (_ 'shadow))))
 
+(defun gptel-runner-ui--approval-count (count)
+  "Format COUNT pending approval requests for a dashboard row."
+  (propertize (format "%d approval%s pending" count (if (= count 1) "" "s"))
+              'face 'warning))
+
+(defun gptel-runner-ui--pending-approvals (call)
+  "Return the actionable tool requests on local CALL."
+  (when (and call (eq (gptel-runner-call-state call) 'waiting-confirmation)
+             (fboundp 'gptel-runner-gptel-pending-interactions))
+    (gptel-runner-gptel-pending-interactions call)))
+
 (defun gptel-runner-ui--call-state (call)
   "Return CALL's dashboard state, including an active tool name."
-  (let ((state (gptel-runner-call-state call)))
-    (if (eq state 'waiting-tool)
-        (propertize
-         (format "Calling %s..."
-                 (if-let* ((names (gptel-runner-call-tool-names call)))
-                     (mapconcat (lambda (name) (format "%s" name))
-                                (ensure-list names) ", ")
-                   "tool"))
-         'face 'warning)
-      (gptel-runner-ui--state state))))
+  (let ((state (gptel-runner-call-state call))
+        (pending (gptel-runner-ui--pending-approvals call)))
+    (cond
+     (pending (gptel-runner-ui--approval-count (length pending)))
+     ((eq state 'waiting-tool)
+      (propertize
+       (format "Calling %s..."
+               (if-let* ((names (gptel-runner-call-tool-names call)))
+                   (mapconcat (lambda (name) (format "%s" name))
+                              (ensure-list names) ", ")
+                 "tool"))
+       'face 'warning))
+     (t (gptel-runner-ui--state state)))))
 
 (defun gptel-runner-ui--elapsed (run &optional call)
   "Return elapsed seconds for RUN or CALL as a compact string."
@@ -576,6 +592,10 @@ CALL may supply explicit provenance when this function is called from Lisp."
   "Return non-nil when the call at point has a live or saved chat."
   (gptel-runner-ui--chat-available-p (gptel-runner-ui--call-at-point)))
 
+(defun gptel-runner-ui--approvals-at-point-p ()
+  "Whether the selected node has a tool request to review."
+  (gptel-runner-ui--pending-approvals (gptel-runner-ui--call-at-point)))
+
 (defun gptel-runner-ui--pausable-call-at-point-p ()
   "Return non-nil when the call at point can be paused for feedback."
   (let ((call (gptel-runner-ui--call-at-point)))
@@ -750,16 +770,94 @@ When NODE is nil, include every participant.  VISIT opens a node chat."
           (gptel-runner-event-time event) (gptel-runner-event-type event)
           (gptel-runner-event-data event) node visit))))))
 
+(defun gptel-runner-ui--insert-tool-request (interaction)
+  "Display the source, tool names and arguments in INTERACTION."
+  (insert (propertize
+           (format "  %s%s\n" (or (plist-get interaction :source-buffer) "Agent")
+                   (if (plist-get interaction :outside-access) " · outside directory" ""))
+           'face 'bold))
+  (dolist (tool (plist-get interaction :tools))
+    (insert (propertize (format "  %s\n" (plist-get tool :name))
+                        'face 'font-lock-function-name-face))
+    (let ((args (plist-get tool :args)))
+      (if (and (proper-list-p args) (cl-evenp (length args)))
+          (cl-loop for (key value) on args by #'cddr do
+                   (insert (format "    %s: %s\n" (string-remove-prefix ":" (format "%s" key))
+                                   (if (stringp value) value (pp-to-string value)))))
+        (insert (pp-to-string args))))))
+
+(defvar-local gptel-runner-ui--approval-call nil)
+(defvar-local gptel-runner-ui--displayed-approval-ids nil)
+
+(defun gptel-runner-ui--approve-tools (ids)
+  "Approve the displayed request IDS and update this review."
+  (interactive (list gptel-runner-ui--displayed-approval-ids))
+  (unless ids (user-error "No tool approvals to submit"))
+  (let ((review (current-buffer)))
+    (unwind-protect
+        (gptel-runner-gptel-approve-interactions gptel-runner-ui--approval-call ids)
+      (when (buffer-live-p review)
+        (with-current-buffer review (revert-buffer))))))
+
+(defun gptel-runner-ui--refresh-tool-review (&rest _ignored)
+  "Show current tool requests and bind actions to exactly the displayed IDs."
+  (let* ((call gptel-runner-ui--approval-call)
+         (pending (gptel-runner-ui--pending-approvals call))
+         (ids (mapcar (lambda (item) (plist-get item :id)) pending))
+         (inhibit-read-only t))
+    (erase-buffer)
+    (setq gptel-runner-ui--displayed-approval-ids ids)
+    (insert (propertize (format "%s" (gptel-runner-node-id (gptel-runner-call-node call)))
+                        'face 'bold)
+            "  ·  " (if ids (gptel-runner-ui--approval-count (length ids))
+                      "No pending tool approvals")
+            "\n\n")
+    (when (cdr ids)
+      (insert-text-button (format "Approve all %d shown" (length ids))
+                          'follow-link t 'action (lambda (_) (gptel-runner-ui--approve-tools ids)))
+      (insert "\n\n"))
+    (dolist (item pending)
+      (gptel-runner-ui--insert-tool-request item)
+      (let ((id (plist-get item :id)))
+        (insert "  ")
+        (insert-text-button "Approve once" 'follow-link t
+                            'action (lambda (_) (gptel-runner-ui--approve-tools (list id)))))
+      (insert "\n\n"))
+    (goto-char (point-min))))
+
+(define-derived-mode gptel-runner-tool-review-mode special-mode "Runner-Tools"
+  "Review the tool requests on a local node."
+  (setq-local revert-buffer-function #'gptel-runner-ui--refresh-tool-review
+              header-line-format "  TAB Actions   a Approve shown   g Refresh   q Back"))
+
+(define-key gptel-runner-tool-review-mode-map (kbd "a") #'gptel-runner-ui--approve-tools)
+(define-key gptel-runner-tool-review-mode-map (kbd "TAB") #'forward-button)
+(define-key gptel-runner-tool-review-mode-map (kbd "<backtab>") #'backward-button)
+
+(defun gptel-runner-review-tools (call)
+  "Review and approve tools for CALL from the dashboard or its chat."
+  (interactive (list (cdr (gptel-runner-ui--run-context))))
+  (unless (gptel-runner-call-p call) (user-error "Select an agent node"))
+  (let ((buffer (get-buffer-create
+                 (format "*gptel-runner tools:%s*" (gptel-runner-call-id call)))))
+    (with-current-buffer buffer
+      (gptel-runner-tool-review-mode)
+      (setq-local gptel-runner-ui--approval-call call)
+      (revert-buffer))
+    (pop-to-buffer buffer)))
+
 (defun gptel-runner-dashboard-open-at-point ()
-  "Open the selected agent's chat or the run's event journal."
+  "Review pending tools, open the selected agent's chat, or inspect a run."
   (interactive)
   (unless (run-hook-with-args-until-success
            'gptel-runner-dashboard-row-action-functions
            'open (tabulated-list-get-id))
     (let ((call (gptel-runner-ui--call-at-point)))
-      (if (and call (not (gptel-runner--elisp-call-p call)))
-          (gptel-runner-dashboard-visit-worker)
-        (gptel-runner-dashboard-inspect-events)))))
+      (cond
+       ((gptel-runner-ui--pending-approvals call) (gptel-runner-review-tools call))
+       ((and call (not (gptel-runner--elisp-call-p call)))
+        (gptel-runner-dashboard-visit-worker))
+       (t (gptel-runner-dashboard-inspect-events))))))
 
 (defun gptel-runner-dashboard-visit-worker ()
   "Visit the live or saved node chat for the call at point."
@@ -1078,6 +1176,8 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
     ("v" "Open node chat" gptel-runner-dashboard-visit-worker
      :inapt-if-not gptel-runner-ui--worker-at-point-p)]
    ["Call"
+    ("y" "Review pending tools" gptel-runner-review-tools
+     :if gptel-runner-ui--approvals-at-point-p)
     ("p" "Pause for feedback" gptel-runner-dashboard-pause-call
      :inapt-if-not gptel-runner-ui--pausable-call-at-point-p)
     ("f" "Send feedback" gptel-runner-dashboard-send-feedback

@@ -18,6 +18,7 @@
 (require 'gptel-runner-discussion)
 
 (declare-function gptel "gptel")
+(declare-function org-in-block-p "org")
 (declare-function gptel-prompt-prefix-string "gptel-request")
 (declare-function gptel--save-state "gptel")
 (declare-function gptel--restore-state "gptel")
@@ -48,6 +49,7 @@
 (declare-function gptel--make-tool "gptel-request")
 (declare-function gptel--parse-directive "gptel-request")
 (declare-function gptel--accept-tool-calls "gptel")
+(declare-function gptel--cleanup-tool-call-overlay "gptel")
 (declare-function gptel-runner--complete-restored-call "gptel-runner-flow")
 (declare-function gptel-runner--resume-discussions "gptel-runner-flow")
 
@@ -71,6 +73,8 @@
 (defvar gptel-response-separator)
 (defvar-local gptel-runner-gptel--submitted-end nil
   "End of the last workflow prompt submitted in this node chat.")
+(defvar-local gptel-runner-gptel--rendered-end nil
+  "End of rendered request output, including text without a gptel property.")
 (defvar-local gptel-runner-gptel--manual-requests nil
   "Ordinary gptel sends still using this node chat.")
 (defvar gptel-prompt-transform-functions)
@@ -89,6 +93,9 @@
   "Driver backed by `gptel-request'.")
 
 (defvar gptel-runner-gptel--cancelling nil)
+
+(defvar gptel-runner-gptel--approval-owner nil
+  "Call, FSM and optional supervisor for the approval currently being drawn.")
 
 (defvar gptel-runner-headless nil
   "Non-nil when runner interactions are handled without local UI.")
@@ -121,6 +128,31 @@ must route replies back to that owning process.")
                               :pending-interactions pending)
                    :pending-interaction (car pending))))
 
+(defun gptel-runner-gptel--interaction-overlay (pending)
+  "Return the live native preview that still belongs to PENDING."
+  (when-let* ((overlay (plist-get pending :overlay))
+              ((overlay-buffer overlay))
+              ((equal (cdr (overlay-get overlay 'gptel-runner-interaction))
+                      (plist-get (plist-get pending :description) :id))))
+    overlay))
+
+(defun gptel-runner-gptel--dismiss-preview (pending)
+  "Remove PENDING's native prompt and release its tool-specific previews."
+  (when-let* ((overlay (gptel-runner-gptel--interaction-overlay pending)))
+    (with-current-buffer (overlay-buffer overlay)
+      (save-restriction
+        (widen)
+        (if (fboundp 'gptel--cleanup-tool-call-overlay)
+            (gptel--cleanup-tool-call-overlay overlay)
+          ;; Older gptel releases expose preview teardown on the overlay.
+          (dolist (teardown (overlay-get overlay 'previews))
+            (when (car teardown) (apply teardown)))
+          (let ((inhibit-read-only t))
+            (dolist (prompt (overlay-get overlay 'prompt))
+              (when (overlay-buffer prompt)
+                (delete-region (overlay-start prompt) (overlay-end prompt)))))
+          (delete-overlay overlay))))))
+
 (defun gptel-runner-gptel--interaction-live-p (call pending)
   "Whether PENDING still belongs to a live request in CALL's generation."
   (let ((description (plist-get pending :description))
@@ -130,12 +162,20 @@ must route replies back to that owning process.")
             (plist-get description :generation))
          (buffer-live-p (or (plist-get pending :buffer)
                             (gptel-runner-call-buffer call)))
+         (or (null (plist-get pending :overlay))
+             (gptel-runner-gptel--interaction-overlay pending))
          (or (null (plist-get pending :agent-supervision))
              (gptel-agent-supervision-request-live-p
               (plist-get pending :agent-supervision) fsm))
          (or (null fsm)
              (and (eq (gptel-fsm-state fsm) 'TOOL)
                   (eq (plist-get pending :info) (gptel-fsm-info fsm)))))))
+
+(defun gptel-runner-gptel-pending-interactions (call)
+  "Return data-only descriptions of the currently actionable requests on CALL."
+  (cl-loop for entry in (gptel-runner-gptel--interactions call)
+           when (gptel-runner-gptel--interaction-live-p call entry)
+           collect (copy-tree (plist-get entry :description) t)))
 
 (defun gptel-runner-gptel-interaction-pending-p (call id)
   "Whether approval ID is still pending on CALL."
@@ -147,10 +187,10 @@ must route replies back to that owning process.")
 (defun gptel-runner-gptel--sync-interactions (call)
   "Discard stale approvals and retain CALL's waiting state for live ones."
   (let* ((previous (gptel-runner-gptel--interactions call))
-         (pending (cl-remove-if-not
-                  (lambda (entry)
-                    (gptel-runner-gptel--interaction-live-p call entry))
-                  previous)))
+         (pending
+          (cl-loop for entry in previous
+                   if (gptel-runner-gptel--interaction-live-p call entry) collect entry
+                   else do (gptel-runner-gptel--dismiss-preview entry))))
     (gptel-runner-gptel--set-interactions call pending)
     (cond
      ((and pending
@@ -161,8 +201,8 @@ must route replies back to that owning process.")
       (gptel-runner-gptel--observe
        call 'waiting-tool (gptel-runner-call-tool-names call))))))
 
-(defun gptel-runner-gptel--pending-interaction (call tools &optional fsm scope)
-  "Publish CALL's approval for TOOLS from FSM, optionally supervised by SCOPE."
+(defun gptel-runner-gptel--pending-interaction (call tools &optional fsm scope overlay)
+  "Publish CALL's TOOLS from FSM with optional supervisor SCOPE and OVERLAY."
   (let ((interaction
          (list :id (gptel-runner--id "interaction") :kind 'tool-approval
                :call-id (gptel-runner-call-id call)
@@ -186,9 +226,13 @@ must route replies back to that owning process.")
                              tools)))
                      (plist-get (gptel-fsm-info fsm) :tool-use))
                     t))))
+    (when overlay
+      (overlay-put overlay 'gptel-runner-interaction
+                   (cons call (plist-get interaction :id))))
     (gptel-runner-gptel--set-interactions
      call (append (gptel-runner-gptel--interactions call)
                   (list (list :description interaction :tools tools :fsm fsm
+                              :overlay overlay
                               :agent-supervision scope
                               :info (and fsm (gptel-fsm-info fsm))
                               :buffer (if fsm (plist-get (gptel-fsm-info fsm) :buffer)
@@ -197,6 +241,33 @@ must route replies back to that owning process.")
     (run-hook-with-args 'gptel-runner-interaction-hook call
                         (copy-tree interaction t))
     interaction))
+
+(defun gptel-runner-gptel--display-tool-calls (original tools info &rest args)
+  "Register the native approval drawn by ORIGINAL for TOOLS, INFO and ARGS."
+  (let* ((call (plist-get info :context))
+         (gptel-runner-gptel--approval-owner
+          (and (gptel-runner-call-p call)
+               (list call (gptel-runner-call-fsm call) nil)))
+         ;; Supervision supplies the owner of a descendant during display.
+         (prompt (apply original tools info args)))
+    (when (and gptel-runner-gptel--approval-owner (overlayp prompt)
+               (overlay-buffer prompt))
+      (pcase-let ((`(,owner ,fsm ,scope) gptel-runner-gptel--approval-owner))
+        (when-let* ((fsm)
+                    ((eq (gptel-fsm-info fsm) info))
+                    (overlay
+                     (with-current-buffer (overlay-buffer prompt)
+                       ;; A tool-specific preview can have no inline text.
+                       (save-restriction
+                         (widen)
+                         (cl-find-if (lambda (ov) (memq prompt (overlay-get ov 'prompt)))
+                                     (overlays-in (max (point-min) (1- (overlay-start prompt)))
+                                                  (min (point-max) (1+ (overlay-end prompt)))))))))
+          ;; The overlay contains the guarded tool functions and editable
+          ;; callbacks that gptel will use when accepted in the conversation.
+          (gptel-runner-gptel--pending-interaction
+           owner (overlay-get overlay 'gptel-tool) fsm scope overlay))))
+    prompt))
 
 (defun gptel-runner-gptel-answer-interaction (call interaction-id approve
                                                 &optional allow-outside)
@@ -222,6 +293,7 @@ Ordinary confirmations and file reviews remain enabled."
     ;; Consume before executing: synchronous tools may create a new gate.
     (gptel-runner-gptel--set-interactions
      call (remq pending (gptel-runner-gptel--interactions call)))
+    (gptel-runner-gptel--dismiss-preview pending)
     (gptel-runner--emit
      (gptel-runner-call-run call) 'interaction-answered
      (gptel-runner-call-node call) call
@@ -315,14 +387,20 @@ created by these tools are never included.  Every execution rechecks liveness."
                     (gptel-runner-gptel--sync-interactions call)))
                 :on-tool-approval
                 (lambda (scope fsm calls)
-                  (when gptel-runner-headless
-                    (when (and (= generation (gptel-runner-call-generation call))
-                               (not (gptel-runner--call-terminal-p call)))
-                      (gptel-runner-gptel--pending-interaction call calls fsm scope))
-                    t)))))))))
+                  (cond
+                   ((or (/= generation (gptel-runner-call-generation call))
+                        (gptel-runner--call-terminal-p call)) t)
+                   (gptel-runner-headless
+                    (gptel-runner-gptel--pending-interaction call calls fsm scope)
+                    t)
+                   (t
+                    (setq gptel-runner-gptel--approval-owner (list call fsm scope))
+                    nil))))))))))
 
 (defun gptel-runner-gptel--stop-supervision (call)
   "Release CALL's optional agent supervisor and pending approvals."
+  (dolist (entry (gptel-runner-gptel--interactions call))
+    (gptel-runner-gptel--dismiss-preview entry))
   (gptel-runner-gptel-revoke-outside-access call)
   (when-let* ((scope (plist-get (gptel-runner-call-driver-data call)
                                 :agent-supervision)))
@@ -343,7 +421,8 @@ created by these tools are never included.  Every execution rechecks liveness."
                       gptel-curl--stream-insert-response
                       gptel--update-tool-ask gptel--update-tool-call
                       gptel--update-status gptel--update-wait
-                      gptel--accept-tool-calls gptel--handle-pre-tool
+                      gptel--accept-tool-calls gptel--display-tool-calls
+                      gptel--handle-pre-tool
                       gptel--handle-post-tool gptel--handle-tool-steer
                       gptel--tool-steer-p))
     (unless (fboundp function)
@@ -355,21 +434,39 @@ created by these tools are never included.  Every execution rechecks liveness."
   (when-let* ((marker (buffer-local-value 'gptel-runner-gptel--submitted-end buffer)))
     (marker-position marker)))
 
-(defun gptel-runner-gptel-restore-submitted-end (buffer position)
-  "Restore the latest submitted prompt boundary in BUFFER to POSITION."
+(defun gptel-runner-gptel-rendered-end (buffer)
+  "Return the position after the latest rendered output in BUFFER."
+  (when-let* ((marker (buffer-local-value 'gptel-runner-gptel--rendered-end buffer)))
+    (marker-position marker)))
+
+(defun gptel-runner-gptel-restore-submitted-end (buffer position &optional rendered)
+  "Restore BUFFER's submitted prompt POSITION and optional RENDERED output end."
   (with-current-buffer buffer
     (save-restriction
       (widen)
       (when (and (integerp position) (<= (point-min) position (point-max)))
-        (setq gptel-runner-gptel--submitted-end (copy-marker position))))))
+        (setq gptel-runner-gptel--submitted-end (copy-marker position)))
+      (when (and (integerp rendered) (<= (point-min) rendered (point-max)))
+        (setq gptel-runner-gptel--rendered-end (copy-marker rendered))))))
 
 (defun gptel-runner-gptel--history-end ()
   "Return the end of the submitted conversation in this widened node chat."
   (save-excursion
     (goto-char (point-max))
-    (let ((role (text-property-search-backward 'gptel nil nil)))
+    (let ((role (text-property-search-backward 'gptel)))
+      (when role
+        (goto-char (prop-match-end role))
+        ;; Old Org snapshots have no output marker.  gptel marks a block's
+        ;; payload but leaves its closing delimiter outside that region.
+        (when (and (derived-mode-p 'org-mode)
+                   (>= (point) (or gptel-runner-gptel--rendered-end (point-min)))
+                   (looking-at "[ \t\n]*#\\+end_\\(tool\\|reasoning\\)[ \t]*\\(?:\n\\|\\'\\)"))
+          (let ((end (match-end 0)))
+            (when (org-in-block-p (list (match-string 1)))
+              (goto-char end)))))
       (max (or gptel-runner-gptel--submitted-end (point-min))
-           (if role (prop-match-end role) (point-min))))))
+           (or gptel-runner-gptel--rendered-end (point-min))
+           (if role (point) (point-min))))))
 
 (defun gptel-runner-gptel--mark-submitted ()
   "Remember point as the end of this turn, separating a trailing draft."
@@ -458,6 +555,7 @@ created by these tools are never included.  Every execution rechecks liveness."
                         ((derived-mode-p 'markdown-mode) 'markdown)
                         (t 'text)))
             (submitted (gptel-runner-gptel-submitted-end buffer))
+            (rendered (gptel-runner-gptel-rendered-end buffer))
             (workspace default-directory)
             (confirmation gptel-confirm-tool-calls))
         (with-temp-buffer
@@ -468,6 +566,7 @@ created by these tools are never included.  Every execution rechecks liveness."
             (set (make-local-variable setting) (buffer-local-value setting buffer)))
           (insert-buffer-substring buffer)
           (when submitted (setq submitted (copy-marker submitted)))
+          (when rendered (setq rendered (copy-marker rendered)))
           ;; Start a separate locals block even when the user's draft itself
           ;; contains an example of Emacs file-local variables.
           (when (eq mode 'org) (gptel--save-state))
@@ -479,6 +578,9 @@ created by these tools are never included.  Every execution rechecks liveness."
             (when submitted
               (add-file-local-variable 'gptel-runner-submitted-end
                                        (marker-position submitted)))
+            (when rendered
+              (add-file-local-variable 'gptel-runner-rendered-end
+                                       (marker-position rendered)))
             (unless (eq mode 'org)
               (save-restriction
                 (narrow-to-region footer (point-max))
@@ -503,7 +605,8 @@ created by these tools are never included.  Every execution rechecks liveness."
       (let ((read-circle nil))
         (while (re-search-forward "^;; \\([^ :\n]+\\):[ \t]*" nil t)
           (let ((key (intern-soft (match-string 1))))
-            (when (memq key '(mode gptel-runner-submitted-end gptel-runner-directory
+            (when (memq key '(mode gptel-runner-submitted-end gptel-runner-rendered-end
+                              gptel-runner-directory
                               gptel-confirm-tool-calls gptel-model
                               gptel--preset gptel--backend-name gptel-system-prompt
                               gptel--tool-names gptel--bounds gptel-max-tokens
@@ -537,7 +640,8 @@ created by these tools are never included.  Every execution rechecks liveness."
                         ((memq (cdr entry) '(auto t nil))))
               (setq-local gptel-confirm-tool-calls (cdr entry)))
             (gptel-runner-gptel-restore-submitted-end
-             buffer (alist-get 'gptel-runner-submitted-end settings))
+             buffer (alist-get 'gptel-runner-submitted-end settings)
+             (alist-get 'gptel-runner-rendered-end settings))
             (goto-char (point-max))
             buffer)
         (error (kill-buffer buffer) (signal (car err) (cdr err)))))))
@@ -726,12 +830,27 @@ Used as a TYPE transition predicate, after the full response is parsed."
                (format "Incomplete tool response: stop reason %S without tool calls"
                        (plist-get info :stop-reason)))))
 
+(defun gptel-runner-gptel--note-rendered-end (info)
+  "Remember the native output marker from request INFO in its source chat."
+  (when-let* ((marker (or (plist-get info :tracking-marker) (plist-get info :position)))
+              ((markerp marker))
+              (buffer (marker-buffer marker))
+              ((eq buffer (plist-get info :buffer))))
+    (with-current-buffer buffer
+      (when (>= marker (or gptel-runner-gptel--rendered-end (point-min)))
+        (setq gptel-runner-gptel--rendered-end marker)))))
+
 (defun gptel-runner-gptel--insert-response (response info &optional raw)
   "Render RESPONSE using the transport described by INFO, honoring RAW."
-  (funcall (if (plist-get info :stream)
-               #'gptel-curl--stream-insert-response
-             #'gptel--insert-response)
-           response info raw))
+  (prog1 (funcall (if (plist-get info :stream)
+                      #'gptel-curl--stream-insert-response
+                    #'gptel--insert-response)
+                  response info raw)
+    ;; The native renderer advances this marker through raw text and block
+    ;; delimiters too.  Typing a draft at the marker leaves it in place.
+    (when (and (eq (car-safe response) 'reasoning) (plist-get info :reasoning-marker))
+      (plist-put info :runner-open-reasoning (stringp (cdr response))))
+    (gptel-runner-gptel--note-rendered-end info)))
 
 (defun gptel-runner-gptel--callback (call observe response info &optional raw)
   "Use OBSERVE to record gptel RESPONSE and INFO for CALL.
@@ -917,6 +1036,15 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
 (defun gptel-runner-gptel--retire-request (call)
   "Disarm CALL's finished request before another turn can reuse this chat."
   (when-let* ((fsm (gptel-runner-call-fsm call)))
+    (let ((info (gptel-fsm-info fsm)))
+      ;; A paused stream may never deliver the native end-of-reasoning
+      ;; callback.  Close its display block before inserting a user prompt.
+      (when (and (plist-get info :runner-open-reasoning)
+                 (buffer-live-p (plist-get info :buffer)))
+        (gptel-runner-gptel--insert-response '(reasoning . t) info))
+      ;; A delegated tool-only turn may advance the parent's request
+      ;; position to reserve its child display before any response arrives.
+      (gptel-runner-gptel--note-rendered-end info))
     ;; A late async tool result can advance its old FSM even after abort.
     ;; Each runner FSM owns its handler table.  Keep its request data for
     ;; inspection while preventing another send or insertion into the chat.
@@ -1174,6 +1302,7 @@ At a human approval gate the new response awaits explicit acceptance using
       (condition-case err
           (let ((mark-active nil))
             (gptel-runner-gptel--start-supervision call)
+            (goto-char gptel-runner-gptel--submitted-end)
             (gptel-request nil
               :buffer (current-buffer) :stream gptel-stream
               :context call :fsm fsm
@@ -1181,6 +1310,7 @@ At a human approval gate the new response awaits explicit acceptance using
               :callback
               (lambda (response info &optional raw)
                 (when (and (= generation (gptel-runner-call-generation call))
+                           (plist-get (gptel-runner-call-driver-data call) :feedback-active)
                            (not (gptel-runner--call-terminal-p call)))
                   (gptel-runner-gptel--callback call observe response info raw)))))
         (error
@@ -1269,6 +1399,7 @@ node result and reconstructs the continuation from the workflow AST."
   "Release FSM's reservation of BUFFER, then admit waiting workflow turns."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
+      (gptel-runner-gptel--note-rendered-end (gptel-fsm-info fsm))
       (setq gptel-runner-gptel--manual-requests (delq fsm gptel-runner-gptel--manual-requests))
       (unless gptel-runner-gptel--manual-requests
         (remove-hook 'kill-buffer-hook #'gptel-runner-gptel--wake-chat-queue t)
@@ -1329,17 +1460,26 @@ node result and reconstructs the continuation from the workflow AST."
   "Mark a confirmed runner tool active before calling ORIGINAL.
 RESPONSE and OVERLAY are the arguments accepted by
 `gptel--accept-tool-calls'."
-  (let* ((target (or (and (overlayp overlay) (overlay-buffer overlay))
+  (let* ((interaction (and (overlayp overlay) (overlay-get overlay 'gptel-runner-interaction)))
+         (target (or (and interaction (plist-get (overlay-get overlay 'info) :buffer))
+                     (and (overlayp overlay) (overlay-buffer overlay))
                      (current-buffer)))
-         (call (and (buffer-live-p target)
-                    (buffer-local-value 'gptel-runner--call target))))
+         (call (or (car interaction)
+                   (and (buffer-live-p target)
+                        (buffer-local-value 'gptel-runner--call target)))))
+    ;; A gptel inspection buffer can retain the old overlay after a dashboard
+    ;; approval or a pause.  Its edited callbacks must not execute a second time.
+    (when (and interaction
+               (not (gptel-runner-gptel-interaction-pending-p call (cdr interaction))))
+      (user-error "This tool request is no longer pending"))
     (when (and (gptel-runner-call-p call)
                (eq (gptel-runner-call-state call) 'waiting-confirmation))
       (gptel-runner-gptel--observe
        call 'waiting-tool (gptel-runner-call-tool-names call)))
-    (if call
-        (with-current-buffer target (funcall original response overlay))
-      (funcall original response overlay))))
+    (if (not call) (funcall original response overlay)
+      (unwind-protect
+          (with-current-buffer target (funcall original response overlay))
+        (gptel-runner-gptel--sync-interactions call)))))
 
 (defun gptel-runner-gptel-install-abort-advice ()
   "Install conditional runner integration around gptel commands."
@@ -1356,7 +1496,12 @@ RESPONSE and OVERLAY are the arguments accepted by
   (unless (advice-member-p #'gptel-runner-gptel--around-accept-tool-calls
                            'gptel--accept-tool-calls)
     (advice-add 'gptel--accept-tool-calls :around
-                #'gptel-runner-gptel--around-accept-tool-calls)))
+                #'gptel-runner-gptel--around-accept-tool-calls))
+  ;; Surround gptel-agent's supervision and display handlers.  Registration
+  ;; needs both the owner they identify and the finished native preview.
+  (unless (advice-member-p #'gptel-runner-gptel--display-tool-calls 'gptel--display-tool-calls)
+    (advice-add 'gptel--display-tool-calls :around #'gptel-runner-gptel--display-tool-calls
+                '((depth . -100)))))
 
 (with-eval-after-load 'gptel
   (gptel-runner-gptel-install-abort-advice))

@@ -102,6 +102,110 @@
       (should (= 2 (gptel-runner-budget-requests (gptel-runner-run-budget run))))
       (should-not requests))))
 
+(ert-deftest gptel-runner-gptel-feedback-follows-interrupted-org-tool-output ()
+  (dolist (restore '(nil t))
+    (gptel-runner-gptel-test--with-transport
+      (let ((gptel-default-mode 'org-mode)
+            (gptel-runner-headless restore))
+        (gptel-runner-register-agent 'reader)
+        (let* ((run (gptel-runner-start
+                     (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect")))
+               (call (car (gptel-runner-run-calls run)))
+               (chat (gptel-runner-call-buffer call))
+               (request (pop requests)))
+          (with-current-buffer chat
+            (goto-char (point-max))
+            (insert "Unsent private draft"))
+          (gptel-runner-gptel-test--reply
+           request "Checking" "tool_calls"
+           [(:id "read-1" :type "function"
+                 :function (:name "runner_read" :arguments "{}"))])
+          (should (eq (pop requests) request))
+          (gptel-runner-pause-call call)
+          (when restore
+            ;; Simulate resuming a checkpoint in a different worker.
+            (let ((original chat))
+              (setq chat (gptel-runner-gptel-chat-from-text
+                          (gptel-runner-gptel-chat-text chat)))
+              (gptel-runner-store-track-chat call chat)
+              (kill-buffer original)))
+          (gptel-runner-gptel-feedback call "Continue")
+          (let* ((next (pop requests))
+                 (messages (append (plist-get (plist-get (gptel-fsm-info next) :data)
+                                              :messages) nil)))
+            (should (equal (plist-get (car (last messages)) :content) "Continue"))
+            (should (string-search "repository findings" (prin1-to-string messages)))
+            (should-not (string-search "Unsent private draft" (prin1-to-string messages)))
+            (gptel-runner-gptel-test--reply next "Revised" "stop")
+            (let ((info (gptel-fsm-info next)))
+              (funcall (plist-get info :callback) "Late text" info)))
+          (with-current-buffer chat
+            (goto-char (point-min))
+            (should (search-forward "Checking" nil t))
+            (should (search-forward "#+end_tool" nil t))
+            (should (search-forward "Continue" nil t))
+            (should (search-forward "Revised" nil t))
+            (should (search-forward "Unsent private draft" nil t))
+            (should-not (string-search "Late text" (buffer-string)))))))))
+
+(ert-deftest gptel-runner-gptel-feedback-closes-interrupted-reasoning ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-default-mode 'org-mode) (gptel-stream t))
+      (gptel-runner-register-agent 'reader)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect")))
+             (call (car (gptel-runner-run-calls run)))
+             (info (gptel-fsm-info (pop requests))))
+        (plist-put info :include-reasoning 'ignore)
+        (funcall (plist-get info :callback) '(reasoning . "Partial thought") info)
+        (gptel-runner-pause-call call)
+        (gptel-runner-gptel-feedback call "Continue")
+        (with-current-buffer (gptel-runner-call-buffer call)
+          (goto-char (point-min))
+          (should (search-forward "Partial thought" nil t))
+          (should (search-forward "#+end_reasoning" nil t))
+          (should (search-forward "Continue" nil t)))))))
+
+(ert-deftest gptel-runner-gptel-history-recognizes-legacy-org-block-ends ()
+  (dolist (block '("tool" "reasoning"))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+begin_" block "\n" (propertize "Body" 'gptel 'ignore)
+              "\n#+end_" block "\n")
+      (let ((end (point)))
+        (insert "My draft")
+        (should (= end (gptel-runner-gptel--history-end)))))))
+
+(ert-deftest gptel-runner-gptel-feedback-follows-ordinary-chat-output ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'reader)
+    (let* ((run (gptel-runner-start
+                 (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect"
+                                          :pause-after t)
+                 :completion 'response))
+           (call (car (gptel-runner-run-calls run)))
+           (chat (gptel-runner-call-buffer call)))
+      (gptel-runner-gptel-test--reply (pop requests) "First report" "stop")
+      (with-current-buffer chat
+        (goto-char (point-max))
+        (insert "Check manually")
+        (gptel-send)
+        (insert "My draft"))
+      (let* ((ordinary (pop requests)) (info (gptel-fsm-info ordinary)))
+        ;; A discussion can insert an inbox message with RAW after the model's
+        ;; answer.  It is part of the conversation even without a role property.
+        (setf (plist-get info :callback) #'gptel--insert-response)
+        (gptel--insert-response "Reading" info)
+        (gptel--insert-response "Inbox message" info t)
+        (gptel-runner-gptel-test--reply ordinary nil "stop")
+        (gptel-runner-gptel--release-send chat ordinary))
+      (gptel-runner-gptel-feedback call "Continue")
+      (with-current-buffer chat
+        (goto-char (point-min))
+        (should (search-forward "Inbox message" nil t))
+        (should (search-forward "Continue" nil t))
+        (should (search-forward "My draft" nil t))))))
+
 (ert-deftest gptel-runner-gptel-reviewed-handoff-accepts-payload-or-later-reply ()
   (dolist (manual '(nil t))
     (gptel-runner-gptel-test--with-transport
@@ -754,6 +858,35 @@
         (with-current-buffer chat
           (should (string-suffix-p "Draft for a later discussion" (buffer-string))))))))
 
+(ert-deftest gptel-runner-gptel-protects-node-chats-until-run-finishes ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'planner)
+    (let* ((run (gptel-runner-start
+                 (gptel-runner-sequence
+                  (gptel-runner-agent-step :id 'plan :agent 'planner :prompt "Plan")
+                  (gptel-runner-agent-step :id 'review :agent 'planner :prompt "Review"))))
+           (chat (gptel-runner-node-buffer run 'plan))
+           (call (car (gptel-runner-run-calls run))))
+      (save-window-excursion
+        (switch-to-buffer chat)
+        (should-not (call-interactively #'kill-current-buffer))
+        (quit-window)
+        (should-not (eq (window-buffer) chat)))
+      (should (buffer-live-p chat))
+      (should (eq (gptel-runner-call-state call) 'running))
+      (should (eq (gptel-runner-call-fsm call) (car requests)))
+      (gptel-runner-gptel-test--handoff (pop requests) "Ready to review")
+      (should (eq (gptel-runner-call-state call) 'succeeded))
+      (should-not (kill-buffer chat))
+      (let ((review (gptel-runner-node-buffer run 'review)))
+        (gptel-runner-gptel-test--reply (pop requests) "Which branch?" "stop")
+        (should-not (kill-buffer review))
+        (should (eq (gptel-runner-call-state (buffer-local-value 'gptel-runner--call review))
+                    'waiting-feedback))
+        (gptel-runner-abort-run run)
+        (should (kill-buffer review))
+        (should (kill-buffer chat))))))
+
 (ert-deftest gptel-runner-gptel-queues-workflow-turn-during-ordinary-send ()
   (dolist (end '(reply error abort kill))
     (gptel-runner-gptel-test--with-transport
@@ -791,7 +924,11 @@
           ('abort
            (let ((gptel--request-alist (list (cons 'mock-process (cons manual #'ignore)))))
              (gptel-abort chat)))
-          ('kill (kill-buffer chat)))
+          ('kill
+           (should-not (kill-buffer chat))
+           ;; Forced disposal must still archive the chat and release the queue.
+           (with-current-buffer chat
+             (let ((kill-buffer-query-functions nil)) (kill-buffer chat)))))
         ;; The next dispatch runs after the terminal handlers or kill hooks.
         (should-not requests)
         (accept-process-output nil 0.02)
@@ -1001,6 +1138,57 @@
             (should (= (length (plist-get (plist-get info :data) :messages)) 1))
             (should (eq (gptel-runner-call-state call) 'running))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gptel-runner-gptel-dashboard-and-chat-share-tool-approval ()
+  (dolist (action '(dashboard native pause))
+    (gptel-runner-gptel-test--with-transport
+      (let* ((gptel-confirm-tool-calls t)
+             (executions 0) finish
+             (gptel-tools
+              (list (gptel-make-tool
+                     :name "runner_async_read" :description "Read delayed test evidence."
+                     :args nil :async t :include t
+                     :function (lambda (done) (cl-incf executions) (setq finish done))))))
+        (gptel-runner-register-agent 'reader :preset nil)
+        (let* ((run (gptel-runner-start
+                     (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read")
+                     :completion 'response :driver (gptel-runner-gptel-driver-create)))
+               (call (car (gptel-runner-run-calls run)))
+               (fsm (pop requests)))
+          (gptel-runner-gptel-test--reply
+           fsm nil "tool_calls"
+           [(:id "read-1" :type "function" :function (:name "runner_async_read" :arguments "{}"))])
+          (with-current-buffer (gptel-runner-call-buffer call)
+            (let* ((interactions (gptel-runner-gptel-pending-interactions call))
+                   (id (plist-get (car interactions) :id))
+                   (overlay (cl-find-if (lambda (ov) (overlay-get ov 'gptel-tool))
+                                        (overlays-in (point-min) (point-max))))
+                   (calls (overlay-get overlay 'gptel-tool)))
+              (should (= (length interactions) 1))
+              (should (equal (plist-get (car interactions) :tools)
+                             '((:name "runner_async_read" :args nil))))
+              (pcase action
+                ('dashboard
+                 (save-restriction
+                   ;; The preview may be outside the user's visible subtree.
+                   (narrow-to-region (point-min) (point-min))
+                   (save-window-excursion
+                     (with-current-buffer (gptel-runner-review-tools call)
+                       (unwind-protect
+                           (call-interactively (key-binding (kbd "a")))
+                         (kill-buffer (current-buffer)))))))
+                ('native (gptel--accept-tool-calls calls overlay))
+                ('pause (gptel-runner-pause-call call)))
+              (should-not (overlay-buffer overlay))
+              (should-not (gptel-runner-gptel-pending-interactions call))
+              (should-error (gptel-runner-gptel-answer-interaction call id t) :type 'user-error)
+              (should-error (gptel--accept-tool-calls calls overlay) :type 'user-error)
+              (should-not requests)
+              (if (eq action 'pause) (should (zerop executions))
+                (should (= executions 1))
+                (should (eq (gptel-fsm-state fsm) 'TOOL))
+                (funcall finish "Evidence")
+                (should (equal requests (list fsm)))))))))))
 
 (ert-deftest gptel-runner-gptel-headless-approval-is-data-and-consumed-once ()
   (gptel-runner-gptel-test--with-transport

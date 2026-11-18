@@ -231,6 +231,27 @@
       (should-error (gptel-runner-gptel-answer-interaction call (plist-get (car interactions) :id) t)
                     :type 'user-error))))
 
+(ert-deftest gptel-runner-delegation-foreground-approval-targets-owning-child ()
+  (gptel-runner-delegation-test--with-run
+    (let* ((gptel-runner-headless nil)
+           (worker (gptel-runner-delegation-test--agent fsm t))
+           (child (gptel-agent--run-fsm worker))
+           (chat (gptel-runner-delegation-test--discussion fsm))
+           (discussion (gptel-agent-discussion--chat-fsm chat)))
+      (dolist (request (list child discussion))
+        (with-current-buffer (plist-get (gptel-fsm-info request) :buffer)
+          (setq-local gptel-confirm-tool-calls t))
+        (gptel-runner-delegation-test--tool request "delegation_probe" nil))
+      (let ((pending (gptel-runner-gptel-pending-interactions call)))
+        (should (= (length pending) 2))
+        (gptel-runner-gptel-answer-interaction call (plist-get (car pending) :id) t)
+        (should (equal executions (list (gptel-agent--run-child-buffer worker))))
+        (should (eq (gptel-runner-call-state call) 'waiting-confirmation))
+        (should (equal (gptel-runner-gptel-pending-interactions call) (cdr pending)))
+        (gptel-runner-gptel-answer-interaction call (plist-get (cadr pending) :id) t)
+        (should (eq (car executions) (gptel-agent-discussion--chat-buffer chat)))
+        (should-not (gptel-runner-gptel-pending-interactions call))))))
+
 (ert-deftest gptel-runner-delegation-batch-approves-both-child-conversations ()
   (gptel-runner-delegation-test--with-run
     (let* ((worker (gptel-runner-delegation-test--agent fsm t))

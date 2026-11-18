@@ -56,14 +56,6 @@
             (plist-get call :epoch) (plist-get call :id))
     (list 'background-run (plist-get run :id))))
 
-(defun gptel-runner-panel--interactions (run call)
-  "Return only RUN's current requests owned by CALL's exact epoch."
-  (cl-remove-if-not
-   (lambda (item)
-     (and (equal (plist-get item :call-id) (plist-get call :id))
-          (equal (plist-get item :epoch) (plist-get call :epoch))))
-   (plist-get run :interactions)))
-
 (defun gptel-runner-panel--submitted-p (id)
   "Whether displayed interaction ID already has a submitted decision."
   (cl-some (lambda (entry)
@@ -176,19 +168,7 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
 (defun gptel-runner-panel--request (run call interaction)
   "Insert a readable INTERACTION and its individual actions for CALL in RUN."
   (let ((id (plist-get interaction :id)) (start (point)))
-    (insert (propertize
-             (format "  %s%s\n" (or (plist-get interaction :source-buffer) "Agent")
-                     (if (plist-get interaction :outside-access) " · outside directory" ""))
-             'face 'bold))
-    (dolist (tool (plist-get interaction :tools))
-      (insert (propertize (format "  %s\n" (plist-get tool :name))
-                          'face 'font-lock-function-name-face))
-      (let ((args (plist-get tool :args)))
-        (if (and (proper-list-p args) (cl-evenp (length args)))
-            (cl-loop for (key value) on args by #'cddr do
-                     (insert (format "    %s: %s\n" (string-remove-prefix ":" (format "%s" key))
-                                     (if (stringp value) value (pp-to-string value)))))
-          (insert (pp-to-string args)))))
+    (gptel-runner-ui--insert-tool-request interaction)
     (if (gptel-runner-panel--submitted-p id)
         (insert (propertize "  Decision submitted — awaiting worker update\n" 'face 'shadow))
       (insert "  ")
@@ -208,7 +188,7 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
 
 (defun gptel-runner-panel--call (run call)
   "Insert CALL's state and approval group in RUN."
-  (let ((interactions (gptel-runner-panel--interactions run call)))
+  (let ((interactions (gptel-runner-jobs-ui--call-interactions run call)))
     (insert (propertize (format "%s" (plist-get call :node)) 'face 'bold)
             (format "  ·  %s  ·  " (or (plist-get call :agent) "Elisp"))
             (gptel-runner-ui--state (plist-get call :state))
@@ -291,7 +271,7 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
            (lambda () (gptel-runner-background-visit target)))
           (insert (format " · %s · " (or (plist-get item :agent) "Elisp")))
           (insert (gptel-runner-ui--state (plist-get item :state)))
-          (let ((count (length (gptel-runner-panel--interactions run item))))
+          (let ((count (length (gptel-runner-jobs-ui--call-interactions run item))))
             (when (> count 0)
               (insert (propertize (format " · %d approvals" count) 'face 'warning))))
           (insert "\n\n"))))

@@ -64,6 +64,14 @@
   (cl-remove-if #'gptel-runner-invocation-forgotten-p
                 (gptel-runner-invocation-list)))
 
+(defun gptel-runner-jobs-ui--call-interactions (run call)
+  "Return pending requests for CALL's exact epoch in RUN."
+  (cl-remove-if-not
+   (lambda (item)
+     (and (equal (plist-get item :call-id) (plist-get call :id))
+          (equal (plist-get item :epoch) (plist-get call :epoch))))
+   (plist-get run :interactions)))
+
 (defun gptel-runner-jobs-ui--entries ()
   "Return external invocation rows using only their compact manifests."
   (let (entries)
@@ -99,14 +107,9 @@
                                     (format "%s" (plist-get call :agent)))
                                    (t "")))
                     (call . ,(plist-get call :id))
-                    (state . ,(let ((count (cl-count-if
-                                           (lambda (item)
-                                             (and (equal (plist-get item :call-id) (plist-get call :id))
-                                                  (equal (plist-get item :epoch) (plist-get call :epoch))))
-                                           (plist-get run :interactions))))
-                                (if (> count 0)
-                                    (propertize (format "%d approval%s pending" count
-                                                        (if (= count 1) "" "s")) 'face 'warning)
+                    (state . ,(let ((pending (gptel-runner-jobs-ui--call-interactions run call)))
+                                (if pending
+                                    (gptel-runner-ui--approval-count (length pending))
                                   (gptel-runner-ui--state (plist-get call :state)))))
                     (elapsed . ,(gptel-runner-jobs-ui--elapsed call))
                     (attempts . ,(format "%s" (or (plist-get call :attempts) 0))))))
@@ -238,12 +241,14 @@ at point."
         (setq-local gptel-runner-background--target target)))))
 
 (defun gptel-runner-background-visit (&optional target)
-  "Visit TARGET's chat, or its controls when there is no chat.
+  "Visit TARGET's controls for pending approvals, or its available chat.
 TARGET defaults to the selected background run or node."
   (interactive)
   (let* ((selection (gptel-runner-jobs-ui--selection target))
+         (run (car selection))
          (call (nth 1 selection)))
-    (if (and call (or (plist-get call :chat) (plist-get call :transcript)))
+    (if (and call (or (plist-get call :chat) (plist-get call :transcript))
+             (not (gptel-runner-jobs-ui--call-interactions run call)))
         (gptel-runner-background-transcript selection)
       (gptel-runner-background-open (nth 2 selection)))))
 

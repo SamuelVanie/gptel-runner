@@ -9,13 +9,17 @@
   keep completion on an ordinary assistant response.
 
 - Each agent node now uses an ordinary gptel conversation across turns.
-  Open it with `RET` in the dashboard. Save and reopen a named run with
+  Open it with `? v` in the dashboard. Save and reopen a named run with
   `gptel-runner-save-session` and `gptel-runner-open-session`. Version 4
   checkpoints include the node chats, child transcripts, and pending feedback.
   Runner-owned chats stay under their run even with global gptel-agent session
   saving enabled. Open child transcripts with `? j` on a node or run.
   Background agents publish editable copies that link to the worker controls.
   Existing version 2 and 3 checkpoints and background text transcripts still open.
+- Unfinished runs keep their node chats alive when you close a window or try
+  to kill the buffer. Feedback follows interrupted tool output and reasoning,
+  preserving unsent drafts. Press `RET` on a dashboard node with pending tools
+  to review and approve the requests for that node.
 - Rerun a finished workflow from its first node with the same goal, chats,
   and fresh budget accounting via `gptel-runner-rerun` or `? R` on the
   local or background run. Previous outputs remain in continuation history.
