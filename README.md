@@ -67,8 +67,8 @@ Define one with
  :callback (lambda (run) (message "Run: %s" (gptel-runner-run-state run))))
 ```
 
-Agent calls execute asynchronously; Elisp steps execute synchronously when
-the scheduler admits them.  The run's callback runs exactly once.
+Agent calls execute asynchronously; Elisp steps can run synchronously or use
+the native async contract below.  The run's callback runs exactly once.
 Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
@@ -126,11 +126,12 @@ including background worker locks, and consume neither `:max-calls` nor
 `:max-requests`.  They execute trusted Lisp directly, without gptel tool
 confirmation.
 
-Functions run synchronously in the owning Emacs process, even inside a
-parallel group.  Keep them short; long computations block that process, and
-duration limits cannot preempt Lisp that does not yield.  The runner checks
-elapsed duration again before accepting a function's return value.  There is
-no asynchronous completion callback or agent conversation for Elisp steps.
+By default, functions run synchronously in the owning Emacs process, even
+inside a parallel group.  Keep them short; long computations block that
+process, and timers cannot preempt Lisp that does not yield.  The runner
+checks elapsed duration again before accepting a function's return value.
+Elisp steps have no agent conversation; use `gptel-runner-pause-run` to pause
+their workflow.
 
 An error fails the node with `:type 'elisp-error`; quitting cancels it.
 `:retries` defaults to zero and opts into additional attempts after errors.
@@ -144,6 +145,54 @@ step IDs.  Use stable explicit IDs and reload the workflow's function
 definitions before restoring a snapshot.  Saved values must be readable Lisp
 data.  Functions with side effects should tolerate repeated execution after
 retries or recovery; pausing or cancellation cannot undo effects already made.
+
+### Asynchronous Elisp steps
+
+Set `:async t` to start asynchronous work.  The function receives
+`(run node resolve reject)` and returns promptly.  Call `(funcall resolve value)`
+to succeed, including with `nil`, or `(funcall reject error-data)` to fail with
+`(:type elisp-error :error ERROR-DATA)`.  The first callback wins; duplicates
+and callbacks from cancelled, paused, timed-out, or superseded attempts are
+ignored.  Inline callbacks are supported, with completion deferred until
+startup returns.  Errors or quits before completion fail or cancel the step.
+
+The return value must be `nil` or a cleanup function accepting one reason:
+`succeeded`, `failed`, `cancelled`, `paused`, or `timeout`.  Once startup has
+returned, cleanup runs once before releasing concurrency and writer locks or
+starting a retry.  Use it to stop processes, cancel timers, and release buffers.
+Cleanup may trigger process sentinels safely; their old callbacks are already invalid.
+Cleanup errors and quits produce an `elisp-cleanup-error` event and do not
+replace the step's outcome.  Startup must release any resources it acquired
+if it signals before returning its cleanup function.
+
+```elisp
+;; This snippet needs lexical-binding, as do closures used by process sentinels.
+(gptel-runner-elisp-step
+ :id 'wait :async t :timeout 5 :save-as 'result
+ :function
+ (lambda (_run _node resolve _reject)
+   (let ((timer (run-at-time 0.1 nil (lambda () (funcall resolve 'ready)))))
+     (lambda (_reason) (cancel-timer timer)))))
+```
+
+Optional `:timeout` is a positive finite number of seconds from admission,
+excluding time spent queued.  Expiry fails the attempt with
+`(:type elisp-timeout :timeout SECONDS)` and runs cleanup with `timeout`.
+`:retries` also applies to rejections and timeouts; every new attempt gets a
+fresh timeout.  `:timeout` works for synchronous Elisp steps too, subject to
+Emacs yielding.  A run's `:max-duration` still bounds the whole workflow.
+
+Startup and cleanup run in temporary buffers in the step's workspace.
+Asynchronous handlers should capture their own buffers and other resources;
+the startup buffer is gone when the function returns.  An unfinished async
+step keeps its concurrency slot and writer lock until completion or cleanup.
+Pausing cleans up the attempt; resume or snapshot recovery restarts it with
+fresh callbacks and timeout.  Runtime callbacks, timers, and cleanup functions
+are never serialized.  If pause or cancellation occurs while startup yields,
+the returned cleanup runs as soon as startup returns.
+
+The [async Elisp example](examples/async-elisp.el) runs `git status` in a
+subprocess, resolves or rejects from its sentinel, and cleans up on every exit.
 
 ### Failure recovery and cleanup
 

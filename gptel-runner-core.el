@@ -114,7 +114,8 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   id run node agent prompt workspace buffer fsm
   (state 'pending) (request-attempt 0) retry-timer (generation 0)
   response-parts result error started-at finished-at on-complete
-  driver-data repair-p tool-names)
+  driver-data repair-p tool-names
+  elisp-cleanup elisp-cleanup-reason elisp-timer elisp-deadline)
 
 (cl-defstruct (gptel-runner-run
                (:constructor gptel-runner-run-create))
@@ -675,40 +676,113 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
           call 'failed (list :type (or status 'driver-error)
                              :value value :metadata metadata))))))
 
+(defun gptel-runner--elisp-current-p (call generation)
+  "Return non-nil if CALL can accept an Elisp result from GENERATION."
+  (and (= generation (gptel-runner-call-generation call))
+       (eq (gptel-runner-call-state call) 'running)
+       (eq (gptel-runner-run-state (gptel-runner-call-run call)) 'running)
+       (not (gptel-runner-call-elisp-cleanup-reason call))))
+
+(defun gptel-runner--cleanup-elisp (call reason)
+  "Stop CALL's Elisp timer and invoke its cleanup once with REASON.
+Remember the first reason even if startup has not returned its cleanup yet.
+Cleanup errors are journaled without interrupting scheduler teardown."
+  (unless (gptel-runner-call-elisp-cleanup-reason call)
+    (setf (gptel-runner-call-elisp-cleanup-reason call) reason))
+  (when (timerp (gptel-runner-call-elisp-timer call))
+    (cancel-timer (gptel-runner-call-elisp-timer call)))
+  (setf (gptel-runner-call-elisp-timer call) nil)
+  (when-let* ((cleanup (gptel-runner-call-elisp-cleanup call)))
+    ;; Detach before invoking user code, which may trigger a process sentinel.
+    (setf (gptel-runner-call-elisp-cleanup call) nil)
+    (condition-case err
+        (with-temp-buffer
+          (setq default-directory (gptel-runner-call-workspace call))
+          (funcall cleanup (gptel-runner-call-elisp-cleanup-reason call)))
+      ((error quit)
+       (gptel-runner--emit (gptel-runner-call-run call) 'elisp-cleanup-error
+                           (gptel-runner-call-node call) call err)))))
+
+(defun gptel-runner--elisp-result (call generation state value)
+  "Accept CALL's Elisp STATE and VALUE if GENERATION is still current."
+  (when (gptel-runner--elisp-current-p call generation)
+    (let ((run (gptel-runner-call-run call))
+          (timeout (plist-get (gptel-runner-node-properties
+                               (gptel-runner-call-node call)) :timeout)))
+      ;; CPU-bound Lisp cannot service timers.  Check elapsed time before
+      ;; publishing output or starting a retry or another workflow node.
+      (cond
+       ((and (gptel-runner-run-duration-remaining run)
+             (gptel-runner-run-active-started-at run)
+             (>= (- (float-time) (gptel-runner-run-active-started-at run))
+                 (gptel-runner-run-duration-remaining run)))
+        (gptel-runner--duration-expired run (gptel-runner-run-generation run)))
+       ((and (gptel-runner-call-elisp-deadline call)
+             (>= (float-time) (gptel-runner-call-elisp-deadline call)))
+        (gptel-runner--finish-call
+         call 'failed (list :type 'elisp-timeout :timeout timeout)))
+       (t (gptel-runner--finish-call call state value))))))
+
 (defun gptel-runner--dispatch-elisp (call)
-  "Execute CALL's Elisp function and finish with its value or error.
-Keep the continuation outside the error handler so failures in downstream
-nodes are never attributed to this function.  Discard results if the run
-was cancelled or paused while the function yielded to Emacs."
+  "Start CALL's synchronous or asynchronous Elisp function.
+Defer inline completion until startup returns and installs its cleanup.
+Run continuations outside the startup error handler so downstream errors
+are never attributed to this function."
   (let* ((run (gptel-runner-call-run call))
          (node (gptel-runner-call-node call))
-         (generation (gptel-runner-call-generation call)))
+         (props (gptel-runner-node-properties node))
+         (generation (gptel-runner-call-generation call))
+         (timeout (plist-get props :timeout))
+         (starting t)
+         outcome)
     (when (and (eq (gptel-runner-run-state run) 'running)
                (not (gptel-runner--call-terminal-p call)))
       (setf (gptel-runner-call-state call) 'running)
-      (let ((outcome
-             (condition-case err
-                 (cons 'succeeded
-                       (with-temp-buffer
-                         (setq default-directory
-                               (gptel-runner-call-workspace call))
-                         (funcall (plist-get (gptel-runner-node-properties node)
-                                             :function)
-                                  run node)))
-               (error (cons 'failed (list :type 'elisp-error :error err)))
-               (quit (cons 'cancelled (list :type 'elisp-quit :error err))))))
-        (when (and (= generation (gptel-runner-call-generation call))
-                   (eq (gptel-runner-call-state call) 'running)
-                   (eq (gptel-runner-run-state run) 'running))
-          ;; CPU-bound Lisp cannot service the duration timer.  Check again
-          ;; before publishing its result or starting another workflow node.
-          (if (and (gptel-runner-run-duration-remaining run)
-                   (gptel-runner-run-active-started-at run)
-                   (>= (- (float-time) (gptel-runner-run-active-started-at run))
-                       (gptel-runner-run-duration-remaining run)))
-              (gptel-runner--duration-expired
-               run (gptel-runner-run-generation run))
-            (gptel-runner--finish-call call (car outcome) (cdr outcome))))))))
+      (cl-labels
+          ((deliver (state value)
+             (when (and (not outcome)
+                        (gptel-runner--elisp-current-p call generation))
+               (setq outcome (cons state value))
+               (unless starting
+                 (gptel-runner--elisp-result call generation state value))
+               t)))
+        (condition-case err
+            (progn
+              (when timeout
+                (setf (gptel-runner-call-elisp-deadline call)
+                      (+ (float-time) timeout)
+                      (gptel-runner-call-elisp-timer call)
+                      (run-at-time
+                       timeout nil
+                       (lambda ()
+                         (deliver 'failed
+                                  (list :type 'elisp-timeout
+                                        :timeout timeout))))))
+              (with-temp-buffer
+                (setq default-directory (gptel-runner-call-workspace call))
+                (if (plist-get props :async)
+                    (let ((cleanup
+                           (funcall
+                            (plist-get props :function) run node
+                            (lambda (value) (deliver 'succeeded value))
+                            (lambda (error-data)
+                              (deliver 'failed
+                                       (list :type 'elisp-error
+                                             :error error-data))))))
+                      (unless (or (null cleanup) (functionp cleanup))
+                        (error "Async Elisp function must return nil or a cleanup function"))
+                      (setf (gptel-runner-call-elisp-cleanup call) cleanup))
+                  (deliver 'succeeded
+                           (funcall (plist-get props :function) run node)))))
+          (error (deliver 'failed (list :type 'elisp-error :error err)))
+          (quit (deliver 'cancelled (list :type 'elisp-quit :error err))))
+        (setq starting nil)
+        (if-let* ((reason (gptel-runner-call-elisp-cleanup-reason call)))
+            ;; Cancellation or pause may have happened while startup yielded.
+            (gptel-runner--cleanup-elisp call reason)
+          (when outcome
+            (gptel-runner--elisp-result
+             call generation (car outcome) (cdr outcome))))))))
 
 (defun gptel-runner--dispatch-attempt (call)
   "Dispatch one provider attempt for CALL."
@@ -751,6 +825,11 @@ was cancelled or paused while the function yielded to Emacs."
       (if (eq state 'succeeded)
           (setf (gptel-runner-call-result call) value)
         (setf (gptel-runner-call-error call) value))
+      (when (gptel-runner--elisp-call-p call)
+        (gptel-runner--cleanup-elisp
+         call (if (and (eq state 'failed)
+                       (eq (plist-get value :type) 'elisp-timeout))
+                  'timeout state)))
       (gptel-runner--deactivate-call call)
       (gptel-runner--emit run (intern (format "call-%s" state))
                           (gptel-runner-call-node call) call value)
@@ -882,11 +961,13 @@ feedback without asking the driver to stop external work."
           (ignore-errors
             (gptel-runner-driver-pause
              (gptel-runner-run-driver run) call))))
-      (gptel-runner--deactivate-call call)
       (unless keep-continuation
         (setf (gptel-runner-call-on-complete call) nil))
       (setf (gptel-runner-call-state call) state
             (gptel-runner-call-tool-names call) nil)
+      (when (gptel-runner--elisp-call-p call)
+        (gptel-runner--cleanup-elisp call 'paused))
+      (gptel-runner--deactivate-call call)
       (gptel-runner--emit run (intern (format "call-%s" state))
                           (gptel-runner-call-node call) call reason)
       (gptel-runner--drain-queue run)

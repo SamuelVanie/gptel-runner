@@ -35,11 +35,20 @@ nil values inherit the workspace passed to `gptel-runner-start'."
   "Return an Elisp node described by PROPERTIES.
 `:function' is required and receives (RUN NODE).  Its return value, including
 nil, is the node output; `:save-as' stores it on the run blackboard.
+With `:async t', the function instead receives (RUN NODE RESOLVE REJECT).
+Call RESOLVE with the output or REJECT with error data.  Return nil or a
+cleanup function accepting a reason: succeeded, failed, cancelled, paused,
+or timeout.  Cleanup runs once; late or duplicate callbacks are ignored.
+Inline completion is deferred until the function returns its cleanup.
+Optional `:timeout' is a positive number of seconds per attempt, starting
+at admission.  Expiry fails the step with `:type' elisp-timeout.
 Optional `:id', `:workspace', `:workspace-mode' (read or write), and `:retries'
-customize execution.  The function runs synchronously in a temporary buffer
-with `default-directory' set to the node workspace.  Write steps require
+customize execution.  Startup and cleanup run in temporary buffers with
+`default-directory' set to the node workspace.  Write steps require
 `:allow-writes t' and share workspace locks with agent steps.
-Errors fail the step; explicit `:retries' allow that many additional attempts.
+Errors and rejections fail the step; `:retries' permits additional attempts,
+including after timeout.  Pause stops work; resume starts a fresh attempt.
+Timers cannot preempt Lisp that does not yield to Emacs.
 Elisp steps consume concurrency slots but no agent-call or request budget."
   (gptel-runner-node-create
    :id (gptel-runner--node-id properties 'elisp)
@@ -360,6 +369,12 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
               ('elisp
                (unless (functionp (plist-get props :function))
                  (user-error "Elisp node %S needs a :function" id))
+               (unless (memq (plist-get props :async) '(nil t))
+                 (user-error "Elisp node %S has invalid :async" id))
+               (when-let* ((timeout (plist-get props :timeout)))
+                 (unless (and (numberp timeout) (> timeout 0)
+                              (< timeout 1.0e+INF))
+                   (user-error "Elisp node %S needs a positive finite :timeout" id)))
                (unless (memq (or (plist-get props :workspace-mode) 'read)
                              '(read write))
                  (user-error "Elisp node %S has invalid :workspace-mode" id))
@@ -1592,7 +1607,8 @@ use it for the retried run's next terminal transition."
                          (gptel-runner--budget-kinds-at-limit run)))
            ;; Retrying a local error needs no provider capacity.  If a later
            ;; agent needs more, its ordinary dispatch enforces that budget.
-           (budgets (if (and (eq (plist-get failure :type) 'elisp-error)
+           (budgets (if (and (memq (plist-get failure :type)
+                                  '(elisp-error elisp-timeout))
                              (or (null path)
                                  (eq (gptel-runner-node-kind (car (last path)))
                                      'elisp)))

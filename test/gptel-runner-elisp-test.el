@@ -75,6 +75,12 @@
                             (:function ignore :workspace-mode invalid)
                             (:function ignore :retries -1)
                             (:function ignore :retries 1.5)
+                            (:function ignore :async yes)
+                            (:function ignore :timeout 0)
+                            (:function ignore :timeout -1)
+                            (:function ignore :timeout "1")
+                            (:function ignore :timeout 1.0e+INF)
+                            (:function ignore :timeout 0.0e+NaN)
                             (:function ignore :pause-after t)
                             (:function ignore :parser identity)
                             (:function ignore :workspace-mode write)))
@@ -282,6 +288,316 @@
         (gptel-runner-resume-run run)
         (should (eq (gptel-runner-run-state run) 'succeeded))
         (should (= (gptel-runner-get run 'result) 2))))))
+
+(ert-deftest gptel-runner-elisp-async-holds-slots-and-writer-lock-until-cleanup ()
+  (gptel-runner-elisp-test--isolated
+    (gptel-runner-register-agent 'writer :workspace-mode 'write)
+    (let ((driver (gptel-runner-fake-driver-create)) resolve read-resolve cleaned)
+      (gptel-runner-fake-queue driver 'writer '(:value "agent done"))
+      (let* ((run
+              (gptel-runner-start
+               (gptel-runner-parallel
+                :save-as 'results
+                (gptel-runner-elisp-step
+                 :async t :timeout 3600 :workspace-mode 'write :save-as 'local
+                 :function
+                 (lambda (run node complete _reject)
+                   (setq resolve complete)
+                   (should (equal default-directory
+                                  (gptel-runner-node-workspace run node)))
+                   (lambda (reason)
+                     (should (eq reason 'succeeded))
+                     (should (= (gptel-runner-run-writer-active run) 1))
+                     (should-not (gptel-runner-fake-driver-starts driver))
+                     (should (equal default-directory
+                                    (gptel-runner-node-workspace run node)))
+                     (setq cleaned t))))
+                (gptel-runner-agent-step :agent 'writer :prompt "work")
+                (gptel-runner-elisp-step
+                 :async t
+                 :function (lambda (_run _node complete _reject)
+                             (setq read-resolve complete) nil)))
+               :driver driver :max-concurrency 2 :allow-writes t
+               :max-calls 1 :max-requests 1))
+             (call (car (gptel-runner-run-calls run)))
+             (timer (gptel-runner-call-elisp-timer call)))
+        (should (eq (gptel-runner-run-state run) 'running))
+        (should (= (gptel-runner-run-active-count run) 2))
+        (should-not (gptel-runner-fake-driver-starts driver))
+        (should (funcall resolve nil))
+        (should cleaned)
+        (should-not (memq timer timer-list))
+        (should-not (gptel-runner-call-elisp-timer call))
+        (should-not (funcall resolve 'duplicate))
+        (should-not (gptel-runner-get run 'local 'absent))
+        (should (= (length (gptel-runner-fake-driver-starts driver)) 1))
+        (funcall read-resolve 'read)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (should (zerop (gptel-runner-run-writer-active run)))))))
+
+(ert-deftest gptel-runner-elisp-async-inline-first-result-wins ()
+  (gptel-runner-elisp-test--isolated
+    (dolist (fail '(nil t))
+      (let (cleaned resolve reject)
+        (let ((run
+               (gptel-runner-start
+                (gptel-runner-sequence
+                 (gptel-runner-elisp-step
+                  :async t :save-as 'result
+                  :function
+                  (lambda (_run _node complete failure)
+                    (setq resolve complete reject failure)
+                    (should (funcall (if fail failure complete) 'first))
+                    (should-not (funcall failure 'second))
+                    (should-not (funcall complete 'third))
+                    (lambda (reason)
+                      (should (eq reason (if fail 'failed 'succeeded)))
+                      (should-not (funcall complete 'from-cleanup))
+                      (setq cleaned t))))
+                 (gptel-runner-elisp-step
+                  :function (lambda (_run _node) (should cleaned)))))))
+          (should cleaned)
+          (should (eq (gptel-runner-run-state run) (if fail 'failed 'succeeded)))
+          (should-not (funcall resolve 'late))
+          (should-not (funcall reject 'late))
+          (if fail
+              (should (equal (gptel-runner-run-terminal-data run)
+                             '(:type elisp-error :error first)))
+            (should (eq (gptel-runner-get run 'result) 'first))))))))
+
+(ert-deftest gptel-runner-elisp-async-startup-errors-and-quits ()
+  (gptel-runner-elisp-test--isolated
+    (dolist (behavior '(error quit invalid complete-then-error))
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-elisp-step
+               :async t :timeout 3600 :save-as 'result
+               :function
+               (lambda (_run _node resolve _reject)
+                 (pcase behavior
+                   ('error (error "startup"))
+                   ('quit (signal 'quit nil))
+                   ('invalid 'not-a-function)
+                   (_ (funcall resolve 42) (error "too late"))))))))
+        (should (eq (gptel-runner-run-state run)
+                    (pcase behavior ('quit 'cancelled)
+                           ('complete-then-error 'succeeded) (_ 'failed))))
+        (should-not (gptel-runner-call-elisp-timer
+                     (car (gptel-runner-run-calls run))))
+        (when (eq behavior 'complete-then-error)
+          (should (= (gptel-runner-get run 'result) 42)))))))
+
+(ert-deftest gptel-runner-elisp-async-retry-cleans-before-new-attempt ()
+  (gptel-runner-elisp-test--isolated
+    (let (callbacks reasons)
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-elisp-step
+               :async t :retries 1 :save-as 'result
+               :function
+               (lambda (_run _node resolve reject)
+                 (when callbacks (should (equal reasons '(failed))))
+                 (push (cons resolve reject) callbacks)
+                 (lambda (reason) (push reason reasons))))
+              :max-calls 0 :max-requests 0)))
+        (let ((first (car callbacks)))
+          (funcall (cdr first) '(error "rejected"))
+          (should (= (length callbacks) 2))
+          (should-not (funcall (car first) 'stale))
+          (should-not (funcall (cdr first) 'duplicate))
+          (should (eq (gptel-runner-run-state run) 'running))
+          (funcall (caar callbacks) 42)
+          (should (eq (gptel-runner-run-state run) 'succeeded))
+          (should (= (gptel-runner-get run 'result) 42))
+          (should (equal reasons '(succeeded failed))))))))
+
+(ert-deftest gptel-runner-elisp-async-cancellation-cleans-and-ignores-callbacks ()
+  (gptel-runner-elisp-test--isolated
+    (dolist (during-start '(nil t))
+      (let (resolve reject reasons (completions 0))
+        (let* ((run
+                (gptel-runner-start
+                 (gptel-runner-elisp-step
+                  :async t :timeout 3600 :retries 2 :save-as 'result
+                  :function
+                  (lambda (run _node complete failure)
+                    (setq resolve complete reject failure)
+                    (when during-start (gptel-runner-abort-run run))
+                    (lambda (reason)
+                      (push reason reasons)
+                      (should-not (funcall complete 'from-cleanup)))))
+                 :callback (lambda (_run) (cl-incf completions))))
+               (call (car (gptel-runner-run-calls run))))
+          (gptel-runner-abort-call call)
+          (gptel-runner-abort-run run)
+          (should (equal reasons '(cancelled)))
+          (should (= completions 1))
+          (should (= (length (gptel-runner-run-calls run)) 1))
+          (should-not (funcall resolve 'late))
+          (should-not (funcall reject 'late))
+          (should-not (gptel-runner-call-elisp-timer call))
+          (should (eq (gptel-runner-get run 'result 'absent) 'absent))
+          (should (zerop (gptel-runner-run-active-count run))))))))
+
+(ert-deftest gptel-runner-elisp-async-pause-restarts-and-invalidates-old-attempt ()
+  (gptel-runner-elisp-test--isolated
+    (dolist (during-start '(nil t))
+      (let (callbacks reasons)
+        (gptel-runner-defworkflow async-pause nil
+          (gptel-runner-elisp-step
+           :id 'work :async t :timeout 3600 :save-as 'result
+           :function
+           (lambda (run _node resolve reject)
+             (push (cons resolve reject) callbacks)
+             (when (and during-start (= (length callbacks) 1))
+               (gptel-runner-pause-run run))
+             (lambda (reason) (push reason reasons)))))
+        (let* ((run (gptel-runner-start 'async-pause))
+               (old (car callbacks))
+               (call (car (gptel-runner-run-calls run))))
+          (gptel-runner-pause-run run)
+          (should (equal reasons '(paused)))
+          (should-not (gptel-runner-call-elisp-timer call))
+          (should (zerop (gptel-runner-run-active-count run)))
+          (should-not (funcall (car old) 'while-paused))
+          (gptel-runner-resume-run run)
+          (should-not (funcall (car old) 'after-resume))
+          (should-not (funcall (cdr old) 'after-resume))
+          (funcall (caar callbacks) 'fresh)
+          (should (eq (gptel-runner-run-state run) 'succeeded))
+          (should (eq (gptel-runner-get run 'result) 'fresh))
+          (should (equal reasons '(succeeded paused))))))))
+
+(ert-deftest gptel-runner-elisp-async-timeout-retries-and-ignores-stale-timer ()
+  (gptel-runner-elisp-test--isolated
+    (let (callbacks reasons)
+      (let* ((run
+              (gptel-runner-start
+               (gptel-runner-elisp-step
+                :async t :timeout 3600 :retries 1 :save-as 'result
+                :function
+                (lambda (_run _node resolve _reject)
+                  (push resolve callbacks)
+                  (lambda (reason) (push reason reasons))))))
+             (call (car (gptel-runner-run-calls run)))
+             (timer (gptel-runner-call-elisp-timer call)))
+        ;; Drive the actual timer callback deterministically, without sleeping.
+        (apply (timer--function timer) (timer--args timer))
+        (should (equal reasons '(timeout)))
+        (should (equal (gptel-runner-call-error call)
+                       '(:type elisp-timeout :timeout 3600)))
+        (should-not (memq timer timer-list))
+        (should-not (funcall (cadr callbacks) 'late))
+        (apply (timer--function timer) (timer--args timer))
+        (should (= (length callbacks) 2))
+        (funcall (car callbacks) 'fresh)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (equal reasons '(succeeded timeout)))))))
+
+(ert-deftest gptel-runner-elisp-timeout-checks-clock-before-accepting-result ()
+  (gptel-runner-elisp-test--isolated
+    (dolist (async '(nil t))
+      (let (resolve reasons)
+        (let ((run
+               (gptel-runner-start
+                (gptel-runner-elisp-step
+                 :async async :timeout 3600 :save-as 'result
+                 :function
+                 (lambda (run _node &optional complete _reject)
+                   ;; Simulate CPU work that prevented the timer from firing.
+                   (setf (gptel-runner-call-elisp-deadline
+                          (car (gptel-runner-run-calls run))) 0)
+                   (if async
+                       (progn (setq resolve complete)
+                              (lambda (reason) (push reason reasons)))
+                     'late))))))
+          (when async (funcall resolve 'late))
+          (should (eq (gptel-runner-run-state run) 'failed))
+          (should (eq (plist-get (gptel-runner-run-terminal-data run) :type)
+                      'elisp-timeout))
+          (should (eq (gptel-runner-get run 'result 'absent) 'absent))
+          (when async (should (equal reasons '(timeout)))))))))
+
+(ert-deftest gptel-runner-elisp-async-cleanup-errors-do-not-interrupt-teardown ()
+  (gptel-runner-elisp-test--isolated
+    (dolist (condition '(error quit))
+      (let (resolve)
+        (let ((run
+               (gptel-runner-start
+                (gptel-runner-elisp-step
+                 :async t :timeout 3600
+                 :function (lambda (_run _node complete _reject)
+                             (setq resolve complete)
+                             (lambda (_reason) (signal condition nil)))))))
+          (funcall resolve 'ok)
+          (should (eq (gptel-runner-run-state run) 'succeeded))
+          (should (zerop (gptel-runner-run-active-count run)))
+          (should (= (cl-count 'elisp-cleanup-error
+                               (gptel-runner-run-events run)
+                               :key #'gptel-runner-event-type) 1)))))))
+
+(ert-deftest gptel-runner-elisp-async-run-duration-cleans-active-work ()
+  (gptel-runner-elisp-test--isolated
+    (let (resolve reasons)
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-elisp-step
+               :async t :timeout 3600
+               :function (lambda (_run _node complete _reject)
+                           (setq resolve complete)
+                           (lambda (reason) (push reason reasons))))
+              :max-duration 3600)))
+        (gptel-runner--duration-expired run (gptel-runner-run-generation run))
+        (should (eq (gptel-runner-run-state run) 'failed))
+        (should (eq (plist-get (gptel-runner-run-terminal-data run) :kind) 'duration))
+        (should (equal reasons '(cancelled)))
+        (should-not (funcall resolve 'late))
+        (should-not (gptel-runner-call-elisp-timer
+                     (car (gptel-runner-run-calls run))))))))
+
+(ert-deftest gptel-runner-elisp-async-timeout-recovery-from-snapshot ()
+  (gptel-runner-elisp-test--isolated
+    (let (resolve)
+      (gptel-runner-defworkflow async-retry
+          (:persist t :max-calls 0 :max-requests 0)
+        (gptel-runner-elisp-step
+         :id 'work :async t :timeout 3600 :save-as 'result
+         :function (lambda (_run _node complete _reject)
+                     (setq resolve complete) nil)))
+      (let* ((run (gptel-runner-start 'async-retry))
+             (old resolve)
+             (timer (gptel-runner-call-elisp-timer
+                     (car (gptel-runner-run-calls run)))))
+        (apply (timer--function timer) (timer--args timer))
+        (gptel-runner-store-flush-pending)
+        (remhash (gptel-runner-run-id run) gptel-runner--runs)
+        (let ((restored (gptel-runner-load-run (gptel-runner-run-snapshot-file run))))
+          (gptel-runner-retry restored :from-node 'work)
+          (should (eq (gptel-runner-run-state restored) 'running))
+          (should-not (funcall old 'late))
+          (funcall resolve 'fresh)
+          (should (eq (gptel-runner-run-state restored) 'succeeded))
+          (should (eq (gptel-runner-get restored 'result) 'fresh)))))))
+
+(ert-deftest gptel-runner-elisp-async-timeout-is-catchable ()
+  (gptel-runner-elisp-test--isolated
+    (let* ((run
+            (gptel-runner-start
+             (gptel-runner-try
+              :error-as 'failure :save-as 'result
+              :body (gptel-runner-elisp-step
+                     :id 'work :async t :timeout 3600 :function #'ignore)
+              :catch (gptel-runner-elisp-step
+                      :function (lambda (_run _node) 'recovered)))))
+           (timer (gptel-runner-call-elisp-timer
+                   (car (gptel-runner-run-calls run)))))
+      (apply (timer--function timer) (timer--args timer))
+      (should (eq (gptel-runner-run-state run) 'succeeded))
+      (should (eq (gptel-runner-get run 'result) 'recovered))
+      (should (equal (gptel-runner-get run 'failure)
+                     '(:node work :state failed
+                       :value (:type elisp-timeout :timeout 3600)))))))
 
 (provide 'gptel-runner-elisp-test)
 ;;; gptel-runner-elisp-test.el ends here

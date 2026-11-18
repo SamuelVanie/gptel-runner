@@ -2,6 +2,9 @@
 
 ## 0.1.0 - unreleased
 
+- Add native asynchronous Elisp steps with completion/rejection callbacks,
+  once-only cleanup on completion, cancellation, pause, and timeout, per-attempt
+  timeouts, and protection against duplicate or late results.
 - Preload gptel and gptel-agent in background workers before each job init,
   capture external library paths for fresh processes, and initialize agent
   definitions, with an opt-out for standalone jobs.

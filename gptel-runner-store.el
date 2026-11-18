@@ -105,8 +105,9 @@ terminal run transitions bypass it, but their writes are still asynchronous."
        ((and (listp data)
              (memq (plist-get data :type) '(budget iteration-budget)))
         (copy-tree data t))
-       ((and (listp data) (eq (plist-get data :type) 'elisp-error))
-        '(:type elisp-error))
+       ((and (listp data)
+             (memq (plist-get data :type) '(elisp-error elisp-timeout)))
+        (list :type (plist-get data :type)))
        (t '(:type other))))))
 
 (defun gptel-runner-store--snapshot-tokens (run)
