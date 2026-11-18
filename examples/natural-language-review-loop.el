@@ -59,11 +59,11 @@
       (intern (downcase (match-string 1 response))))))
 
 (defun example/natural-review-passed-p (run)
-  "Return non-nil when RUN's fresh reviewer reported PASS."
+  "Return non-nil when RUN's latest review reported PASS."
   (eq (example/natural-review-status run) 'pass))
 
 (defun example/natural-review-blocked-p (run)
-  "Return non-nil when RUN's fresh reviewer reported BLOCKED."
+  "Return non-nil when RUN's latest review reported BLOCKED."
   (eq (example/natural-review-status run) 'blocked))
 
 (defun example/natural-review-progress-key (run)
@@ -79,8 +79,8 @@
            "Read %s.  It contains the goal and the latest natural-language "
            "feedback from an independent reviewer.  Reinspect the actual "
            "workspace, address every applicable observation, and run relevant "
-           "tests.  Do not assume any previous conversation or agent state.\n\n"
-           "Return a concise natural-language report of changes and checks.  "
+           "tests.  Check earlier findings against the current files.\n\n"
+           "Use RunnerHandoff for a concise report of changes and checks.  "
            "Do not delete or replace the handoff file; the reviewer owns it.")
    (gptel-runner-run-goal run)
    (gptel-runner-run-workspace run)
@@ -88,17 +88,17 @@
    (example/natural-review-state-path run)))
 
 (defun example/natural-review-review-prompt (run _node)
-  "Build an independent review prompt for RUN without prior review context."
+  "Build an independent review prompt for RUN's current implementation."
   (format
    (concat "Goal:\n%s\n\nWorkspace: %s\n\n"
-           "Act as a fresh independent reviewer.  Reinspect the implementation "
+           "Act as an independent reviewer.  Reinspect the implementation "
            "and run the relevant tests yourself.  Do not trust the implementer "
            "report as evidence and do not modify implementation files.\n\n"
-           "Replace %s with only the goal, one status line, and the feedback "
-           "needed by the next fresh implementer.  Use STATUS: PASS when no "
+           "Replace %s with a status line followed by the goal and feedback "
+           "needed for the next implementation turn.  Use STATUS: PASS when no "
            "work remains, STATUS: REVISE when corrections remain, or "
            "STATUS: BLOCKED when external input is required.\n\n"
-           "Return exactly the same text that you wrote to the handoff file.\n\n"
+           "Call RunnerHandoff with the exact text you wrote to the handoff file.\n\n"
            "Implementer report (informational only):\n%s")
    (gptel-runner-run-goal run)
    (gptel-runner-run-workspace run)

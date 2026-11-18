@@ -146,6 +146,21 @@
      (dolist (artifact (gptel-runner-artifacts run))
        (should (file-exists-p (gptel-runner-artifact-file run artifact)))))))
 
+(ert-deftest gptel-runner-jobs-rerun-finished-invocation ()
+  (gptel-runner-jobs-test--isolated
+   (let* ((job (gptel-runner-jobs-test--job 'artifact-pipeline "Rerun report"
+                (expand-file-name "examples/artifact-pipeline.el" gptel-runner-jobs--package-directory)))
+          (first (gptel-runner-jobs-test--finished (gptel-runner-job-run job))))
+     (should (eq (plist-get first :state) 'succeeded))
+     (gptel-runner-jobs-test--command first 'rerun)
+     (let ((second (gptel-runner-jobs-test--finished first)))
+       (should (equal (plist-get first :id) (plist-get second :id)))
+       (should (eq (plist-get second :state) 'succeeded))
+       (should (= (plist-get second :epoch) (1+ (plist-get first :epoch))))
+       (should (= (length (gptel-runner-artifacts second)) 2))
+       (should (equal (gptel-runner-get first 'report-text)
+                      (gptel-runner-get second 'report-text)))))))
+
 (ert-deftest gptel-runner-jobs-forget-rechecks-state-and-generation-under-lock ()
   (let ((old '(:id "invocation-1" :epoch 1 :phase closed :root "/tmp/"))
         locked)

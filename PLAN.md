@@ -23,6 +23,8 @@ normal verification commands where applicable.
 - [x] Generation-based retry/cancellation protection and request backoff.
 - [x] gptel adapter with one editable chat per agent node, local presets,
   streaming and non-streaming turns, tool approvals, and abort integration.
+- [x] Explicit handoffs and follow-up questions between sequence agents
+  in their own chats, bounded by the run's call and request budgets.
 - [ ] Validate the adapter against a live provider (opt-in; never part of CI).
 
 ## Workflow interpreter
@@ -51,8 +53,8 @@ normal verification commands where applicable.
 - [x] Automated tests for core workflow behavior, budgets, retries,
   cancellation, output repair, stalls, parallel joins, and writer safety.
 - [x] Installation, API, safety, compatibility, and troubleshooting docs.
-- [ ] Dedicated human gate nodes, worktrees, enforced tool wrappers,
-  gptel-agent files, and bounded dialogue (post-v0.1).
+- [ ] Dedicated human gate nodes, worktrees, enforced tool wrappers, and
+  gptel-agent files (post-v0.1).
 - [ ] Add a start-time custom-input API, such as `:inputs', that initializes
   the run blackboard before the first node can dispatch.  Prompt functions
   will read these values with `gptel-runner-get`; arbitrary inputs will not

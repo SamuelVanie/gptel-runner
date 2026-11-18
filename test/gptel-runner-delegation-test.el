@@ -6,6 +6,7 @@
 (require 'gptel-runner-jobs)
 
 (defvar gptel-runner-delegation-test--stream nil)
+(defvar gptel-runner-delegation-test--completion 'response)
 
 (defmacro gptel-runner-delegation-test--with-run (&rest body)
   "Run BODY using real runner and agent handlers with queued transport."
@@ -44,7 +45,8 @@
        (let* ((pipeline
                (gptel-runner-start
                 (gptel-runner-agent-step :id 'coordinate :agent 'coordinator
-                                         :prompt "Investigate together")
+                                         :prompt "Investigate together"
+                                         :completion gptel-runner-delegation-test--completion)
                 :driver (gptel-runner-gptel-driver-create)))
               (call (car (gptel-runner-run-calls pipeline)))
               (fsm (gptel-runner-call-fsm call))
@@ -115,6 +117,61 @@
       (gptel-runner-delegation-test--settle)
       (should (eq (gptel-runner-run-state pipeline) 'succeeded))
       (should (equal (gptel-runner-call-result call) "Final answer")))))
+
+(ert-deftest gptel-runner-delegation-discussion-holds-explicit-handoff ()
+  (let ((gptel-runner-delegation-test--completion 'handoff))
+    (gptel-runner-delegation-test--with-run
+      (let* ((chat (gptel-runner-delegation-test--discussion fsm))
+             (child (gptel-agent-discussion--chat-fsm chat))
+             (tool (cl-find "RunnerHandoff" (plist-get (gptel-fsm-info fsm) :tools)
+                            :key #'gptel-tool-name :test #'equal)))
+        (with-current-buffer (plist-get (gptel-fsm-info child) :buffer)
+          (should (string-match-p "different workflow turn"
+                                  (funcall (gptel-tool-function tool) "Child verdict"))))
+        (gptel-runner-gptel-test--handoff fsm "Parent verdict")
+        (should (eq (gptel-fsm-state fsm) 'AGWT))
+        (should-not (gptel-runner--run-terminal-p pipeline))
+        (gptel-runner-delegation-test--answer child "Evidence")
+        (gptel-runner-delegation-test--settle)
+        (should (eq 'succeeded (gptel-runner-run-state pipeline)))
+        (should (equal (gptel-runner-call-result call) "Parent verdict"))))))
+
+(ert-deftest gptel-runner-delegation-chats-belong-only-to-workflow ()
+  (let ((gptel-agent-session-directory (make-temp-file "runner-agent-catalog-" t))
+        (gptel-agent-session-auto-title nil))
+    (unwind-protect
+        (progn
+          (gptel-agent-session-mode 1)
+          (gptel-runner-delegation-test--with-run
+            (let* ((ordinary (gptel (generate-new-buffer-name "*ordinary-test-chat*")))
+                   (worker (gptel-runner-delegation-test--agent fsm t))
+                   (chat (gptel-runner-delegation-test--discussion fsm))
+                   (nested (gptel-runner-delegation-test--discussion (gptel-agent--run-fsm worker)))
+                   (copy (gptel-agent-session-buffer-from-record
+                          (gptel-agent-session-buffer-record parent) t))
+                   (detached (gptel-runner-gptel-chat-from-text
+                              (gptel-runner-gptel-chat-text parent)))
+                   (owned (list parent (gptel-agent--run-child-buffer worker)
+                                (gptel-agent-discussion--chat-buffer chat)
+                                (gptel-agent-discussion--chat-buffer nested) copy detached)))
+              ;; Cover the enable-time discovery scan as well as immediate hooks.
+              (gptel-agent-session-mode -1)
+              (gptel-agent-session-mode 1)
+              (gptel-agent-session-save)
+              (let ((catalog (gptel-agent-session--catalog)))
+                (should (cl-find (buffer-name ordinary) catalog
+                                 :key (lambda (r) (plist-get r :name)) :test #'equal))
+                (dolist (buffer owned)
+                  (with-current-buffer buffer
+                    (should gptel-agent-session-managed-externally)
+                    (should-not gptel-agent-session--id)
+                    (should-not (gethash buffer gptel-agent-session--dirty))
+                    (should-error (gptel-agent-session-save t) :type 'user-error)
+                    (should-not (cl-find (buffer-name) catalog
+                                         :key (lambda (r) (plist-get r :name))
+                                         :test #'equal))))))))
+      (gptel-agent-session-mode -1)
+      (delete-directory gptel-agent-session-directory t))))
 
 (ert-deftest gptel-runner-delegation-nested-discussions-hold-every-level ()
   (gptel-runner-delegation-test--with-run
@@ -471,7 +528,7 @@
                              (gptel-runner-delegation-test--tool request "delegation_probe" nil))
                             (t (gptel-runner-delegation-test--answer request "Final evidence")))))))))
             (gptel-runner-register-agent 'job-coordinator :preset nil)
-            (gptel-runner-defworkflow delegation-job ()
+            (gptel-runner-defworkflow delegation-job (:completion response)
               (gptel-runner-agent-step :id 'coordinate :agent 'job-coordinator :prompt "Inspect" :save-as 'result)))
          (current-buffer)))
       (let ((invocation (gptel-runner-job-run
@@ -493,6 +550,86 @@
         (with-temp-buffer
           (insert-file-contents evidence)
           (should (= (length (split-string (buffer-string) "\n" t)) 2)))))))
+
+(ert-deftest gptel-runner-delegation-child-transcripts-survive-restart ()
+  (let ((gptel-runner-snapshot-directory (make-temp-file "runner-child-chats-" t))
+        (gptel-runner--workflows (make-hash-table :test #'eq)))
+    (unwind-protect
+        (gptel-runner-delegation-test--with-run
+          (setf (gptel-runner-run-workflow pipeline)
+                (gptel-runner-defworkflow saved-children ()
+                  (gptel-runner-workflow-root (gptel-runner-run-workflow pipeline))))
+          (require 'gptel-agent-review-aside)
+          (let* ((worker (gptel-runner-delegation-test--agent fsm))
+                 (worker-fsm (gptel-agent--run-fsm worker))
+                 (worker-buffer (gptel-agent--run-child-buffer worker))
+                 (worker-id (buffer-local-value 'gptel-runner-store--child-id worker-buffer))
+                 (chat (gptel-runner-delegation-test--discussion worker-fsm))
+                 (chat-buffer (gptel-agent-discussion--chat-buffer chat))
+                 (chat-id (buffer-local-value 'gptel-runner-store--child-id chat-buffer))
+                 (aside (gptel-agent-review-aside--create
+                         (gptel-agent-review--make-queue :owner parent)
+                         (list :path (expand-file-name "sample.el" default-directory))))
+                 (aside-id (buffer-local-value 'gptel-runner-store--child-id aside))
+                 (children (gptel-runner-run-child-chats pipeline))
+                 (file (expand-file-name "run.snapshot" gptel-runner-snapshot-directory)))
+            (should (= (hash-table-count children) 3))
+            (should (equal (plist-get (gethash chat-id children) :parent-id) worker-id))
+            (with-current-buffer aside
+              (should (bound-and-true-p gptel-agent-session-managed-externally))
+              (insert "A review question"))
+            (with-current-buffer chat-buffer
+              (should (eq (car (gptel-runner-ui--run-context)) pipeline)))
+            (gptel-runner-delegation-test--answer
+             (gptel-agent-discussion--chat-fsm chat) "The nested finding")
+            (gptel-runner-delegation-test--settle)
+            (gptel-runner-delegation-test--answer worker-fsm "The worker finding")
+            (gptel-runner-delegation-test--settle)
+            (gptel-runner-delegation-test--answer fsm "Final synthesis")
+            (gptel-runner-delegation-test--settle)
+            (should (eq (gptel-runner-run-state pipeline) 'succeeded))
+            (gptel-runner-save-run pipeline file)
+            (gptel-runner-forget-run pipeline)
+            (should-not (buffer-live-p chat-buffer))
+            (should-not (buffer-live-p worker-buffer))
+            (let* ((request-count (length requests))
+                   (loaded (gptel-runner-load-run file))
+                   (restored (gptel-runner-run-child-chats loaded)))
+              (unwind-protect
+                  (progn
+                    (should (= 3 (hash-table-count restored)))
+                    (should (equal (plist-get (gethash chat-id restored) :call)
+                                   (gptel-runner-call-id call)))
+                    (should-not (bufferp (plist-get (gethash chat-id restored) :chat)))
+                    (let* ((gptel-runner-jobs--invocation
+                            (list :id "child-test" :epoch 2 :directory gptel-runner-snapshot-directory))
+                           (gptel-runner-jobs--exports (make-hash-table :test #'equal))
+                           (gptel-runner-jobs--run loaded))
+                      (gptel-runner-jobs--publish)
+                      (let ((published (plist-get (car (plist-get gptel-runner-jobs--invocation :calls))
+                                                  :children)))
+                        (should (equal '(gptel-agent transcript transcript)
+                                       (sort (mapcar (lambda (r) (plist-get r :chat-format)) published)
+                                             #'string-lessp)))
+                        (dolist (record published)
+                          (should (file-readable-p
+                                   (expand-file-name (plist-get record :chat)
+                                                     gptel-runner-snapshot-directory))))))
+                    (with-current-buffer (gptel-runner-child-buffer loaded worker-id)
+                      (should buffer-read-only)
+                      (should (string-search "The worker finding" (buffer-string))))
+                    (with-current-buffer (gptel-runner-child-buffer loaded aside-id)
+                      (should buffer-read-only)
+                      (should-not (bound-and-true-p gptel-agent-review-aside-mode))
+                      (should-not (bound-and-true-p gptel-mode))
+                      (should (string-search "A review question" (buffer-string))))
+                    (with-current-buffer (gptel-runner-child-buffer loaded chat-id)
+                      (should (bound-and-true-p gptel-mode))
+                      (should (bound-and-true-p gptel-agent-session-managed-externally))
+                      (should (string-search "The nested finding" (buffer-string))))
+                    (should (= request-count (length requests))))
+                (gptel-runner-forget-run loaded)))))
+      (delete-directory gptel-runner-snapshot-directory t))))
 
 (provide 'gptel-runner-delegation-test)
 ;;; gptel-runner-delegation-test.el ends here

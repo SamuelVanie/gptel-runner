@@ -11,6 +11,7 @@
 
 (require 'tabulated-list)
 (require 'transient)
+(require 'button)
 (require 'gptel-runner-core)
 
 (declare-function gptel-runner-save-run "gptel-runner-store")
@@ -20,13 +21,18 @@
 (defvar gptel-runner-snapshot-directory)
 (declare-function gptel-runner-call-chat-buffer "gptel-runner-store")
 (declare-function gptel-runner-node-buffer "gptel-runner-store")
+(declare-function gptel-runner-child-buffer "gptel-runner-store")
+(defvar gptel-runner-store--child-run)
+(defvar gptel-runner-store--child-id)
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
 (declare-function gptel-runner-continue "gptel-runner-flow")
 (declare-function gptel-runner-extend "gptel-runner-flow")
 (declare-function gptel-runner--exhausted-budget-kinds "gptel-runner-flow")
 (declare-function gptel-runner-retry "gptel-runner-flow")
+(declare-function gptel-runner-rerun "gptel-runner-flow")
 (declare-function gptel-runner-complete-call-from-buffer
                   "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-feedback "gptel-runner-gptel")
 
 (defconst gptel-runner-dashboard--column-specs
   '((item "Workflow / node" 38)
@@ -504,6 +510,11 @@ An elided value retains its complete unpropertized text as hover help."
    ((and (boundp 'gptel-runner--call)
          (gptel-runner-call-p gptel-runner--call))
     (cons (gptel-runner-call-run gptel-runner--call) gptel-runner--call))
+   ((bound-and-true-p gptel-runner-store--child-run)
+    (let* ((run gptel-runner-store--child-run)
+           (child (gethash gptel-runner-store--child-id (gptel-runner-run-child-chats run))))
+      (cons run (cl-find (plist-get child :call) (gptel-runner-run-calls run)
+                         :key #'gptel-runner-call-id :test #'equal))))
    ((derived-mode-p 'gptel-runner-dashboard-mode)
     (let ((call (gptel-runner-ui--call-at-point)))
       (when-let* ((run (or (and call (gptel-runner-call-run call))
@@ -683,6 +694,62 @@ CALL may supply explicit provenance when this function is called from Lisp."
       (goto-char (point-min))
       (display-buffer (current-buffer)))))
 
+(defun gptel-runner-ui--insert-message (time type data node visit)
+  "Insert the message in DATA for NODE at TIME, if TYPE is a message.
+When NODE is nil, include every participant.  VISIT opens a node chat."
+  (when-let* ((kind (pcase type
+                      ('node-handoff "Handoff")
+                      ('node-follow-up "Follow-up")
+                      ('node-reply "Reply")))
+              (from (plist-get data :from)))
+    (let ((to (plist-get data :to)))
+      (when (or (null node) (equal node from) (equal node to))
+        (insert (propertize (format-time-string "%H:%M:%S" (seconds-to-time time))
+                            'face 'shadow)
+                "  " (propertize kind 'face 'bold) "  ")
+        (cl-flet ((link (id)
+                    (insert-text-button (format "%s" id) 'follow-link t
+                                        'action (lambda (_) (funcall visit id)))))
+          (link from)
+          (insert " → ")
+          (if to (link to) (insert "Workflow")))
+        (insert "\n" (substring-no-properties (plist-get data :message)) "\n\n")))))
+
+(defun gptel-runner-ui--show-messages (buffer-name node render)
+  "Show messages for NODE in BUFFER-NAME, calling RENDER on refresh."
+  (let ((buffer (get-buffer-create buffer-name)))
+    (with-current-buffer buffer
+      (special-mode)
+      (setq-local header-line-format
+                  (list " Node messages" (and node (format " · %s" node))
+                        "    g Refresh"))
+      (setq-local revert-buffer-function
+                  (lambda (&rest _)
+                    (let ((position (point)) (inhibit-read-only t))
+                      (erase-buffer)
+                      (funcall render)
+                      (when (= (point-min) (point-max))
+                        (insert "No node messages yet.\n"))
+                      (goto-char (min position (point-max))))))
+      (revert-buffer)
+      (goto-char (point-min)))
+    (pop-to-buffer buffer)))
+
+(defun gptel-runner-dashboard-messages ()
+  "Show workflow messages for the run or node at point."
+  (interactive)
+  (let* ((run (or (gptel-runner-ui--run-at-point) (user-error "Select a run or node")))
+         (call (gptel-runner-ui--call-at-point))
+         (node (and call (gptel-runner-node-id (gptel-runner-call-node call))))
+         (visit (lambda (id) (gptel-runner-visit-node-chat run id))))
+    (gptel-runner-ui--show-messages
+     (format "*gptel-runner events:%s*" (gptel-runner-run-id run)) node
+     (lambda ()
+       (dolist (event (gptel-runner-run-events run))
+         (gptel-runner-ui--insert-message
+          (gptel-runner-event-time event) (gptel-runner-event-type event)
+          (gptel-runner-event-data event) node visit))))))
+
 (defun gptel-runner-dashboard-open-at-point ()
   "Open the selected agent's chat or the run's event journal."
   (interactive)
@@ -701,6 +768,35 @@ CALL may supply explicit provenance when this function is called from Lisp."
                   (user-error "Select an agent node"))))
     (pop-to-buffer (or (gptel-runner-call-chat-buffer call)
                        (user-error "No chat was retained for this node")))))
+
+(defun gptel-runner-ui--read-child (children)
+  "Select a transcript in CHILDREN by its node, parent, name and identifier."
+  (unless children (user-error "No child transcripts for this selection"))
+  (if (null (cdr children)) (car children)
+    (let ((choices
+           (mapcar (lambda (child)
+                     (cons (format "%s%s · %s · %s [%s]"
+                                   (plist-get child :node)
+                                   (if-let* ((parent (plist-get child :parent-id)))
+                                       (format " / %s" parent) "")
+                                   (plist-get child :kind)
+                                   (string-trim (plist-get child :name))
+                                   (plist-get child :id))
+                           child))
+                   children)))
+      (cdr (assoc (completing-read "Child transcript: " choices nil t) choices)))))
+
+(defun gptel-runner-dashboard-child-transcripts ()
+  "Open a child agent or discussion transcript for the selected node or run."
+  (interactive)
+  (let* ((run (or (gptel-runner-ui--run-at-point) (user-error "Select a run or node")))
+         (call (gptel-runner-ui--call-at-point))
+         (node (and call (gptel-runner-node-id (gptel-runner-call-node call))))
+         (child (gptel-runner-ui--read-child
+                 (cl-loop for child being the hash-values of (gptel-runner-run-child-chats run)
+                          when (or (null node) (equal node (plist-get child :node)))
+                          collect child))))
+    (pop-to-buffer (gptel-runner-child-buffer run (plist-get child :id)))))
 
 ;;;###autoload
 (defun gptel-runner-visit-node-chat (run node)
@@ -755,6 +851,17 @@ from the local session.  NODE may be a node object or its ID."
    nil (or (gptel-runner-ui--call-at-point)
            (user-error "No call on this row")))
   (revert-buffer))
+
+(defun gptel-runner-dashboard-send-feedback ()
+  "Send another message in the selected waiting node's conversation."
+  (interactive)
+  (unless (gptel-runner-ui--completable-call-at-point-p)
+    (user-error "Select an agent waiting for feedback"))
+  (let ((call (gptel-runner-ui--call-at-point)))
+    (gptel-runner-gptel-feedback
+     call (read-string (format "Feedback for %s: "
+                               (gptel-runner-node-id (gptel-runner-call-node call)))))
+    (revert-buffer)))
 
 (defun gptel-runner-dashboard-pause-run ()
   "Pause and durably snapshot the run at point."
@@ -837,6 +944,13 @@ read a run from the current session."
   (gptel-runner-retry
    (or (gptel-runner-ui--run-at-point)
        (user-error "No run on this row")))
+  (revert-buffer))
+
+(defun gptel-runner-dashboard-rerun ()
+  "Rerun the finished run at point from its first step with the same goal."
+  (interactive)
+  (gptel-runner-rerun (or (gptel-runner-ui--run-at-point)
+                        (user-error "No run on this row")))
   (revert-buffer))
 
 (defun gptel-runner-dashboard-retry-node ()
@@ -955,6 +1069,10 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
 (transient-define-prefix gptel-runner-dashboard-menu ()
   "Show actions for the selected dashboard row."
   [["Inspect"
+    ("j" "Child transcripts" gptel-runner-dashboard-child-transcripts
+     :inapt-if-not gptel-runner-ui--run-at-point-p)
+    ("m" "Node messages" gptel-runner-dashboard-messages
+     :inapt-if-not gptel-runner-ui--run-at-point-p)
     ("e" "Event journal" gptel-runner-dashboard-inspect-events
      :inapt-if-not gptel-runner-ui--run-at-point-p)
     ("v" "Open node chat" gptel-runner-dashboard-visit-worker
@@ -962,6 +1080,8 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
    ["Call"
     ("p" "Pause for feedback" gptel-runner-dashboard-pause-call
      :inapt-if-not gptel-runner-ui--pausable-call-at-point-p)
+    ("f" "Send feedback" gptel-runner-dashboard-send-feedback
+     :inapt-if-not gptel-runner-ui--completable-call-at-point-p)
     ("a" "Accept response" gptel-runner-dashboard-complete-call
      :inapt-if-not gptel-runner-ui--completable-call-at-point-p)
     ("T" "Retry from this node" gptel-runner-dashboard-retry-node
@@ -975,6 +1095,8 @@ With prefix argument DELETE-SNAPSHOTS, also delete their durable snapshots."
      :inapt-if-not gptel-runner-ui--resumable-run-at-point-p)
     ("t" "Retry" gptel-runner-dashboard-retry-run
      :inapt-if-not gptel-runner-ui--retryable-run-at-point-p)
+    ("R" "Rerun with same goal" gptel-runner-dashboard-rerun
+     :inapt-if-not gptel-runner-ui--continuable-run-at-point-p)
     ("b" "Extend limits" gptel-runner-dashboard-extend-run
      :inapt-if-not gptel-runner-ui--extendable-run-at-point-p)
     ("c" "Continue with new goal" gptel-runner-dashboard-continue-run

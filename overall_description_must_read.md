@@ -221,31 +221,22 @@ For coding work, the workspace itself is the primary source of truth. The blackb
 
 This also matches the useful property of gptel-agent subagents: they do not inherit the entire parent context and return focused reports instead. ([GitHub][2])
 
-## Stateless turns for the first release
+## Conversations and handoffs
 
-The first implementation should make every workflow agent call stateless.
+Each agent node owns one gptel conversation per run. Revisiting a reviewer
+in a repeat, or asking it a question about its findings, adds a turn to the
+same buffer. Opening a node in the dashboard shows that conversation.
 
-For example, the second implementer invocation receives:
+Within a sequence, an agent uses `RunnerHandoff` to submit the result for
+the next agent. A recipient can call `RunnerAskPrevious` for clarification.
+The earlier agent uses `RunnerHandoff` to answer and the recipient resumes
+with that answer. Elisp controls routing, validation, and approval. The
+last agent's handoff lets the workflow finish.
 
-```text
-Original goal
-Current workflow iteration
-Workspace path
-Previous reviewer findings
-Any relevant constraints
-```
-
-It then inspects the workspace again.
-
-We should not initially preserve a private ongoing conversation for every agent because that introduces:
-
-* hidden state;
-* context growth;
-* complicated persistence;
-* unclear retry semantics;
-* potentially stale beliefs about files that have changed.
-
-Persistent per-agent sessions can be added later as an explicit option.
+Tool turns share the run's budgets. A step that needs to finish on ordinary
+assistant text can select `:completion 'response`. See the
+[runner README](README.md#handing-work-to-the-next-agent) for route
+boundaries, dashboard controls, and a workflow definition.
 
 ---
 

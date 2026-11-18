@@ -2,15 +2,12 @@
 
 ;;; Commentary:
 
-;; This example demonstrates an explicit handoff between independent chats:
-;;
-;;   researcher -> planner -> human approval -> implementer
-;;
-;; Each step stores its result on the run blackboard with `:save-as'.  The
-;; next step receives that result because its prompt function reads it with
-;; `gptel-runner-get'.  No conversational transcript is shared implicitly.
-;; The planner uses `:pause-after t', so its first response remains provisional
-;; until a human accepts or replaces it from the retained worker transcript.
+;; The researcher sends findings to the planner.  The planner may ask the
+;; researcher for evidence before handing its plan to the implementer.
+;; The implementer can ask the planner questions while doing the work.
+;; Each agent answers in its own chat.  The plan requires human acceptance.
+;; After the last handoff, read the report with
+;; (gptel-runner-get run 'completion-report).
 ;;
 ;; Define the gptel presets `handoff-researcher', `handoff-planner', and
 ;; `handoff-implementer' before running this workflow.  Their tool lists are
@@ -40,36 +37,33 @@
   (format
    (concat "Goal:\n%s\n\nWorkspace: %s\n\n"
            "Inspect the workspace and gather the facts needed to accomplish "
-           "the goal.  Do not modify files.  Return a concise research report "
-           "for the planning agent.")
+           "the goal.  Call RunnerHandoff with the findings and file locations "
+           "the planner will need.")
    (gptel-runner-run-goal run)
    (gptel-runner-run-workspace run)))
 
 (defun example/handoff-plan-prompt (run _node)
-  "Pass the research report in RUN to the planning agent."
+  "Ask the planner to turn its incoming research into a plan for RUN."
   (format
-   (concat "Goal:\n%s\n\nWorkspace: %s\n\n"
-           "Research report from the previous agent:\n%S\n\n"
-           "Reinspect relevant files, then produce a concrete implementation "
-           "plan for the final agent.  Do not modify files.")
-   (gptel-runner-run-goal run)
-   (gptel-runner-run-workspace run)
-   (gptel-runner-get run 'research-report)))
+   (concat "Plan the implementation of this goal:\n%s\n\n"
+           "Check the researcher's findings against the workspace.  "
+           "If evidence is missing, use RunnerAskPrevious to ask for it.  "
+           "Use RunnerHandoff to submit the plan for approval.  Include "
+           "the files to change and the tests the implementer should run.")
+   (gptel-runner-run-goal run)))
 
 (defun example/handoff-implement-prompt (run _node)
-  "Pass prior results in RUN to the final implementation agent."
+  "Ask the implementer to carry out the accepted plan for RUN."
   (format
    (concat "Goal:\n%s\n\nWorkspace: %s\n\n"
-           "Research report:\n%S\n\nImplementation plan:\n%S\n\n"
-           "Inspect the current workspace, implement the goal, and run the "
-           "relevant verification.  Return a concise completion report.")
+           "Carry out the approved plan.  Use RunnerAskPrevious if you need "
+           "the planner to clarify a decision.  Run the relevant tests, then "
+           "use RunnerHandoff to report the changes and test results.")
    (gptel-runner-run-goal run)
-   (gptel-runner-run-workspace run)
-   (gptel-runner-get run 'research-report)
-   (gptel-runner-get run 'implementation-plan)))
+   (gptel-runner-run-workspace run)))
 
 (gptel-runner-defworkflow three-stage-handoff
-    (:max-requests 12 :max-calls 3 :max-concurrency 1 :max-duration 1800)
+    (:max-requests 30 :max-calls 12 :max-concurrency 1 :max-duration 1800)
   (gptel-runner-sequence
    :id 'three-stage-handoff-sequence
    (gptel-runner-agent-step

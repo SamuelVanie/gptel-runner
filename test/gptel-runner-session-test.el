@@ -1,6 +1,7 @@
 ;;; gptel-runner-session-test.el --- Native node chat integration -*- lexical-binding: t; -*-
 
 (require 'gptel-runner-gptel-test)
+(require 'gptel-runner-conversation-integration)
 (require 'gptel-runner-jobs-ui)
 
 (defmacro gptel-runner-session-test--with-run (&rest body)
@@ -37,23 +38,22 @@
       (with-current-buffer chat
         (goto-char (point-max))
         (insert "PRIVATE-UNSENT-DRAFT"))
-      (gptel-runner-gptel-test--reply first "First finding" "stop")
+      (gptel-runner-gptel-test--handoff first "First finding")
       (let* ((second (pop requests))
              (messages (plist-get (plist-get (gptel-fsm-info second) :data) :messages)))
         (should (eq chat (plist-get (gptel-fsm-info second) :buffer)))
-        (should (cl-some (lambda (m) (and (equal (plist-get m :role) "assistant")
-                                          (equal (plist-get m :content) "First finding")))
-                         messages))
+        (should (string-search "First finding" (prin1-to-string messages)))
         (should (string-match-p "Recheck the result" (prin1-to-string messages)))
         (should-not (string-match-p "PRIVATE-UNSENT-DRAFT" (prin1-to-string messages)))
-        (gptel-runner-gptel-test--reply second "Done" "stop"))
+        (gptel-runner-gptel-test--handoff second "Done"))
       (should (eq 'succeeded (gptel-runner-run-state run)))
       (with-current-buffer chat
         (should (string-match-p "PRIVATE-UNSENT-DRAFT" (buffer-string))))
       (kill-buffer chat)
       (setq chat (gptel-runner-node-buffer run 'check))
       (should (buffer-local-value 'gptel-mode chat))
-      (should (equal "Done" (gptel-runner-gptel--last-response chat))))))
+      (should (equal "Done" (gptel-runner-get run 'answer)))
+      (should (string-search "Done" (with-current-buffer chat (buffer-string)))))))
 
 (defun gptel-runner-session-test--checkpoint ()
   "Verify that an editable, paused chat survives the whole run lifecycle."
@@ -105,7 +105,7 @@
         (should-not requests)
         (should (equal (plist-get (gptel-fsm-info review) :buffer)
                        (gptel-runner-node-buffer run 'review)))
-        (gptel-runner-gptel-test--reply review "Reviewed" "stop"))
+        (gptel-runner-gptel-test--handoff review "Reviewed"))
       (should (eq (gptel-runner-run-state run) 'succeeded))
       (gptel-runner-forget-run run))))
 
@@ -118,6 +118,39 @@
   (skip-unless (and (require 'gptel-agent nil t)
                     (gptel-runner-store--agent-sessions-p)))
   (gptel-runner-session-test--checkpoint))
+
+(ert-deftest gptel-runner-session-restore-outstanding-question ()
+  (gptel-runner-session-test--with-run
+    (gptel-runner-defworkflow saved-question (:persist t)
+      (gptel-runner-sequence
+       (gptel-runner-agent-step :id 'research :agent 'reader :prompt "Research"
+                                :save-as 'report)
+       (gptel-runner-agent-step :id 'plan :agent 'reader :prompt "Plan"
+                                :save-as 'plan)))
+    (let* ((run (gptel-runner-start 'saved-question))
+           (file (gptel-runner-run-snapshot-file run)))
+      (gptel-runner-gptel-test--handoff (pop requests) "original findings")
+      (gptel-runner-gptel-test--reply
+       (pop requests) nil "tool_calls"
+       [(:id "ask" :type "function"
+         :function (:name "RunnerAskPrevious" :arguments "{\"question\":\"Which version?\"}"))])
+      (gptel-runner-gptel-test--reply (pop requests) "Version two" "stop")
+      (gptel-runner-pause-run run)
+      (gptel-runner-forget-run run)
+      (setq run (gptel-runner-load-run file))
+      (should-not requests)
+      ;; Accept the answer in the research chat after restarting Emacs.
+      (with-current-buffer (gptel-runner-node-buffer run 'research)
+        (gptel-runner-complete-call-from-buffer))
+      (should (equal (gptel-runner-get run 'report) "original findings"))
+      (let* ((resumed (pop requests))
+             (info (gptel-fsm-info resumed)))
+        (should (eq (plist-get info :buffer) (gptel-runner-node-buffer run 'plan)))
+        (should (string-search "Version two" (prin1-to-string (plist-get info :data))))
+        (gptel-runner-gptel-test--handoff resumed "final plan"))
+      (should (eq (gptel-runner-run-state run) 'succeeded))
+      (should (equal "final plan" (gptel-runner-get run 'plan)))
+      (should-not requests))))
 
 (ert-deftest gptel-runner-session-parallel-feedback-survives-restart ()
   (gptel-runner-session-test--with-run
@@ -145,11 +178,45 @@
       (should (eq (gptel-runner-run-state run) 'succeeded))
       (should-not requests))))
 
+(ert-deftest gptel-runner-session-restored-discussion-preserves-parallel-approval ()
+  (gptel-runner-session-test--with-run
+    (let ((prompt-count 0))
+      (gptel-runner-defworkflow saved-discussions (:persist t :max-concurrency 2)
+        (gptel-runner-parallel
+         (gptel-runner-agent-step :id 'talk :agent 'reader :save-as 'answer
+                                  :prompt (lambda (_run _node)
+                                            (cl-incf prompt-count) "Inspect"))
+         (gptel-runner-agent-step :id 'gate :agent 'reader :prompt "Review"
+                                  :pause-after t :save-as 'review)))
+      (let* ((run (gptel-runner-start 'saved-discussions))
+             (file (gptel-runner-run-snapshot-file run)))
+        (gptel-runner-gptel-test--reply (pop requests) "Which file?" "stop")
+        (gptel-runner-gptel-test--handoff (pop requests) "Ready for approval")
+        (gptel-runner-pause-run run)
+        (gptel-runner-forget-run run)
+        (setq run (gptel-runner-load-run file))
+        (with-current-buffer (gptel-runner-node-buffer run 'talk)
+          (gptel-runner-gptel-feedback gptel-runner--call "Read design.el"))
+        (should (= 1 prompt-count))
+        (let ((resumed (pop requests)))
+          (should-not requests)
+          (should (string-search "Which file?" (prin1-to-string
+                                                (plist-get (gptel-fsm-info resumed) :data))))
+          (gptel-runner-gptel-test--handoff resumed "File inspected"))
+        (should (equal "File inspected" (gptel-runner-get run 'answer)))
+        (should-not (gptel-runner-get run 'review))
+        (with-current-buffer (gptel-runner-node-buffer run 'gate)
+          (gptel-runner-complete-call-from-buffer))
+        (should (eq 'succeeded (gptel-runner-run-state run)))
+        (should (equal "Ready for approval" (gptel-runner-get run 'review)))
+        (should-not requests)))))
+
 (ert-deftest gptel-runner-session-background-publishes-editable-chat ()
   (gptel-runner-session-test--with-run
     (let* ((gptel-runner-jobs--run
             (gptel-runner-start
-             (gptel-runner-agent-step :id 'check :agent 'reader :prompt "Check code")
+             (gptel-runner-agent-step :id 'check :agent 'reader :prompt "Check code"
+                                      :completion 'response)
              :driver (gptel-runner-gptel-driver-create)))
            (gptel-runner-jobs--invocation
             (list :id "session-test" :epoch 1 :directory gptel-runner-snapshot-directory))

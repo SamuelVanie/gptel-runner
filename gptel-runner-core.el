@@ -122,7 +122,8 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   (state 'pending) (request-attempt 0) retry-timer (generation 0)
   response-parts result error started-at finished-at on-complete
   driver-data repair-p tool-names
-  elisp-cleanup elisp-cleanup-reason elisp-timer elisp-deadline)
+  elisp-cleanup elisp-cleanup-reason elisp-timer elisp-deadline
+  discussion-owner follow-up-p)
 
 (cl-defstruct (gptel-runner-run
                (:constructor gptel-runner-run-create))
@@ -137,7 +138,9 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   output-directory artifacts output-epoch
   callback callback-called
   duration-timer duration-remaining active-started-at
-  paused-at snapshot-file (generation 0) options)
+  paused-at snapshot-file (generation 0) options
+  (child-chats (make-hash-table :test #'equal))
+  (discussions (make-hash-table :test #'equal)))
 
 (defun gptel-runner--source-root (source)
   "Return the workflow root represented by SOURCE.
@@ -295,8 +298,10 @@ functions that need NODE's directory."
 (cl-defgeneric gptel-runner-driver-start (driver call complete observe)
   "Start CALL with DRIVER.
 COMPLETE accepts STATUS, VALUE, and optional METADATA.  OBSERVE accepts an
-event type and data.  A driver must call COMPLETE at most once, but the core is
-defensive against duplicate and late calls.  METADATA may include
+event type and data.  Success supplies an accepted handoff.  A `discussion'
+status parks an ordinary reply for another turn, and `follow-up' supplies
+a question for the preceding agent.  A driver must call COMPLETE at most
+once.  The core ignores duplicate and late calls.  METADATA may include
 `:retryable t' for a transient protocol failure despite a successful HTTP
 status; request budgets, retry limits, and `:permanent' still apply.")
 
@@ -438,8 +443,8 @@ returns nil even when DEFAULT is non-nil."
 
 (defun gptel-runner-continuations (run)
   "Return a copy of RUN's ordered continuation history.
-Each entry records the preceding goal and terminal state, the observation that
-became the next goal, and the preceding workflow's saved results."
+Each entry records the preceding goal, terminal state and workflow outputs.
+Its observation is the new goal for a continuation, or nil for a rerun."
   (unless (gptel-runner-run-p run)
     (user-error "Not a gptel-runner run: %S" run))
   (copy-tree (gptel-runner-get run gptel-runner-continuations-key) t))
@@ -569,6 +574,12 @@ When DELETE-SNAPSHOT is non-nil, also delete its durable snapshot file."
   ;; The last checkpoint already owns these chats.  Closing the buffers must
   ;; not enqueue another save for a run that is leaving the registry.
   (clrhash (gptel-runner-run-chats run))
+  (let* ((children (gptel-runner-run-child-chats run))
+         (buffers (mapcar (lambda (record) (plist-get record :chat))
+                          (hash-table-values children))))
+    (clrhash children)
+    (dolist (buffer buffers)
+      (when (buffer-live-p buffer) (kill-buffer buffer))))
   (dolist (call (gptel-runner-run-calls run))
     (when (buffer-live-p (gptel-runner-call-buffer call))
       (kill-buffer (gptel-runner-call-buffer call))
@@ -606,15 +617,17 @@ non-nil, also delete snapshot files belonging to the removed runs."
     (gptel-runner-unregister-workflow name)
     workflow))
 
-(defun gptel-runner--set-node-state (run node state &optional data)
-  "Set NODE state in RUN to STATE and emit its transition with DATA."
+(defun gptel-runner--set-node-state (run node state &optional data handoff)
+  "Set NODE state in RUN to STATE and emit its transition with DATA.
+HANDOFF is the raw message accepted for this execution of an agent node."
   (let* ((states (gptel-runner-run-node-states run))
          (id (gptel-runner-node-id node))
          (old (gethash id states 'pending)))
     (unless (or (eq old state) (gptel-runner--terminal-p old))
       (puthash id state states)
       (if (gptel-runner--terminal-p state)
-          (puthash id (list :state state :value data)
+          (puthash id (append (list :state state :value data)
+                              (when handoff (list :handoff handoff)))
                    (gptel-runner-run-node-outcomes run))
         (remhash id (gptel-runner-run-node-outcomes run)))
       (gptel-runner--emit run (intern (format "node-%s" state)) node nil data)
@@ -838,15 +851,29 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
   (when (and (= generation (gptel-runner-call-generation call))
              (not (gptel-runner--call-terminal-p call)))
     (pcase status
+      ('discussion
+       (if (gptel-runner--empty-output-p value)
+           (gptel-runner--finish-call call 'failed (gptel-runner--empty-output-error))
+         (setf (gptel-runner-call-result call) value
+               (gptel-runner-call-driver-data call)
+               (plist-put (gptel-runner-call-driver-data call) :discussion-wait t))
+         (gptel-runner--suspend-call call 'waiting-feedback 'discussion t t)
+         (gptel-runner--checkpoint (gptel-runner-call-run call) t)))
+      ('follow-up
+       (setf (gptel-runner-call-follow-up-p call) t)
+       (gptel-runner--finish-call call 'succeeded value))
       ('success
        (if (gptel-runner--empty-output-p value)
            (gptel-runner--finish-call
             call 'failed (gptel-runner--empty-output-error))
-         (if (plist-get
-              (gptel-runner-node-properties (gptel-runner-call-node call))
-              :pause-after)
-             (gptel-runner--suspend-call
-              call 'waiting-feedback 'pause-after t t)
+         (if (and (not (gptel-runner-call-discussion-owner call))
+                  (plist-get (gptel-runner-node-properties
+                              (gptel-runner-call-node call)) :pause-after))
+             (progn
+               (setf (gptel-runner-call-result call) value)
+               (gptel-runner--suspend-call
+                call 'waiting-feedback 'pause-after t t)
+               (gptel-runner--checkpoint (gptel-runner-call-run call) t))
            (gptel-runner--finish-call call 'succeeded value))))
       ('cancelled (gptel-runner--finish-call call 'cancelled value))
       ('blocked (gptel-runner--finish-call call 'blocked value))
@@ -1086,9 +1113,10 @@ Roll back acquisitions if any admission function refuses or signals."
                 (gptel-runner--dispatch-attempt found)))
             (setq progress t)))))))
 
-(defun gptel-runner--submit-call (run node agent prompt done &optional repair-p)
+(defun gptel-runner--submit-call (run node agent prompt done &optional repair-p owner)
   "Queue a call for NODE in RUN, invoking DONE on terminalization.
-AGENT and PROMPT are nil for Elisp steps.  REPAIR-P marks an agent repair."
+AGENT and PROMPT are nil for Elisp steps.  REPAIR-P marks an agent repair.
+OWNER identifies the downstream node whose question this call serves."
   (if (and (not (eq (gptel-runner-node-kind node) 'elisp))
            (not (gptel-runner--consume-call run)))
       (progn
@@ -1102,7 +1130,8 @@ AGENT and PROMPT are nil for Elisp steps.  REPAIR-P marks an agent repair."
                  :id (gptel-runner--id "call") :run run :node node
                  :agent agent :prompt prompt
                  :workspace (gptel-runner-node-workspace run node)
-                 :state 'ready :on-complete done :repair-p repair-p)))
+                 :state 'ready :on-complete done :repair-p repair-p
+                 :discussion-owner owner)))
       (setf (gptel-runner-run-calls run)
             (nconc (gptel-runner-run-calls run) (list call))
             (gptel-runner-run-queue run)

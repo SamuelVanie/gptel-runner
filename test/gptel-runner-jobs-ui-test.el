@@ -415,5 +415,98 @@
              (lambda (&rest _) (ert-fail "Forgot history without confirmation"))))
     (gptel-runner-jobs-ui--forget '((:phase closed)) t "test history")))
 
+(ert-deftest gptel-runner-dashboard-node-messages-refresh-and-open-participants ()
+  (let* ((run (gptel-runner-run-create :id "message-test"))
+         (call (gptel-runner-call-create
+                :node (gptel-runner-node-create :id 'review :kind 'agent)
+                :run run))
+         (name "*gptel-runner events:message-test*")
+         visited)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'gptel-runner-ui--run-at-point) (lambda () run))
+                    ((symbol-function 'gptel-runner-ui--call-at-point) (lambda () call))
+                    ((symbol-function 'gptel-runner-visit-node-chat)
+                     (lambda (r node) (setq visited (list r node)))))
+            (gptel-runner-dashboard-messages)
+            (should (string-match-p "No node messages" (buffer-string)))
+            (gptel-runner--emit run 'node-handoff nil nil
+                                '(:from first :to second :message "Unrelated message"))
+            (gptel-runner--emit run 'node-follow-up nil nil
+                                '(:from review :to draft :message "Which branch?"))
+            (gptel-runner--emit run 'node-reply nil nil
+                                '(:from draft :to review :message "Use main."))
+            (gptel-runner--emit run 'node-handoff nil nil
+                                '(:from review :to nil :message "Tests passed."))
+            (revert-buffer)
+            (should-not (string-match-p "Unrelated message" (buffer-string)))
+            (goto-char (point-min))
+            (search-forward "Follow-up  review → draft")
+            (button-activate (button-at (1- (point))))
+            (should (equal visited (list run 'draft)))
+            (search-forward "Which branch?")
+            (search-forward "Reply  draft → review")
+            (search-forward "Use main.")
+            (search-forward "Handoff  review → Workflow")
+            (search-forward "Tests passed.")))
+      (when (get-buffer name) (kill-buffer name)))))
+
+(ert-deftest gptel-runner-jobs-ui-published-messages-link-to-owning-epoch ()
+  (let* ((directory (make-temp-file "runner-messages-" t))
+         (run (list :id "test" :directory directory
+                    :calls '((:id "c1" :node planner :epoch 1 :chat "1.el")
+                             (:id "c2" :node planner :epoch 2 :chat "2.el"))))
+         selection)
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "events.el" directory)
+            (insert (gptel-runner-jobs--data-string
+                     '(:epoch 1 :time 1.0 :type node-handoff
+                       :data (:from planner :to reviewer :message "Review this plan.")))
+                    "(:epoch 1"))
+          (with-temp-buffer
+            (gptel-runner-jobs-ui--insert-messages run nil)
+            (should (string-match-p "Review this plan" (buffer-string)))
+            (goto-char (point-min))
+            (search-forward "planner")
+            (cl-letf (((symbol-function 'gptel-runner-background-visit)
+                       (lambda (target) (setq selection target))))
+              (button-activate (button-at (1- (point)))))
+            (should (equal selection '(background-call "test" 1 "c1")))))
+      (delete-directory directory t))))
+
+(ert-deftest gptel-runner-dashboard-feedback-targets-selected-waiting-chat ()
+  (let* ((call (gptel-runner-call-create
+                :node (gptel-runner-node-create :id 'review :kind 'agent)
+                :buffer (current-buffer) :state 'waiting-feedback))
+         sent)
+    (cl-letf (((symbol-function 'gptel-runner-ui--call-at-point) (lambda () call))
+              ((symbol-function 'read-string) (lambda (&rest _) "Check the tests."))
+              ((symbol-function 'gptel-runner-gptel-feedback)
+               (lambda (target text) (setq sent (list target text))))
+              ((symbol-function 'revert-buffer) #'ignore))
+      (gptel-runner-dashboard-send-feedback)
+      (should (equal sent (list call "Check the tests.")))
+      (setf (gptel-runner-call-state call) 'succeeded)
+      (should-error (gptel-runner-dashboard-send-feedback) :type 'user-error))))
+
+(ert-deftest gptel-runner-dashboard-background-child-selection-keeps-worker-target ()
+  (let* ((run '(:id "job-1"
+                :calls ((:node draft :id "c1" :epoch 1
+                         :children ((:id "x" :kind agent :node draft :name "worker"
+                                     :chat "child-chats/x.chat" :chat-format transcript)))
+                        (:node verify :id "c2" :epoch 1
+                         :children ((:id "y" :kind discussion :node verify :name "chat"))))))
+         (call (car (plist-get run :calls)))
+         opened)
+    (cl-letf (((symbol-function 'gptel-runner-jobs-ui--selection)
+               (lambda () (list run call '(background-call "job-1" 1 "c1"))))
+              ((symbol-function 'gptel-runner-background-transcript)
+               (lambda (selection) (setq opened selection))))
+      (gptel-runner-background-child-transcripts)
+      (should (equal (plist-get (cadr opened) :id) "x"))
+      (should (equal (plist-get (cadr opened) :chat) "child-chats/x.chat"))
+      (should (equal (nth 2 opened) '(background-call "job-1" 1 "c1"))))))
+
 (provide 'gptel-runner-jobs-ui-test)
 ;;; gptel-runner-jobs-ui-test.el ends here

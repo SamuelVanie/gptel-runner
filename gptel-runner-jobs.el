@@ -76,7 +76,7 @@ executes directly and does not need this launcher."
 (defconst gptel-runner-jobs--version 1)
 (define-error 'gptel-runner-job-storage-error "Background job storage failed")
 (defconst gptel-runner-jobs--operations
-  '(pause resume cancel retry continue extend extend-repeat decision
+  '(pause resume cancel retry rerun continue extend extend-repeat decision
 	  pause-call cancel-call feedback accept approve approve-all reject
           revoke-outside))
 
@@ -274,7 +274,7 @@ loading the initialization file."
     (cl-loop for (key _value) on arguments by #'cddr
              unless (memq key '(:goal :workspace :inputs :max-requests :max-calls
 				      :max-concurrency :max-duration :allow-writes
-				      :allow-unconfirmed-tools :decision-memory :context))
+				      :allow-unconfirmed-tools :decision-memory :context :completion))
              do (error "Unsupported durable job start argument: %S" key))
     (unless (and (stringp emacs) (file-name-absolute-p emacs)
                  (file-executable-p emacs))
@@ -764,6 +764,7 @@ invocation is recorded as skipped without starting another worker."
             ((or 'pause 'cancel) nil)
             ('resume '(:feedback))
             ('retry '(:from-node :feedback))
+            ('rerun '(:reset-budget))
             ('continue (append '(:observation :reset-budget) budgets))
             ('extend budgets)
             ('extend-repeat (append '(:node :additional-iterations) budgets))
@@ -827,7 +828,7 @@ inside a newly launched worker, never inside the caller's Emacs."
                       (/= (plist-get arguments :call-epoch) (plist-get invocation :epoch)))
              (error "This call belongs to an earlier worker generation"))
 	   (unless (gptel-runner-invocation-live-p invocation)
-             (unless (memq operation '(resume retry continue extend extend-repeat cancel))
+             (unless (memq operation '(resume retry rerun continue extend extend-repeat cancel))
                (error "This operation requires the original live worker"))
              (unless (file-exists-p (expand-file-name "checkpoint.el"
                                                       (plist-get invocation :directory)))
@@ -963,25 +964,28 @@ Opaque runtime objects and circular references are represented by type."
        (expand-file-name relative (plist-get gptel-runner-jobs--invocation :directory)) data)
       (puthash relative hash gptel-runner-jobs--exports))))
 
-(defun gptel-runner-jobs--export-chat (call epoch)
-  "Return the published session fields for CALL's node in EPOCH."
-  (when-let* ((node (gptel-runner-node-id (gptel-runner-call-node call)))
-              (chat (gethash node (gptel-runner-run-chats (gptel-runner-call-run call)))))
-    (let* ((relative (format "chats/%d-%s.chat" epoch
-                             (secure-hash 'sha256 (prin1-to-string node))))
-           (file (expand-file-name relative
-                                   (plist-get gptel-runner-jobs--invocation :directory)))
-           (stamp (if (buffer-live-p chat)
-                      (with-current-buffer chat
-                        (list chat (buffer-modified-tick) (point-min) (point-max)
-                              (point) (buffer-name)))
-                    chat))
-           (cached (gethash relative gptel-runner-jobs--exports)))
-      (unless (equal stamp (car cached))
-        (gptel-runner-jobs--mkdir (file-name-directory file))
-        (setq cached (cons stamp (gptel-runner-store-export-chat chat file)))
-        (puthash relative cached gptel-runner-jobs--exports))
-      (list :chat relative :chat-format (cdr cached)))))
+(defun gptel-runner-jobs--export-chat (call epoch &optional child)
+  "Return published chat fields for CALL in EPOCH, or for its CHILD record."
+  (let* ((node (gptel-runner-node-id (gptel-runner-call-node call)))
+         (chat (if child (plist-get child :chat)
+                 (gethash node (gptel-runner-run-chats (gptel-runner-call-run call))))))
+    (when chat
+      (let* ((key (if child (plist-get child :id) node))
+             (relative (format "%s/%d-%s.chat" (if child "child-chats" "chats") epoch
+                               (secure-hash 'sha256 (prin1-to-string key))))
+             (file (expand-file-name relative (plist-get gptel-runner-jobs--invocation :directory)))
+             (stamp (if (buffer-live-p chat)
+                        (with-current-buffer chat
+                          (list chat (buffer-modified-tick) (point-min) (point-max)
+                                (point) (buffer-name)))
+                      chat))
+             (cached (gethash relative gptel-runner-jobs--exports)))
+        (unless (equal stamp (car cached))
+          (gptel-runner-jobs--mkdir (file-name-directory file))
+          (setq cached (cons stamp (gptel-runner-store-export-chat
+                                    (if child (gptel-runner-store--child-archive child) chat) file)))
+          (puthash relative cached gptel-runner-jobs--exports))
+        (list :chat relative :chat-format (cdr cached))))))
 
 (defun gptel-runner-jobs--publish ()
   "Publish current worker inspection data and its compact manifest."
@@ -992,7 +996,11 @@ Opaque runtime objects and circular references are represented by type."
            (previous (cl-remove-if
                       (lambda (call) (= (plist-get call :epoch) epoch))
                       (plist-get gptel-runner-jobs--invocation :calls)))
+           (children-by-call (make-hash-table :test #'equal))
            calls outputs)
+      (maphash (lambda (_id child)
+                 (push child (gethash (plist-get child :call) children-by-call)))
+               (gptel-runner-run-child-chats run))
       ;; Preserve earlier rows under their owning epoch.  A worker might
       ;; also have checkpointed a chat just before its first publication.
       (dolist (call (cl-remove-if
@@ -1017,6 +1025,15 @@ Opaque runtime objects and circular references are represented by type."
                              :attempts (gptel-runner-call-request-attempt call)
                              :record (concat base ".el"))))
           (setq record (append record (gptel-runner-jobs--export-chat call epoch)))
+          (when-let* ((children (gethash (gptel-runner-call-id call) children-by-call)))
+            (setq record
+                  (plist-put record :children
+                             (mapcar
+                              (lambda (child)
+                                (let ((entry (copy-sequence child)))
+                                  (cl-remf entry :chat)
+                                  (append entry (gptel-runner-jobs--export-chat call epoch child))))
+                              children))))
           (gptel-runner-jobs--export-file
            (concat base ".el")
            (append record (list :prompt (gptel-runner-call-prompt call)
@@ -1118,6 +1135,7 @@ Opaque runtime objects and circular references are represented by type."
       ('resume (gptel-runner-resume-run run (plist-get args :feedback)))
       ('cancel (gptel-runner-abort-run run 'background-command))
       ('retry (apply #'gptel-runner-retry run args))
+      ('rerun (apply #'gptel-runner-rerun run args))
       ('continue (let ((rest (copy-sequence args)))
                    (cl-remf rest :observation)
                    (apply #'gptel-runner-continue run (plist-get args :observation) rest)))

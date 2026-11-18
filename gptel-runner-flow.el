@@ -12,6 +12,7 @@
 
 (require 'cl-lib)
 (require 'gptel-runner-core)
+(require 'gptel-runner-discussion)
 (require 'gptel-runner-output)
 
 (defun gptel-runner--make-node (kind properties &optional children)
@@ -25,7 +26,9 @@
   "Return an agent node described by PROPERTIES.
 Required keys are `:agent' and `:prompt'.  Optional `:id', `:save-as',
 `:retries', `:parser', `:validator', `:repair-invalid', `:pause-after',
-`:workspace', and `:context' customize its execution.  A non-nil `:pause-after'
+`:workspace', `:completion', and `:context' customize its execution.
+Completion defaults to `handoff'; use `response' for a plain-text result.
+A non-nil `:pause-after'
 holds a successful response for human feedback before completing the node.
 `:workspace' selects an existing directory, relative to the run workspace
 or absolute.  Omitted or
@@ -475,6 +478,9 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
                  (when (plist-member props key)
                    (user-error "Elisp node %S does not support %S" id key))))
               ('agent
+               (when (and (plist-member props :completion)
+                          (not (memq (plist-get props :completion) '(handoff response))))
+                 (user-error "Agent node %S has invalid :completion" id))
                (let ((agent (gptel-runner--agent (plist-get props :agent)))
                      (directory (gptel-runner--node-workspace node workspace)))
                  (dolist (entry contexts)
@@ -588,6 +594,7 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
 
 (defun gptel-runner--reset-subtree (run node)
   "Reset NODE and descendants to pending in RUN before a new iteration."
+  (remhash (gptel-runner-node-id node) (gptel-runner-run-discussions run))
   (when (eq (gptel-runner-node-kind node) 'try)
     (remhash (list 'gptel-runner-try (gptel-runner-node-id node))
              (gptel-runner-run-blackboard run))
@@ -614,22 +621,28 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
   "Cancel unfinished work in RUN below NODE for REASON."
   (let ((ids (gptel-runner--subtree-ids node)))
     (dolist (call (copy-sequence (gptel-runner-run-calls run)))
-      (when (and (memq (gptel-runner-node-id (gptel-runner-call-node call)) ids)
+      (when (and (member (or (gptel-runner-call-discussion-owner call)
+                             (gptel-runner-node-id (gptel-runner-call-node call)))
+                         ids)
                  (not (gptel-runner--call-terminal-p call)))
         (gptel-runner-abort-call call reason)))))
 
 (defun gptel-runner--prompt (run node)
   "Resolve NODE's prompt for RUN."
-  (let* ((prompt (plist-get (gptel-runner-node-properties node) :prompt))
-         (resolved (if (functionp prompt) (funcall prompt run node) prompt))
-         (resolved (gptel-runner--prepend-context
-                    resolved (gptel-runner--resolve-context run node)))
+  (let* ((turn (gethash (gptel-runner-node-id node) (gptel-runner-run-discussions run)))
+         (prompt (plist-get (gptel-runner-node-properties node) :prompt))
+         (resolved (or (plist-get turn :prompt)
+                       (gptel-runner--prepend-context
+                        (if (functionp prompt) (funcall prompt run node) prompt)
+                        (gptel-runner--resolve-context run node))))
+         (message (unless turn (gptel-runner--incoming-handoff run node)))
          (decisions (and (gptel-runner-decision-memory-p run)
                          (gptel-runner-decisions run)))
          (continuation (gptel-runner--latest-continuation run))
          (retry-feedback (gptel-runner-get run 'gptel-runner-retry-feedback))
          (feedback (gethash 'gptel-runner-resume-feedback
                             (gptel-runner-run-blackboard run))))
+    (when message (setq resolved (concat resolved "\n\n" message)))
     (when decisions
       (setq resolved
             (concat
@@ -638,7 +651,7 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
              "===============================================\n\n"
              (gptel-runner-format-decisions run)
              "\n\nTreat these decisions as constraints for this stage.")))
-    (when continuation
+    (when (plist-get continuation :observation)
       (setq resolved
             (concat
              resolved
@@ -714,8 +727,9 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
    (concat "The previous call completed without a non-empty final answer, "
            "possibly after a tool call.\n"
            "Complete the original task now and return its full final answer.\n"
-           "Do not end on a tool call: after using tools, always provide a "
-           "non-empty final response for the next workflow step.\n"
+           (if (gptel-runner-handoff-p run node)
+               "Submit the full answer as the message in RunnerHandoff.\n"
+             "After using tools, provide a non-empty final response.\n")
            "Original goal: %s\nWorkspace: %s\nNode: %S\n"
            "Original task:\n%s")
    (gptel-runner-run-goal run) (gptel-runner-node-workspace run node)
@@ -738,19 +752,24 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
           (let* ((generation (gptel-runner-run-generation run))
                  (resolved
                   (condition-case err
-                      (cons t (gptel-runner--prompt run node))
+                      (cons t (if-let* ((parked (gptel-runner--resuming-chat run node)))
+                                  (gptel-runner-call-prompt parked)
+                                (gptel-runner--prompt run node)))
                     (error
                      (finish 'failed (list :type 'prompt :error err))
                      nil))))
             (when (and resolved (= generation (gptel-runner-run-generation run)))
-              (launch (cdr resolved) nil))))
+              (launch (cdr resolved)
+                      (plist-get (gethash (gptel-runner-node-id node)
+                                          (gptel-runner-run-discussions run))
+                                 :repair)))))
          (repair-empty
           (call error-data)
           (setq repaired t)
           (gptel-runner--emit run 'output-repair-started
                               node nil error-data)
           (launch (gptel-runner--empty-output-repair-prompt
-                   run node (gptel-runner-call-prompt call)) t))
+                   run (gptel-runner-call-node call) (gptel-runner-call-prompt call)) t))
          (repair-invalid
           (value error-data)
           (setq repaired t)
@@ -761,7 +780,7 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
          (launch
           (prompt repair-p)
           (unless (gptel-runner--run-terminal-p run)
-            (gptel-runner--submit-call
+            (gptel-runner--submit-discussion
              run node agent prompt
              (lambda (call state value)
                (pcase state
@@ -774,9 +793,8 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
                     (when (= generation (gptel-runner-run-generation run))
                       (if (car parsed)
                           (progn
-                            (when-let* ((key (plist-get props :save-as)))
-                              (gptel-runner-put run key (cdr parsed)))
-                            (finish 'succeeded (cdr parsed)))
+                            (gptel-runner--accept-agent-result call (cdr parsed) value)
+                            (funcall done 'succeeded (cdr parsed)))
                         (cond
                          ((and (gptel-runner--empty-output-error-p (cdr parsed))
                                (not repaired))
@@ -1325,7 +1343,7 @@ INPUTS is an alist or hash table.  Runner-owned history keys are reserved."
 (cl-defun gptel-runner-start
     (workflow &rest arguments
               &key goal workspace inputs driver max-requests max-calls
-              max-concurrency max-duration allow-writes
+              max-concurrency max-duration allow-writes completion
               allow-unconfirmed-tools decision-memory persist context callback
               &allow-other-keys)
   "Start WORKFLOW with keyword ARGUMENTS and return its run.
@@ -1343,10 +1361,12 @@ ALLOW-UNCONFIRMED-TOOLS disables gptel confirmation only when explicitly set.
 DECISION-MEMORY controls automatic propagation of recorded decisions and
 defaults to non-nil.
 CONTEXT adds run-wide starting context to the workflow's own context.
+COMPLETION defaults to `handoff'.  Set it to `response' to use a model's
+ordinary final reply as its output.  Agent steps may override this option.
 PERSIST enables versioned snapshots at workflow checkpoints.
 CALLBACK runs exactly once with the terminal run."
   (ignore workspace max-requests max-calls max-concurrency max-duration
-          allow-unconfirmed-tools decision-memory)
+          allow-unconfirmed-tools decision-memory completion)
   (let* ((definition
           (cond ((gptel-runner-workflow-p workflow) workflow)
                 ((symbolp workflow)
@@ -1381,6 +1401,7 @@ CALLBACK runs exactly once with the terminal run."
                 (gptel-runner--option :max-duration arguments defaults nil)
                 :allow-writes allow-writes
                 :allow-unconfirmed-tools allow-unconfirmed-tools
+                :completion (gptel-runner--option :completion arguments defaults 'handoff)
                 :decision-memory (gptel-runner--option
                                   :decision-memory arguments defaults t)
                 :context context
@@ -1388,6 +1409,8 @@ CALLBACK runs exactly once with the terminal run."
                           :persist arguments defaults persist))))
     (unless (file-directory-p directory)
       (user-error "Run workspace is not a directory: %s" directory))
+    (unless (memq (plist-get options :completion) '(handoff response))
+      (user-error ":completion must be handoff or response"))
     (when (and (plist-get options :persist)
                (null (gptel-runner-workflow-name definition)))
       (user-error "Persistent runs require a named workflow"))
@@ -1490,7 +1513,8 @@ can resume at the narrowest safe checkpoint."
 (defun gptel-runner--supersede-paused-calls (run)
   "Mark every unfinished historical call skipped before resuming RUN."
   (dolist (call (gptel-runner-run-calls run))
-    (unless (gptel-runner--call-terminal-p call)
+    (unless (or (gptel-runner--call-terminal-p call)
+                (memq call gptel-runner--resuming-chats))
       (setf (gptel-runner-call-state call) 'skipped
             (gptel-runner-call-finished-at call) (float-time)
             (gptel-runner-call-on-complete call) nil)
@@ -1554,6 +1578,15 @@ FEEDBACK, and execution restarts from the workflow AST's safe checkpoint."
              (gptel-runner-run-blackboard run)))
   (gptel-runner--restart-run
    run 'run-resumed (and feedback (list :feedback feedback)) callback))
+
+(defun gptel-runner--resume-discussions (run)
+  "Resume paused RUN with all its waiting chats held at their current turns.
+Rebuild their continuations before sending feedback to a specific chat."
+  (let ((gptel-runner--resuming-chats
+         (cl-remove-if-not (lambda (call)
+                             (eq (gptel-runner-call-state call) 'waiting-feedback))
+                           (gptel-runner-run-calls run))))
+    (gptel-runner-resume-run run)))
 
 (defun gptel-runner--validate-extension-amount (value name integer-only)
   "Validate extension VALUE named NAME.
@@ -1968,12 +2001,33 @@ ADDITIONAL-REQUESTS, ADDITIONAL-CALLS, and ADDITIONAL-DURATION values increase
 the corresponding finite limits and may be combined with RESET-BUDGET.
 Unlimited limits remain unlimited.  When CALLBACK is non-nil, use it for the
 continued run's next terminal transition."
-  (setq run (gptel-runner--resolve-run run))
   (unless (stringp observation)
     (user-error "OBSERVATION must be a string"))
   (setq observation (string-trim observation))
   (when (string-empty-p observation)
     (user-error "OBSERVATION cannot be empty"))
+  (gptel-runner--start-cycle run observation reset-budget callback
+                             additional-requests additional-calls additional-duration))
+
+(cl-defun gptel-runner-rerun (run &key (reset-budget t) callback)
+  "Run the complete workflow again with RUN's existing goal and chats.
+RUN must be terminal, including when reopened from a checkpoint.  Archive
+the prior workflow results and execute again from the root.  Retain
+decisions, inputs, configured limits and conversation history.  Accounting
+starts fresh unless RESET-BUDGET is explicitly nil.  When supplied, use
+CALLBACK for the new cycle's terminal transition."
+  (gptel-runner--start-cycle run nil reset-budget callback))
+
+(defun gptel-runner--start-cycle (run observation reset-budget callback
+                                     &optional additional-requests additional-calls
+                                     additional-duration)
+  "Restart terminal RUN and archive its previous workflow outputs.
+With OBSERVATION, continue with that goal from a failed checkpoint or
+begin a successful run again.  With nil OBSERVATION, rerun the whole
+workflow with its existing goal.  RESET-BUDGET starts fresh accounting.
+Apply ADDITIONAL-REQUESTS, ADDITIONAL-CALLS and ADDITIONAL-DURATION to
+the limits.  CALLBACK optionally replaces the terminal callback."
+  (setq run (gptel-runner--resolve-run run))
   (gptel-runner--validate-extension-amount
    additional-requests "ADDITIONAL-REQUESTS" t)
   (gptel-runner--validate-extension-amount
@@ -1986,7 +2040,7 @@ continued run's next terminal transition."
                 (gptel-runner-run-workflow run)))
          (previous-goal (gptel-runner-run-goal run))
          (previous-state (gptel-runner-run-state run))
-         (restart-mode (if (eq previous-state 'succeeded)
+         (restart-mode (if (or (null observation) (eq previous-state 'succeeded))
                            'new-cycle
                          'checkpoint))
          (history (gptel-runner-get run gptel-runner-continuations-key))
@@ -1999,6 +2053,10 @@ continued run's next terminal transition."
                 :terminal-data
                 (copy-tree (gptel-runner-run-terminal-data run) t)
                 :observation observation
+                :node-outcomes (gptel-runner-map-nodes
+                                (lambda (node)
+                                  (copy-tree (gptel-runner-node-outcome run node) t))
+                                root)
                 :results (gptel-runner--workflow-results run root))))
     (when (eq restart-mode 'new-cycle)
       (gptel-runner--clear-workflow-results run root))
@@ -2009,8 +2067,8 @@ continued run's next terminal transition."
              (gptel-runner-run-blackboard run))
     (remhash 'gptel-runner-retry-feedback
              (gptel-runner-run-blackboard run))
-    (setf (gptel-runner-run-goal run) observation
-          (gptel-runner-run-extension-context run) nil)
+    (when observation (setf (gptel-runner-run-goal run) observation))
+    (setf (gptel-runner-run-extension-context run) nil)
     (when (eq restart-mode 'new-cycle)
       (gptel-runner--reset-subtree run root)
       (gptel-runner--clear-repeat-progress run root))
@@ -2020,7 +2078,7 @@ continued run's next terminal transition."
     (gptel-runner--extend-budget run 'calls additional-calls)
     (gptel-runner--extend-budget run 'duration additional-duration)
     (gptel-runner--restart-run
-     run 'run-continued
+     run (if observation 'run-continued 'run-rerun)
      (list :cycle (plist-get entry :cycle)
            :restart-mode restart-mode
            :previous-state previous-state
@@ -2174,14 +2232,21 @@ for the extended run's next terminal transition."
   "Complete restored CALL with VALUE and resume its reconstructed workflow."
   (let* ((run (gptel-runner-call-run call))
          (node (gptel-runner-call-node call))
-         (agent (gptel-runner-call-agent call))
-         (parsed (gptel-runner--parse-agent-result agent node value)))
-    (unless (car parsed)
-      (user-error "Manual response is invalid: %S" (cdr parsed)))
+         (owner (gptel-runner-call-discussion-owner call))
+         (turns (gptel-runner-run-discussions run)))
+    (if owner
+        (let ((stack (plist-get (gethash owner turns) :stack)))
+          (unless (and (cdr stack) (equal (car stack) (gptel-runner-node-id node)))
+            (user-error "No pending question for this call"))
+          (gptel-runner--route-discussion run owner stack call value))
+      (let ((parsed (gptel-runner--parse-agent-result
+                     (gptel-runner-call-agent call) node value)))
+        (unless (car parsed)
+          (user-error "Manual response is invalid: %S" (cdr parsed)))
+        (remhash (gptel-runner-node-id node) turns)
+        (gptel-runner--accept-agent-result call (cdr parsed) value)))
+    (setf (gptel-runner-call-on-complete call) nil)
     (gptel-runner--finish-call call 'succeeded value)
-    (when-let* ((key (plist-get (gptel-runner-node-properties node) :save-as)))
-      (gptel-runner-put run key (cdr parsed)))
-    (gptel-runner--set-node-state run node 'succeeded (cdr parsed))
     ;; Parallel reviewers can both have finished answers waiting for a human.
     ;; Restarting now would supersede the other reviewer's pending acceptance.
     (if (and (eq (gptel-runner-run-state run) 'paused)

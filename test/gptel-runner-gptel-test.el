@@ -64,6 +64,140 @@
     (cancel-timer timer)
     (apply (timer--function timer) (timer--args timer))))
 
+(defun gptel-runner-gptel-test--handoff (fsm message &optional commentary)
+  "Send MESSAGE through FSM's real handoff tool with optional COMMENTARY."
+  (gptel-runner-gptel-test--reply
+   fsm commentary "tool_calls"
+   (vector (list :id "handoff" :type "function"
+                 :function (list :name "RunnerHandoff"
+                                 :arguments (gptel--json-encode
+                                             (list :message message)))))))
+
+(ert-deftest gptel-runner-gptel-discussion-feedback-hands-off ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'reader)
+    (let* ((run (gptel-runner-start
+                 (gptel-runner-agent-step :id 'report :agent 'reader
+                                          :prompt "Inspect" :save-as 'answer)))
+           (first (pop requests))
+           (call (car (gptel-runner-run-calls run)))
+           (buffer (gptel-runner-call-buffer call)))
+      (gptel-runner-gptel-test--reply first "Which branch should I inspect?" "stop")
+      (should (eq 'waiting-feedback (gptel-runner-call-state call)))
+      (should-not (gptel-runner-get run 'answer))
+      (gptel-runner-gptel-feedback call "Use main")
+      (let* ((second (pop requests))
+             (info (gptel-fsm-info second))
+             (names (mapcar #'gptel-tool-name (plist-get info :tools))))
+        (should (eq buffer (plist-get info :buffer)))
+        (should (member "runner_read" names))
+        (should (member "RunnerHandoff" names))
+        (should-not (member "RunnerAskPrevious" names))
+        (should (string-search "Which branch" (prin1-to-string (plist-get info :data))))
+        (should-not (cl-find "RunnerHandoff" (buffer-local-value 'gptel-tools buffer)
+                             :key #'gptel-tool-name :test #'equal))
+        (gptel-runner-gptel-test--handoff second "The results" "I checked main."))
+      (should (equal "The results" (gptel-runner-get run 'answer)))
+      (should (eq 'succeeded (gptel-runner-run-state run)))
+      (should (= 2 (gptel-runner-budget-requests (gptel-runner-run-budget run))))
+      (should-not requests))))
+
+(ert-deftest gptel-runner-gptel-reviewed-handoff-accepts-payload-or-later-reply ()
+  (dolist (manual '(nil t))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'reader)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'report :agent 'reader :prompt "Inspect"
+                                            :pause-after t :save-as 'answer)))
+             (call (car (gptel-runner-run-calls run))))
+        (gptel-runner-gptel-test--handoff (pop requests) "Final report" "Here it comes.")
+        (should (eq 'waiting-feedback (gptel-runner-call-state call)))
+        (when manual
+          (gptel-runner-gptel-feedback call "Check again")
+          (gptel-runner-gptel-test--reply (pop requests) "Revised report" "stop"))
+        (gptel-runner-complete-call-from-buffer nil call)
+        (should (equal (if manual "Revised report" "Final report")
+                       (gptel-runner-get run 'answer)))
+        (should-not requests)))))
+
+(ert-deftest gptel-runner-gptel-send-continues-discussion-to-point ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'reader)
+    (let* ((run (gptel-runner-start
+                 (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect")))
+           (call (car (gptel-runner-run-calls run))))
+      (gptel-runner-gptel-test--reply (pop requests) "Which directory?" "stop")
+      (with-current-buffer (gptel-runner-call-buffer call)
+        (goto-char (point-max))
+        (should-error (gptel-send) :type 'user-error)
+        (insert "Use src")
+        (save-excursion (insert "unsent-draft"))
+        (gptel-send)
+        (should-error (gptel-send) :type 'user-error))
+      (let* ((request (pop requests))
+             (messages (plist-get (plist-get (gptel-fsm-info request) :data) :messages)))
+        (should (equal "Use src" (plist-get (car (last (append messages nil))) :content)))
+        (gptel-runner-gptel-test--handoff request "Checked"))
+      (should (eq 'succeeded (gptel-runner-run-state run)))
+      (with-current-buffer (gptel-runner-call-buffer call)
+        (should (string-suffix-p "unsent-draft" (buffer-string)))))))
+
+(ert-deftest gptel-runner-gptel-handoff-honors-approval-and-schema ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-runner-headless t) (gptel-confirm-tool-calls t)
+          (gptel-use-tools nil))
+      (gptel-runner-register-agent 'reader :schema '(:type object :properties (:answer (:type string))))
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect")))
+             (call (car (gptel-runner-run-calls run)))
+             (fsm (pop requests))
+             (info (gptel-fsm-info fsm))
+             (data (plist-get info :data))
+             (answer "{\"answer\":\"ready\"}"))
+        (should-not (plist-get data :response_format))
+        (should (string-search "\"answer\"" (plist-get (aref (plist-get data :messages) 0) :content)))
+        (should (equal '("RunnerHandoff") (mapcar #'gptel-tool-name (plist-get info :tools))))
+        (gptel-runner-gptel-test--handoff fsm answer)
+        (should (eq 'waiting-confirmation (gptel-runner-call-state call)))
+        (should-not (plist-get info :runner-transfer))
+        (let* ((pending (car (gptel-runner-gptel--interactions call)))
+               (id (plist-get (plist-get pending :description) :id)))
+          (gptel-runner-gptel-answer-interaction call id t)
+          (should-error (gptel-runner-gptel-answer-interaction call id t) :type 'user-error))
+        (should (equal answer (gptel-runner-call-result call)))
+        (should-not requests)))))
+
+(ert-deftest gptel-runner-gptel-prompt-preset-keeps-communication-after-async-transform ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel--known-presets nil) resume)
+      (gptel-make-preset 'alternate
+        :prompt-transform-functions
+        (list (lambda (continue fsm)
+                (setq resume
+                      (lambda ()
+                        (with-current-buffer (plist-get (gptel-fsm-info fsm) :data)
+                          (setq-local gptel-tools nil gptel-use-tools nil
+                                      gptel-system-prompt "Preset instructions"))
+                        (funcall continue))))))
+      (gptel-runner-register-agent 'reader)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "@alternate Inspect")))
+             (call (car (gptel-runner-run-calls run))))
+        (should-not requests)
+        (should (functionp resume))
+        (funcall resume)
+        (let* ((request (pop requests))
+               (info (gptel-fsm-info request))
+               (messages (plist-get (plist-get info :data) :messages)))
+          (should (equal '("RunnerHandoff") (mapcar #'gptel-tool-name (plist-get info :tools))))
+          (should (string-search "Preset instructions" (plist-get (aref messages 0) :content)))
+          (should (string-search "RunnerHandoff" (plist-get (aref messages 0) :content)))
+          (gptel-runner-gptel-test--reply request "A question" "stop")
+          (should (eq 'waiting-feedback (gptel-runner-call-state call))))
+        (gptel-runner-gptel-feedback call "Finish")
+        (gptel-runner-gptel-test--handoff (pop requests) "Final answer")
+        (should (eq 'succeeded (gptel-runner-run-state run)))))))
+
 (defun gptel-runner-gptel-test--stream-chunk (fsm delta &optional stop)
   "Deliver a streaming DELTA with optional STOP through FSM's real parser."
   (let ((info (gptel-fsm-info fsm)))
@@ -105,6 +239,7 @@
                      :id 'first :agent 'plan :prompt "Research" :save-as 'first)
                     (gptel-runner-agent-step
                      :id 'second :agent 'plan :prompt "Report"))
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (fsm (pop requests))
              (info (gptel-fsm-info fsm))
@@ -192,6 +327,7 @@
       (let* ((run (gptel-runner-start
                    (gptel-runner-agent-step
                     :id 'plan :agent 'plan :prompt "Research" :save-as 'proposal)
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (fsm (pop requests))
              (info (gptel-fsm-info fsm))
@@ -230,7 +366,7 @@
       (gptel-runner-gptel-test--retry call)
       (should (eq (pop requests) fsm))
       (should (equal (plist-get (gptel-fsm-info fsm) :data) data))
-      (gptel-runner-gptel-test--reply fsm "Complete proposal" "stop")
+      (gptel-runner-gptel-test--handoff fsm "Complete proposal")
       (should (eq (gptel-runner-run-state run) 'succeeded))
       (should (equal (gptel-runner-get run 'proposal-1) "Complete proposal"))
       (should (= (length (gptel-runner-run-calls run)) 1))
@@ -296,7 +432,7 @@
          (should (= (length (gptel-runner-run-calls run)) count))
          (should-not (gptel-runner-get run id))
          (should (eq (pop requests) fsm)))
-       (gptel-runner-gptel-test--reply fsm (symbol-name id) "stop")
+       (gptel-runner-gptel-test--handoff fsm (symbol-name id))
        (should (equal (gptel-runner-get run id) (symbol-name id))))
       (should (eq (gptel-runner-run-state run) 'succeeded))
       (should (= (length (gptel-runner-run-calls run)) 4))
@@ -308,6 +444,7 @@
     (let* ((run (gptel-runner-start
                  (gptel-runner-agent-step
                   :id 'proposal :agent 'plan :prompt "Research" :save-as 'proposal)
+                 :completion 'response
                  :driver (gptel-runner-gptel-driver-create)))
            (call (car (gptel-runner-run-calls run)))
            (fsm (pop requests)))
@@ -333,6 +470,7 @@
       (gptel-runner-register-agent 'plan :preset nil)
       (let* ((run (gptel-runner-start
                    (gptel-runner-agent-step :id 'plan :agent 'plan :prompt "Research")
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (fsm (pop requests))
              (info (gptel-fsm-info fsm)))
@@ -532,7 +670,7 @@
               (should-not (eq (gptel-runner-call-buffer (car calls))
                               (gptel-runner-call-buffer (cadr calls))))
               (dolist (request requests)
-                (gptel-runner-gptel-test--reply request "Findings" "stop"))
+                (gptel-runner-gptel-test--handoff request "Findings"))
               (should (eq (gptel-runner-run-state run) 'succeeded))
               (should (equal default-directory original-directory))))
         (delete-directory workspace t)))))
@@ -585,6 +723,7 @@
                   :body (gptel-runner-agent-step
                          :id 'review :agent 'reviewer :save-as 'answer
                          :prompt "Review this change"))
+                 :completion 'response
                  :driver (gptel-runner-gptel-driver-create)))
            (chat (gptel-runner-node-buffer run 'review))
            (first (pop requests)))
@@ -621,6 +760,7 @@
       (gptel-runner-register-agent 'planner)
       (let* ((run (gptel-runner-start
                    (gptel-runner-agent-step :id 'plan :agent 'planner :prompt "Plan")
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (chat (gptel-runner-node-buffer run 'plan))
              (first (pop requests))
@@ -872,6 +1012,7 @@
       (gptel-runner-register-agent 'reader :preset nil)
       (let* ((run (gptel-runner-start
                    (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read")
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (call (car (gptel-runner-run-calls run)))
              (fsm (pop requests)))
@@ -954,6 +1095,7 @@
       (let* ((run (gptel-runner-start
                    (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
                                             :pause-after t :save-as 'answer)
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (call (car (gptel-runner-run-calls run))))
         (gptel-runner-gptel-test--reply (pop requests) "Initial answer" "stop")
@@ -985,6 +1127,7 @@
       (let* ((run (gptel-runner-start
                    (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
                                             :pause-after t)
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (call (car (gptel-runner-run-calls run))))
         (gptel-runner-gptel-test--reply (pop requests) "Initial" "stop")
@@ -1012,6 +1155,7 @@
       (let* ((run (gptel-runner-start
                    (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
                                             :pause-after t)
+                   :completion 'response
                    :driver (gptel-runner-gptel-driver-create)))
              (call (car (gptel-runner-run-calls run)))
              (initial-fsm (pop requests))

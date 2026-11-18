@@ -45,7 +45,7 @@ Repeated safe checkpoints reset this delay.  Explicit saves, pauses, and
 terminal run transitions bypass it, but their writes are still asynchronous."
   :type 'number)
 
-(defconst gptel-runner-snapshot-version 3
+(defconst gptel-runner-snapshot-version 4
   "Current on-disk runner snapshot format version.")
 
 (defconst gptel-runner-store--slice-seconds 0.01
@@ -73,16 +73,24 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (defvar gptel-runner-store--coordinators (make-hash-table :test #'eq)
   "Save coordinators indexed by live run object.")
 
+(defvar-local gptel-runner-store--child-run nil
+  "Run that owns this delegated chat or worker transcript.")
+(defvar-local gptel-runner-store--child-id nil
+  "Identifier of this transcript in its owning run.")
+(dolist (symbol '(gptel-runner-store--child-run gptel-runner-store--child-id))
+  (put symbol 'permanent-local t))
+
 (defun gptel-runner-store--agent-sessions-p ()
-  "Whether configured agent sessions support standalone session records."
+  "Whether agent sessions support records under independent host ownership."
   (and (featurep 'gptel-agent-session)
+       (default-boundp 'gptel-agent-session-managed-externally)
        (fboundp 'gptel-agent-session-buffer-record)))
 
 (defun gptel-runner-store--require-agent-sessions ()
   "Load the reader needed for an archived gptel-agent chat."
   (unless (and (require 'gptel-agent nil t)
                (gptel-runner-store--agent-sessions-p))
-    (user-error "Install gptel-agent with standalone session support to open this chat")))
+    (user-error "Install gptel-agent with externally managed session support to open this chat")))
 
 (defun gptel-runner-store--archive (buffer)
   "Capture BUFFER in its native chat format."
@@ -90,9 +98,24 @@ terminal run transitions bypass it, but their writes are still asynchronous."
       (cons 'gptel-agent (gptel-agent-session-buffer-record buffer))
     (cons 'gptel (gptel-runner-gptel-chat-text buffer))))
 
+(defun gptel-runner-store--import-agent-chat (function data)
+  "Use FUNCTION to open standalone agent DATA under runner ownership."
+  (gptel-runner-store--require-agent-sessions)
+  (funcall function data t))
+
+(defun gptel-runner-store--text-buffer (text name)
+  "Open a read-only worker transcript containing TEXT in a new buffer NAME."
+  (with-current-buffer (generate-new-buffer name)
+    (insert (substring-no-properties text))
+    (goto-char (point-min))
+    (special-mode)
+    (set-buffer-modified-p nil)
+    (current-buffer)))
+
 (defun gptel-runner-store-export-chat (chat file)
   "Save live or archived CHAT to FILE and return its native format."
   (pcase chat
+    (`(transcript . ,text) (gptel-runner-gptel-save-chat text file) 'transcript)
     (`(gptel-agent . ,record)
      (gptel-runner-store--require-agent-sessions)
      (gptel-agent-session-write-record record file)
@@ -106,8 +129,12 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (defun gptel-runner-store-open-chat (file format)
   "Open FILE in FORMAT as a fresh, independently editable chat."
   (pcase format
-    ('gptel-agent (gptel-runner-store--require-agent-sessions)
-                  (gptel-agent-session-import-buffer file))
+    ('gptel-agent (gptel-runner-store--import-agent-chat
+                   #'gptel-agent-session-import-buffer file))
+    ('transcript (with-temp-buffer
+                   (insert-file-contents file)
+                   (gptel-runner-store--text-buffer
+                    (buffer-string) "*gptel-runner child transcript*")))
     ('gptel (gptel-runner-gptel-open-chat file))
     (_ (user-error "Unknown runner chat format %S" format))))
 
@@ -163,8 +190,8 @@ and for nodes that execute without a gptel conversation."
         (unless call (error "No call owns chat for node %S" id))
         (pcase (car chat)
           ('gptel-agent
-           (gptel-runner-store--require-agent-sessions)
-           (setq buffer (gptel-agent-session-buffer-from-record (cdr chat)))
+           (setq buffer (gptel-runner-store--import-agent-chat
+                         #'gptel-agent-session-buffer-from-record (cdr chat)))
            (gptel-runner-gptel-restore-submitted-end
             buffer (plist-get (gptel-runner-call-driver-data call) :submitted-end)))
           ('gptel (setq buffer (gptel-runner-gptel-chat-from-text (cdr chat))))
@@ -179,6 +206,82 @@ and for nodes that execute without a gptel conversation."
            (gptel-runner-call-buffer call))
       (gptel-runner-node-buffer (gptel-runner-call-run call)
                                 (gptel-runner-call-node call))))
+
+(defun gptel-runner-store--child-archive (record)
+  "Return the detached transcript for live or archived child RECORD."
+  (let ((chat (plist-get record :chat)))
+    (if (not (buffer-live-p chat)) chat
+      (with-current-buffer chat
+        (if (and (eq (plist-get record :kind) 'discussion)
+                 (bound-and-true-p gptel-mode))
+            (gptel-runner-store--archive chat)
+          (save-restriction
+            (widen)
+            (cons 'transcript (buffer-substring-no-properties (point-min) (point-max)))))))))
+
+(defun gptel-runner-store--child-changed (&rest _)
+  "Queue a runner checkpoint after the child transcript changes."
+  (when-let* ((run gptel-runner-store--child-run)
+              ((gethash gptel-runner-store--child-id (gptel-runner-run-child-chats run))))
+    (gptel-runner--checkpoint run)))
+
+(defun gptel-runner-store--close-child ()
+  "Capture the complete child transcript before its buffer disappears."
+  (when-let* ((run gptel-runner-store--child-run)
+              (record (gethash gptel-runner-store--child-id
+                               (gptel-runner-run-child-chats run)))
+              ((eq (plist-get record :chat) (current-buffer))))
+    (setf (plist-get record :name) (buffer-name)
+          (plist-get record :chat) (gptel-runner-store--child-archive record))
+    (gptel-runner--checkpoint run)))
+
+(dolist (function '(gptel-runner-store--child-changed gptel-runner-store--close-child))
+  (put function 'permanent-local-hook t))
+
+(defun gptel-runner-store--attach-child (run record buffer)
+  "Attach BUFFER to its RECORD in RUN for runner-only checkpointing."
+  (setf (plist-get record :chat) buffer)
+  (with-current-buffer buffer
+    (setq-local gptel-runner-store--child-run run
+                gptel-runner-store--child-id (plist-get record :id))
+    (add-hook 'after-change-functions #'gptel-runner-store--child-changed nil t)
+    (add-hook 'kill-buffer-hook #'gptel-runner-store--close-child 90 t))
+  buffer)
+
+(defun gptel-runner-store-track-child (parent child kind)
+  "Register CHILD of PARENT as KIND in the parent's runner session, if any."
+  (let* ((call (buffer-local-value 'gptel-runner--call parent))
+         (run (or (and call (gptel-runner-call-run call))
+                  (buffer-local-value 'gptel-runner-store--child-run parent))))
+    (when (and run (not (buffer-local-value 'gptel-runner-store--child-id child)))
+      (let* ((children (gptel-runner-run-child-chats run))
+             (parent-id (buffer-local-value 'gptel-runner-store--child-id parent))
+             (owner (gethash parent-id children))
+             (id (gptel-runner--id "child"))
+             (record (list :id id :kind kind :name (buffer-name child)
+                           :node (if owner (plist-get owner :node)
+                                   (gptel-runner-node-id (gptel-runner-call-node call)))
+                           :call (if owner (plist-get owner :call) (gptel-runner-call-id call))
+                           :parent-id parent-id :chat child)))
+        (puthash id record children)
+        (gptel-runner-store--attach-child run record child)
+        (gptel-runner--checkpoint run)))))
+
+(defun gptel-runner-child-buffer (run id)
+  "Return child transcript ID in RUN, restoring its buffer on first visit."
+  (let ((record (or (gethash id (gptel-runner-run-child-chats run))
+                    (user-error "Unknown child transcript %s" id))))
+    (pcase (plist-get record :chat)
+      ((and buffer (pred buffer-live-p)) buffer)
+      (chat
+       (gptel-runner-store--attach-child
+        run record
+        (pcase chat
+          (`(gptel-agent . ,data) (gptel-runner-store--import-agent-chat
+                                   #'gptel-agent-session-buffer-from-record data))
+          (`(gptel . ,text) (gptel-runner-gptel-chat-from-text text))
+          (`(transcript . ,text) (gptel-runner-store--text-buffer text (plist-get record :name)))
+          (_ (user-error "Unknown child transcript format"))))))))
 
 (defun gptel-runner-store--alist-hash (alist &optional test)
   "Return a hash table populated from ALIST using TEST."
@@ -235,6 +338,8 @@ and for nodes that execute without a gptel conversation."
   (list :id (gptel-runner-call-id call)
         :node (gptel-runner-node-id (gptel-runner-call-node call))
         :state (gptel-runner-call-state call)
+        :discussion-owner (gptel-runner-call-discussion-owner call)
+        :discussion-wait (plist-get (gptel-runner-call-driver-data call) :discussion-wait)
         :submitted-end
         (let ((buffer (gptel-runner-call-buffer call)))
           (if (and (buffer-live-p buffer)
@@ -322,6 +427,13 @@ and for nodes that execute without a gptel conversation."
       (table "blackboard" (gptel-runner-run-blackboard run) t)
       (table "node-states" (gptel-runner-run-node-states run) nil)
       (table "node-outcomes" (gptel-runner-run-node-outcomes run) nil)
+      (table "discussions" (gptel-runner-run-discussions run) nil)
+      (literal "\n  :messages ")
+      (value (cl-remove-if-not
+              (lambda (event) (memq (gptel-runner-event-type event)
+                                    '(node-handoff node-follow-up node-reply)))
+              (gptel-runner-run-events run))
+             "node messages")
       (literal "\n  :chats (")
       (maphash
        (lambda (id chat)
@@ -331,6 +443,16 @@ and for nodes that execute without a gptel conversation."
                            chat))
                 (format "chat for node %S" id)))
        (gptel-runner-run-chats run))
+      (literal ")\n  :child-chats (")
+      (maphash
+       (lambda (id record)
+         (let ((copy (copy-sequence record)))
+           (when (buffer-live-p (plist-get record :chat))
+             (setf (plist-get copy :name) (buffer-name (plist-get record :chat))))
+           (setf (plist-get copy :chat) (gptel-runner-store--child-archive record))
+           (literal "\n   ")
+           (value (cons id copy) (format "child transcript %s" id))))
+       (gptel-runner-run-child-chats run))
       (literal ")\n  :chat-calls (")
       (dolist (call (gptel-runner-run-calls run))
         (when (and (or (gptel-runner-call-buffer call)
@@ -656,8 +778,8 @@ asynchronous."
     (let ((data (read (current-buffer))))
       (unless (eq (plist-get data :format) 'gptel-runner-snapshot)
         (user-error "Not a gptel-runner snapshot: %s" file))
-      (unless (memq (plist-get data :version) (list 2 gptel-runner-snapshot-version))
-        (user-error "Unsupported snapshot version %S (expected v2 or v3)"
+      (unless (memq (plist-get data :version) (list 2 3 gptel-runner-snapshot-version))
+        (user-error "Unsupported snapshot version %S (expected v2, v3 or v4)"
                     (plist-get data :version)))
       data)))
 
@@ -676,11 +798,13 @@ asynchronous."
      :agent (gptel-runner--agent (plist-get (gptel-runner-node-properties node) :agent))
      :state (if (or (gptel-runner--terminal-p state) (eq state 'waiting-feedback))
                 state 'paused)
+     :discussion-owner (plist-get record :discussion-owner)
      :started-at (plist-get record :started-at) :finished-at (plist-get record :finished-at)
      :result (plist-get record :result) :error (plist-get record :error)
      :prompt (plist-get record :prompt) :generation (or (plist-get record :generation) 0)
      :repair-p (plist-get record :repair) :request-attempt (or (plist-get record :attempt) 0)
-     :driver-data (list :restored t :submitted-end (plist-get record :submitted-end)))))
+     :driver-data (list :restored t :submitted-end (plist-get record :submitted-end)
+                        :discussion-wait (plist-get record :discussion-wait)))))
 
 (defun gptel-runner-load-run (file &optional callback driver)
   "Open the run saved in FILE using CALLBACK and DRIVER.
@@ -695,7 +819,7 @@ open on demand.  A version 2 checkpoint restores execution state only."
                          (user-error "Define workflow %S before loading snapshot"
                                      workflow-name)))
          (workflow (gptel-runner--restore-node-ids
-                    registered (and (= (plist-get snapshot :version) 3)
+                    registered (and (>= (plist-get snapshot :version) 3)
                                     (plist-get data :generated-node-ids))))
          (root (gptel-runner-workflow-root workflow))
          (repeat-limits
@@ -727,10 +851,12 @@ open on demand.  A version 2 checkpoint restores execution state only."
            :node-outcomes (gptel-runner-store--alist-hash
                            (plist-get data :node-outcomes))
            :chats (gptel-runner-store--alist-hash (plist-get data :chats))
+           :child-chats (gptel-runner-store--alist-hash (plist-get data :child-chats))
+           :discussions (gptel-runner-store--alist-hash (plist-get data :discussions))
            :iterations (gptel-runner-store--alist-hash
                         (plist-get data :iterations))
            :repeat-limits repeat-limits
-           :events nil :budget budget
+           :events (plist-get data :messages) :budget budget
            :driver (or driver gptel-runner-default-driver
                        (and (gptel-runner--needs-driver-p root)
                             (require 'gptel-runner-gptel)
@@ -745,8 +871,11 @@ open on demand.  A version 2 checkpoint restores execution state only."
            :duration-remaining (plist-get data :duration-remaining)
            :generation (or (plist-get data :generation) 0)
            :callback callback :snapshot-file file
-           :options (plist-put (copy-sequence (plist-get data :options))
-                               :persist t))))
+           :options (let ((options (copy-sequence (plist-get data :options))))
+                      ;; Checkpoints predating tool handoffs completed on prose.
+                      (unless (plist-member options :completion)
+                        (setq options (plist-put options :completion 'response)))
+                      (plist-put options :persist t)))))
     (when (gethash run-id gptel-runner--runs)
       (user-error "Run %s is already loaded in this Emacs session" run-id))
     (when (and (gptel-runner--needs-driver-p root)
@@ -758,6 +887,7 @@ open on demand.  A version 2 checkpoint restores execution state only."
      (list (cons "workflow" (plist-get (gptel-runner-workflow-options workflow)
                                        :context))
            (cons "run" (plist-get (gptel-runner-run-options run) :context))))
+    (gptel-runner--validate-discussions run)
     (dolist (entry (plist-get data :node-states))
       (unless (gptel-runner-store--node root (car entry))
         (user-error "Snapshot node %S is absent from workflow %S"
@@ -786,6 +916,20 @@ open on demand.  A version 2 checkpoint restores execution state only."
     (setf (gptel-runner-run-calls run)
           (mapcar (lambda (record) (gptel-runner-store--restore-call run record))
                   (plist-get data :chat-calls)))
+    (maphash
+     (lambda (id record)
+       (unless (and (stringp id) (equal id (plist-get record :id))
+                    (stringp (plist-get record :name))
+                    (memq (plist-get record :kind) '(agent discussion review-aside))
+                    (memq (car-safe (plist-get record :chat)) '(gptel gptel-agent transcript))
+                    (gptel-runner-find-node run (plist-get record :node))
+                    (cl-find (plist-get record :call) (gptel-runner-run-calls run)
+                             :key #'gptel-runner-call-id :test #'equal)
+                    (or (null (plist-get record :parent-id))
+                        (gethash (plist-get record :parent-id) (gptel-runner-run-child-chats run))))
+         (user-error "Invalid child transcript %S" id))
+       (gptel-runner-store--notice-id id))
+     (gptel-runner-run-child-chats run))
     (gptel-runner-store--notice-id (gptel-runner-run-id run))
     (puthash (gptel-runner-run-id run) run gptel-runner--runs)
     (gptel-runner--emit run 'snapshot-loaded nil nil file)

@@ -17,7 +17,7 @@
   (format
    (concat "Goal:\n%s\n\nWorkspace: %s\nRevision iteration: %d\n"
            "Prior review: %S\nInspect actual files, make the change, run tests, "
-           "and return a concise report.")
+           "and hand off a concise report.")
    (gptel-runner-run-goal run) (gptel-runner-run-workspace run)
    (gptel-runner-iteration run 'review-cycle)
    (gptel-runner-get run 'review)))
@@ -46,9 +46,10 @@
     (gptel-runner-agent-step
      :id 'implement :agent 'implementer
      :prompt #'example/implementation-prompt :save-as 'implementation)
+    ;; Accept the provider's schema-constrained JSON response as the verdict.
     (gptel-runner-agent-step
      :id 'review :agent 'reviewer :prompt #'example/review-prompt
-     :save-as 'review :repair-invalid t))))
+     :completion 'response :save-as 'review :repair-invalid t))))
 
 ;; Starting this workflow intentionally requires explicit write opt-in:
 ;; (gptel-runner-start 'implement-review :goal "..." :workspace "..."

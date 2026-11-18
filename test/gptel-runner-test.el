@@ -190,8 +190,9 @@
                  (let ((prompt (gptel-runner-call-prompt call)))
                    (should (= (length (split-string
                                        prompt (concat "Evidence from " name))) 6))
-                   (should (string-suffix-p
-                            (gptel-runner-call-workspace call) prompt))))
+                   (should (string-search
+                            (concat "Task\n====\n\n" (gptel-runner-call-workspace call))
+                            prompt))))
                (gptel-runner-run-calls run) '("a" "b")))
             ;; Inherited files must also be checked in each target workspace.
             (delete-file (expand-file-name "b/notes" workspace))
@@ -578,7 +579,7 @@
                    '(waiting-tool waiting-confirmation waiting-tool
                      tool-results)))))
 
-(ert-deftest gptel-runner-simple-stateless-success-and-callback-once ()
+(ert-deftest gptel-runner-simple-handoff-success-and-callback-once ()
   (gptel-runner-test--isolated
     (gptel-runner-register-agent 'worker :preset 'p)
     (let ((driver (gptel-runner-fake-driver-create))
@@ -594,6 +595,37 @@
         (should (= callbacks 1))
         (should (= (length (gptel-runner-run-calls run)) 1))
         (should (= (gptel-runner-test--event-count run 'run-completed) 1))))))
+
+(ert-deftest gptel-runner-extend-resumes-the-question-without-replaying-steps ()
+  (gptel-runner-test--isolated
+    (gptel-runner-register-agent 'author)
+    (gptel-runner-register-agent 'editor)
+    (let ((driver (gptel-runner-fake-driver-create)) (checks 0))
+      (gptel-runner-fake-queue driver 'author '(:value "original") '(:value "details"))
+      (gptel-runner-fake-queue driver 'editor
+                               '(:status follow-up :value "Which version?")
+                               '(:value "complete"))
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-sequence
+                    (gptel-runner-sequence
+                     (gptel-runner-test--step 'draft 'author 'draft)
+                     (gptel-runner-elisp-step
+                      :function (lambda (_run _node) (cl-incf checks))))
+                    (gptel-runner-test--step 'edit 'editor 'final))
+                   :driver driver :max-calls 2)))
+        (should (eq 'failed (gptel-runner-run-state run)))
+        (gptel-runner--validate-discussions run)
+        (gptel-runner-extend run :additional-calls 2)
+        (let ((calls (gptel-runner-fake-driver-starts driver)))
+          (should (equal (mapcar (lambda (c) (gptel-runner-node-id (gptel-runner-call-node c)))
+                                 calls)
+                         '(draft edit draft edit)))
+          (should (string-search "Which version?" (gptel-runner-call-prompt (nth 2 calls))))
+          (should (string-search "details" (gptel-runner-call-prompt (nth 3 calls)))))
+        (should (eq 'succeeded (gptel-runner-run-state run)))
+        (should (= checks 1))
+        (should (equal "original" (gptel-runner-get run 'draft)))
+        (should (equal "complete" (gptel-runner-get run 'final)))))))
 
 (ert-deftest gptel-runner-empty-output-is-repaired-before-handoff ()
   (gptel-runner-test--isolated
@@ -1324,6 +1356,50 @@
                     (implementation . "old implementation")))))
         (should (= (gptel-runner-test--event-count run 'run-continued) 1))))))
 
+(ert-deftest gptel-runner-rerun-from-failed-snapshot-keeps-goal-and-repeats-prefix ()
+  (gptel-runner-test--isolated
+    (let ((gptel-runner-snapshot-directory (make-temp-file "runner-rerun-" t))
+          (driver (gptel-runner-fake-driver-create))
+          prompt)
+      (unwind-protect
+          (progn
+            (gptel-runner-register-agent 'research)
+            (gptel-runner-register-agent 'implement)
+            (gptel-runner-defworkflow full-rerun (:persist t :max-calls 2 :max-requests 2)
+              (gptel-runner-sequence
+               :id 'pipeline
+               (gptel-runner-test--step 'research 'research 'findings)
+               (gptel-runner-test--step 'implement 'implement 'report)))
+            (gptel-runner-fake-queue driver 'research '(:value "Original findings")
+                                     (lambda (call)
+                                       (setq prompt (gptel-runner-call-prompt call))
+                                       '(:value "Revised findings")))
+            (gptel-runner-fake-queue driver 'implement '(:status permanent)
+                                     '(:value "Implemented"))
+            (let* ((run (gptel-runner-start 'full-rerun :driver driver
+                                            :inputs '((project . "Widget"))))
+                   (file (gptel-runner-run-snapshot-file run)))
+              (should (eq (gptel-runner-run-state run) 'failed))
+              (gptel-runner-record-decision run "Use SQLite" "Existing storage")
+              (gptel-runner-forget-run run)
+              (setq run (gptel-runner-load-run file nil driver))
+              (gptel-runner-rerun run)
+              (should (eq (gptel-runner-run-state run) 'succeeded))
+              (should-not (gptel-runner-run-goal run))
+              (should (equal (gptel-runner-get run 'project) "Widget"))
+              (should (string-search "Use SQLite" prompt))
+              (should-not (string-search "Human follow-up" prompt))
+              (should (equal (gptel-runner-get run 'findings) "Revised findings"))
+              (should (equal (gptel-runner-get run 'report) "Implemented"))
+              (let ((entry (car (gptel-runner-continuations run))))
+                (should (eq (plist-get entry :previous-state) 'failed))
+                (should (eq (plist-get entry :restart-mode) 'new-cycle))
+                (should (member '(:node research :state succeeded :value "Original findings")
+                                (plist-get entry :node-outcomes)))
+                (should (equal (plist-get entry :results) '((findings . "Original findings")))))
+              (should (= (gptel-runner-test--event-count run 'run-rerun) 1))))
+        (delete-directory gptel-runner-snapshot-directory t)))))
+
 (ert-deftest gptel-runner-continue-retries-failed-node-before-following-node ()
   (gptel-runner-test--isolated
     (dolist (agent '(first failing following))
@@ -1455,8 +1531,8 @@
         (should (eq (gptel-runner-run-state run) 'succeeded))
         (should (equal (gptel-runner-run-goal run) "Keep this exact goal"))
         (should-not (gptel-runner-continuations run))
-        (should (equal retry-prompt "work"))
-        (should (equal following-prompt "work"))
+        (should (equal retry-prompt "work\n\nHandoff from first-step:\nkept result"))
+        (should (equal following-prompt "work\n\nHandoff from failing-step:\nrecovered"))
         (should
          (equal
           (mapcar
@@ -2299,7 +2375,7 @@
                   (should (equal
                            (mapcar #'gptel-runner-event-type
                                    (gptel-runner-run-events restored))
-                           '(snapshot-loaded)))
+                           '(node-handoff snapshot-loaded)))
                   (gptel-runner-resume-run restored "Use the smaller API")
                   (should (eq (gptel-runner-run-state restored) 'succeeded))
                   (should (string-match-p "Use the smaller API"

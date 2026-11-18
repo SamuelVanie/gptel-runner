@@ -1,15 +1,19 @@
 # gptel-runner
 
-`gptel-runner` runs Emacs workflows in which each agent node has an ordinary
-gptel chat. Open two parallel reviewers and you get two independent conversations.
-When the workflow returns to a reviewer, its next turn continues in the same
-buffer. Elisp coordinates the handoffs, budgets, approvals, and retries.
+`gptel-runner` gives each agent node its own gptel chat. A researcher can
+hand findings to a planner, answer a question in the same research buffer,
+and let the planner continue with that answer. The final agent can use its
+tools to carry out the plan and report what happened. Elisp defines the
+order of work, budgets, approvals, and retries.
 
 Use `M-x gptel-runner-show-dashboard` and press `RET` on an agent row to open
-its chat. From there, `M-x gptel-runner-visit-node-chat` switches nodes.
-For a named workflow, `M-x gptel-runner-save-session` saves the whole run.
-After restarting Emacs, load the workflow definition and use
-`M-x gptel-runner-open-session` to choose it by workflow, date, or goal.
+its chat. Press `? m` on a run to see the handoffs, questions, and replies.
+From a chat, `M-x gptel-runner-visit-node-chat` switches nodes.
+For a named workflow, `M-x gptel-runner-save-session` saves the whole run,
+including node chats and their child transcripts. After restarting Emacs,
+load the workflow definition and use `M-x gptel-runner-open-session` to
+choose it by workflow, date, or goal. The runner dashboard manages the
+session and its conversations together.
 
 The package requires Emacs 29.1 or newer and, for live calls, gptel 0.9.9.6 or
 newer.  Tests use the included fake driver and make no network requests.
@@ -44,7 +48,8 @@ Register agents after defining their gptel presets:
 ```
 
 See [examples/three-stage-handoff.el](examples/three-stage-handoff.el) for a
-linear researcher-to-planner-to-implementer handoff.  The
+researcher, planner, and implementer that exchange messages and pause for
+human approval of the plan. The
 [natural-language review loop](examples/natural-language-review-loop.el)
 shows implementer and reviewer nodes communicating through a minimal file
 without `gptel-runner-review`.  The
@@ -76,6 +81,58 @@ the native async contract below.  The run's callback runs exactly once.
 Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
+
+### Handing work to the next agent
+
+Use a model that supports tool calls. The gptel driver adds the applicable
+workflow tools to each agent request. Each takes a single non-empty string
+and must be the only tool call in that response.
+
+| Tool | What happens |
+| --- | --- |
+| `RunnerHandoff(message)` | Submit the node's result. The next agent in the sequence receives the accepted message in its chat. On the final agent, this submits the final result. |
+| `RunnerAskPrevious(question)` | Ask the preceding agent a question in its existing chat. That agent uses `RunnerHandoff` to reply. The requesting agent resumes with the answer and can ask again. |
+
+For example, a planner trying to choose a migration strategy can ask its
+researcher, “Which files still write the old format?” The researcher can use
+its usual tools, then hand back the filenames and supporting evidence. The
+planner receives the answer before deciding what to pass to the implementer.
+The researcher's original node result stays available to Elisp code.
+
+The sequence determines the recipient. Elisp steps and nested sequences
+between two agents still execute in order. A parallel group, branch,
+repeat, or other non-sequence container bounds the route. A node using
+response completion also ends the route. Use `:save-as` and
+`gptel-runner-get` to carry outputs across these
+boundaries, for example when collecting parallel reviews. Follow-up turns
+use the run's call and request budgets.
+
+```elisp
+(gptel-runner-defworkflow research-and-plan (:max-calls 8 :max-requests 20)
+  (gptel-runner-sequence
+   :id 'pipeline
+   (gptel-runner-agent-step
+    :id 'research :agent 'researcher
+    :prompt "Inspect the storage format. Hand the evidence to the planner.")
+   (gptel-runner-agent-step
+    :id 'plan :agent 'planner :save-as 'plan
+    :prompt "Plan the migration. Ask the researcher about any gaps first.")))
+```
+
+Ordinary assistant prose remains in the chat. If the model ends its turn
+with prose, the call waits for feedback. From its dashboard row, use `? f`
+to send another turn or `? a` to accept the current answer. Set
+`:pause-after t` when even an explicit handoff needs human approval.
+The runner applies the node's parser and validator to the accepted message
+and stores the parsed result under `:save-as`. An agent with a JSON schema
+receives the schema as instructions for the handoff message.
+
+For a preset or provider that should complete a node on a normal text
+response, set `:completion 'response` on its `gptel-runner-agent-step`.
+That mode also supports the provider's usual structured-output mechanism.
+To use response completion throughout a named workflow, write
+`(:completion response)` in the options of `gptel-runner-defworkflow`.
+For a single run, pass `:completion 'response` to `gptel-runner-start`.
 
 ### One pipeline API for local and background runs
 
@@ -703,17 +760,14 @@ workflow then continues from that node's original continuation.
 This is deliberately different from `gptel-runner-abort-call`: aborting is a
 terminal cancellation, while pausing enters the `waiting-feedback` state.
 
-For a planned approval point, put `:pause-after t` on the agent step instead
-of racing to pause it manually.  After the provider returns a non-empty
-response, the call automatically enters `waiting-feedback`; the response has
-not yet completed the node, been stored under `:save-as`, or reached the next
-node.  Choose `v` from the dashboard action menu to visit the transcript, give
-the agent feedback with ordinary gptel commands, then choose `a` from the menu
-or run
-`M-x gptel-runner-complete-call-from-buffer`.  The active region, or otherwise
-the latest gptel response, becomes the actual node result and releases the
-original workflow continuation.  Parsers and validators still apply to that
-accepted result.
+For a planned approval point, put `:pause-after t` on the agent step. The
+call holds the proposed handoff in `waiting-feedback` until you accept it.
+Choose `f` from the dashboard action menu to request a revision, or use `v`
+to visit the chat. Choose `a` to accept, or run
+`M-x gptel-runner-complete-call-from-buffer`. With a region selected in the
+chat, the selected text becomes the result. Otherwise the runner accepts
+the latest revision, or the proposed handoff if you have kept it as submitted.
+Acceptance runs the parser and validator and releases the workflow continuation.
 
 For a named workflow, save the session while the gate is waiting. After
 reopening it, visit the node, revise the answer if needed, then run
@@ -958,8 +1012,37 @@ the callback already invoked for the original failure is not called again.
 
 ### Saving a session and resuming overnight
 
-Persistent runs must use a named workflow and stable explicit node IDs.  Add
-`:persist t` to the workflow defaults or start call:
+Use `M-x gptel-runner-save-session` for an explicit save or `:persist t`
+for automatic checkpoints. All node chats, child discussions, and delegated
+worker transcripts belong to their run, including while automatic saving
+is off. Look them up in the runner dashboard. On a node row, `RET` opens
+its chat and `? j` shows its child transcripts. On a run row, `? j` includes
+children from every node. Saved discussion transcripts and worker diagnostic
+text are available after reopening the run. New agent work is scheduled by
+the owning workflow.
+
+After opening a session, select its run row and press `?` for these actions.
+
+| Action | When to use it |
+| --- | --- |
+| `r` Resume | Continue a paused run from its unfinished step, keeping completed nodes. |
+| `t` Retry | Retry an unsuccessful run from its safe checkpoint with the same goal. |
+| `R` Rerun | Start a finished run from the first node with the same goal, chats, and configured limits. Consumed budget counters start at zero. |
+| `c` Continue | Give a finished run a new goal. A successful run starts another full cycle. An unsuccessful run continues from its safe checkpoint. |
+| `K` Abort / Cancel | Stop an unfinished run and record its cancellation. |
+
+From Lisp, `(gptel-runner-rerun run)` archives the preceding workflow
+outputs in `(gptel-runner-continuations run)`. Each new history entry has
+`:results` for named outputs and `:node-outcomes` for individual steps.
+Inputs, recorded decisions, and conversations stay with the same run.
+Pass `:reset-budget nil` to
+share the remaining budget with the previous cycle. A background invocation
+uses the same operation via `(gptel-runner-job-command invocation 'rerun)`.
+
+Persistent runs use a named workflow. Explicit node IDs make saved work
+easier to inspect. For generated IDs, recovery matches the workflow's node
+layout against its checkpoint. Add `:persist t` to the workflow defaults or
+start call:
 
 ```elisp
 (gptel-runner-defworkflow durable-handoff (:persist t)
@@ -1008,20 +1091,22 @@ After restarting Emacs, load the same workflow and agent definitions, then:
 
 Alternatively, choose `l` and then `r` from the dashboard action menu.
 
-Version 3 saves the node conversations and workflow progress together in one
-file. Opening it restores the run and its chat rows. A conversation becomes
-an editable buffer when you visit it. Loading a session makes no provider
-request. Chats saved with the companion gptel-agent checkout use its native
-session records, including assistant and tool boundaries, settings, and drafts.
-Load the updated `gptel-agent` package to use this integration. Plain gptel
-uses its own saved-chat format. The runner works independently of the global
-`gptel-agent-session-mode`. When you enable that mode, live node chats also
-appear in `M-x gptel-agent-sessions`. Use the runner’s session picker to
-reopen the workflow and its pending feedback together.
+Version 4 saves the node conversations, child transcripts and workflow
+progress together. Opening it restores the run and its chat rows.
+Visiting a node opens its editable buffer. The companion gptel-agent
+package can encode the assistant and tool boundaries, settings, and drafts
+inside the runner checkpoint. Plain gptel uses its own saved-chat format.
+The runner keeps exclusive ownership even with global
+`gptel-agent-session-mode` enabled. The global agent session browser is for
+independent agent chats. Use `M-x gptel-runner-open-session` to recover
+pipeline work, including chats waiting for human feedback.
 
-Existing version 2 checkpoints still load with the workflow state, results,
-and budgets they originally recorded. Chat history is available from the
-first save made with the new version while those chats are present.
+Versions 2 and 3 still open with the data they originally recorded. Version
+3 includes saved node chats. Child transcripts are available once captured
+by a version 4 checkpoint.
+Sessions saved before tool handoffs keep response completion when reopened.
+New checkpoints include the inter-node messages and the outstanding
+question, so a resumed reply can return to the agent that asked for it.
 
 Use `gptel-runner-node-result` to read a completed node's output after
 restoration, or keep using named blackboard entries with `:save-as`.
@@ -1038,7 +1123,7 @@ charged to call and request budgets.  Version 1 snapshots are not accepted.
 Snapshot files have mode `0600`, but outcomes and blackboard values can contain
 prompts, outputs, tool results, and secrets; protect and delete them as sensitive data.
 
-Run options include `:driver`, `:max-requests`, `:max-calls`,
+Run options include `:driver`, `:completion`, `:max-requests`, `:max-calls`,
 `:max-concurrency`, `:max-duration`, `:allow-writes`,
 `:allow-unconfirmed-tools`, `:decision-memory`, `:context`, and `:persist`.
 Workflow defaults are used when an option is not provided.  A function passed
@@ -1132,8 +1217,8 @@ starting a scheduled job does not require a compiler toolchain or update the
 interactive editor's native compilation cache.  Already installed native
 code can still run.  Tools must support headless execution; direct native
 calls to input primitives cannot always be intercepted by Lisp input guards.
-Named workflows and stable explicit node IDs are required for durable jobs,
-just as they are for checkpoint recovery.
+Durable jobs use named workflows and the same node ID matching as local
+checkpoint recovery.
 
 Optional job `:emacs` names an absolute executable path; saving captures the
 current Emacs executable by default.  `:environment` is an explicit alist of
@@ -1187,6 +1272,8 @@ workflow. Older invocations still open their saved text transcripts.
 
 A background run row opens its controls. The panel links to the node chats,
 shows pending tool requests, and sends actions to the owning worker.
+Use `? m` on the run or node row to read its published handoffs, questions,
+and replies. From a waiting node, `? f` sends feedback to its worker.
 Use `n` and `p` to move between nodes, `TAB` to move between buttons, and
 `q` to return to the dashboard.
 
@@ -1375,9 +1462,10 @@ and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/ar
 
 ## Semantics and safety
 
-- Each node has its own conversation for the lifetime of a run. Repeats,
+- Each agent node has its own conversation for the lifetime of a run. Repeats,
   semantic retries, and output repairs add turns to that conversation.
-  Pass results between nodes through the blackboard, artifacts, or prompts.
+  Handoffs and replies deliver individual messages. The blackboard, artifacts,
+  and prompt functions can carry additional context.
 - Decision memory is run-local and append-only.  A recorded decision is added
   to prompts resolved after it was saved.  It cannot alter an agent call that
   is already running; parallel branches should converge before a decision is
@@ -1399,16 +1487,13 @@ and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/ar
   support, just like ordinary gptel chats.  Tool calls and reasoning can stream
   into the worker transcript; a stream ending does not finish the agent until
   gptel's tool loop has completed.
-- A successful provider request must still return a non-empty final response.
-  Intermediate text accompanying tool calls stays in the transcript and event
-  journal; only the final response is saved for downstream nodes.  A provider
-  response that reports `tool_calls`, `tool_use`, or `function_call` without
-  supplying tool calls is retried within the existing request/retry limits,
-  and fails the node if those limits are exhausted.
-  If it returns only `nil` or whitespace (for example, after ending on a tool
-  call), the runner marks that call failed, asks the same agent once for a
-  repaired answer, and fails the node immediately if that answer is
-  also empty.  Downstream nodes never receive the empty value.
+- Agent outputs must be non-empty. With tool-based completion, the message
+  submitted to `RunnerHandoff` supplies the result. With `:completion 'response`,
+  the final assistant response supplies it. Intermediate commentary stays in
+  the transcript. A provider response that reports `tool_calls`, `tool_use`,
+  or `function_call` with no tool payload is retried within the request and
+  retry limits. In response mode, an empty final answer gets one repair
+  attempt before the node fails.
 - Checkpoints preserve chat history and the workflow’s accepted results.
   Active requests, approval callbacks, timers, and external tool processes
   end with their owning Emacs session.
@@ -1422,7 +1507,10 @@ schema, retry policy, and metadata.  Custom drivers implement
 terminalizing the runner call) and `gptel-runner-driver-await-feedback` (which
 prepares an already-completed provider transcript for human editing).  Prompt,
 branch, repeat-stop, and progress-key functions receive the live run and can
-read explicit blackboard values.  Parsers and validators remain runner-owned,
+read explicit blackboard values. In the driver completion callback, pass
+`success` with the submitted handoff text, `follow-up` with the question for
+the preceding agent, or `discussion` with a reply awaiting human feedback.
+Parsers and validators remain runner-owned,
 so provider schema support is a reliability hint rather than an approval
 authority.
 

@@ -247,6 +247,24 @@ TARGET defaults to the selected background run or node."
         (gptel-runner-background-transcript selection)
       (gptel-runner-background-open (nth 2 selection)))))
 
+(defun gptel-runner-background-child-transcripts ()
+  "Open a child transcript published by the selected background node or run."
+  (interactive)
+  (pcase-let* ((`(,run ,call ,_) (gptel-runner-jobs-ui--selection))
+               (children
+                (cl-loop for owner in (plist-get run :calls)
+                         when (or (null call)
+                                  (equal (plist-get owner :node) (plist-get call :node)))
+                         append (mapcar
+                                 (lambda (record)
+                                   (append (list :target (list 'background-call (plist-get run :id)
+                                                              (plist-get owner :epoch)
+                                                              (plist-get owner :id)))
+                                           record))
+                                 (plist-get owner :children))))
+               (child (gptel-runner-ui--read-child children)))
+    (gptel-runner-background-transcript (list run child (plist-get child :target)))))
+
 (defun gptel-runner-background-events ()
   "Open the persisted event journal for the selected invocation."
   (interactive)
@@ -256,6 +274,51 @@ TARGET defaults to the selected background run or node."
       (pop-to-buffer (find-file-noselect path))
       (read-only-mode 1)
       (setq-local gptel-runner-background--target target))))
+
+(defun gptel-runner-jobs-ui--visit-message-node (run epoch node)
+  "Open the published conversation for NODE in RUN at or before EPOCH."
+  (let ((call
+         (cl-find-if (lambda (c)
+                       (and (equal node (plist-get c :node))
+                            (<= (plist-get c :epoch) epoch)
+                            (or (plist-get c :chat) (plist-get c :transcript))))
+                     (plist-get run :calls) :from-end t)))
+    (unless call (user-error "No published chat for node %s" node))
+    (gptel-runner-background-visit
+     (list 'background-call (plist-get run :id) (plist-get call :epoch)
+           (plist-get call :id)))))
+
+(defun gptel-runner-jobs-ui--insert-messages (run node)
+  "Read RUN's published journal and display messages involving NODE."
+  (when (file-exists-p (expand-file-name "events.el" (plist-get run :directory)))
+    (let ((display (current-buffer)))
+      (with-temp-buffer
+        (insert-file-contents (gptel-runner-jobs-ui--artifact-path run "events.el"))
+        (goto-char (point-min))
+        ;; A worker may still be appending the last record.
+        (condition-case nil
+            (while t
+              (let* ((record (read (current-buffer)))
+                     (epoch (plist-get record :epoch)))
+                (with-current-buffer display
+                  (gptel-runner-ui--insert-message
+                   (plist-get record :time) (plist-get record :type)
+                   (plist-get record :data) node
+                   (lambda (id)
+                     (gptel-runner-jobs-ui--visit-message-node run epoch id))))))
+          (end-of-file nil))))))
+
+(defun gptel-runner-background-messages ()
+  "Show node messages exchanged in the selected background invocation."
+  (interactive)
+  (pcase-let* ((`(,run ,call ,target) (gptel-runner-jobs-ui--selection))
+               (id (plist-get run :id))
+               (node (plist-get call :node)))
+    (gptel-runner-ui--show-messages
+     (format "*gptel-runner background messages:%s*" id) node
+     (lambda ()
+       (gptel-runner-jobs-ui--insert-messages (gptel-runner-invocation-get id) node)))
+    (setq-local gptel-runner-background--target target)))
 
 (defun gptel-runner-background-artifact ()
   "Open a selected artifact belonging to the background invocation."
@@ -296,7 +359,7 @@ Approval and rejection open the node panel for review before submission."
    (list (intern
           (completing-read
            "Background action: "
-           '(pause resume cancel retry continue extend extend-repeat decision
+           '(pause resume cancel retry rerun continue extend extend-repeat decision
 		   pause-call cancel-call feedback accept approve reject revoke-outside)
            nil t))))
   (if (memq operation '(approve reject))
@@ -354,6 +417,10 @@ Approval and rejection open the node panel for review before submission."
 (defun gptel-runner-background-continue ()
   "Continue the invocation with a new goal."
   (interactive) (gptel-runner-background-command 'continue))
+
+(defun gptel-runner-background-rerun ()
+  "Rerun the selected finished invocation from its first step."
+  (interactive) (gptel-runner-background-command 'rerun))
 
 (defun gptel-runner-background-extend ()
   "Extend the invocation's finite budgets."
@@ -451,6 +518,8 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
   [["Inspect"
     ("i" "Run/call details" gptel-runner-background-inspect)
     ("w" "Worker controls" gptel-runner-background-open)
+    ("m" "Node messages" gptel-runner-background-messages)
+    ("j" "Child transcripts" gptel-runner-background-child-transcripts)
     ("e" "Event journal" gptel-runner-background-events)
     ("v" "Open node chat" gptel-runner-background-transcript)
     ("o" "Saved outputs" gptel-runner-background-outputs)
@@ -460,6 +529,7 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
     ("P" "Pause" gptel-runner-background-pause)
     ("r" "Resume" gptel-runner-background-resume)
     ("t" "Retry / retry node" gptel-runner-background-retry)
+    ("R" "Rerun with same goal" gptel-runner-background-rerun)
     ("c" "Continue" gptel-runner-background-continue)
     ("b" "Extend budgets" gptel-runner-background-extend)
     ("K" "Cancel" gptel-runner-background-cancel)]

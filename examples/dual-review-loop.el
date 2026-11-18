@@ -74,8 +74,8 @@
     "Reviewer A's previous feedback:\n%s\n\n"
     "Reviewer B's previous feedback:\n%s\n\n"
     "Reinspect the current workspace.  Implement the goal or correct every "
-    "applicable issue, then run the relevant tests.  Do not assume access to "
-    "any earlier conversation.  Return a concise implementation report.")
+    "applicable issue, then run the relevant tests.  Hand off a concise "
+    "implementation report.")
    (gptel-runner-run-goal run)
    (gptel-runner-run-workspace run)
    (1+ (gptel-runner-iteration run 'dual-review-cycle))
@@ -90,9 +90,9 @@
     "You are independent reviewer %s.  Reinspect the implementation and run "
     "the relevant tests yourself.  Do not trust the writer's report as "
     "evidence and do not modify the workspace.\n\n"
-    "Your first line must be exactly VERDICT: PASS when all requirements are "
-    "satisfied, or VERDICT: REVISE when any correction remains.  After that "
-    "line, give concrete natural-language findings for the next writer.\n\n"
+    "Call RunnerHandoff with a message whose first line is exactly VERDICT: "
+    "PASS when all requirements are satisfied, or VERDICT: REVISE when any "
+    "correction remains.  Follow it with concrete findings for the writer.\n\n"
     "Writer report (informational only):\n%s")
    (gptel-runner-run-goal run)
    (gptel-runner-run-workspace run)
