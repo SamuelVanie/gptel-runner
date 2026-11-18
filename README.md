@@ -55,7 +55,8 @@ optional schema helpers and fan-out/synthesis workflows.
 
 Workflows are data, built with `gptel-runner-agent-step`, `gptel-runner-elisp-step`,
 `gptel-runner-sequence`, `gptel-runner-branch`,
-`gptel-runner-repeat-until`, and `gptel-runner-parallel`.  Define one with
+`gptel-runner-repeat-until`, `gptel-runner-parallel`, and `gptel-runner-try`.
+Define one with
 `gptel-runner-defworkflow`, then start it:
 
 ```elisp
@@ -143,6 +144,63 @@ step IDs.  Use stable explicit IDs and reload the workflow's function
 definitions before restoring a snapshot.  Saved values must be readable Lisp
 data.  Functions with side effects should tolerate repeated execution after
 retries or recovery; pausing or cancellation cannot undo effects already made.
+
+### Failure recovery and cleanup
+
+Use `gptel-runner-try` to recover from a failed operation and continue the
+workflow.  Its `:body`, `:catch`, and `:finally` are ordinary workflow nodes,
+including sequences, parallel groups, agent calls, and Elisp steps:
+
+```elisp
+(gptel-runner-try
+ :id 'fetch-report
+ :error-as 'report-failure
+ :save-as 'report
+ :body (gptel-runner-agent-step
+        :id 'fetch :agent 'researcher :prompt "Prepare the report.")
+ :catch (gptel-runner-elisp-step
+         :id 'fallback
+         :function (lambda (run _node)
+                     (let ((failure (gptel-runner-get run 'report-failure)))
+                       (list :status 'unavailable
+                             :reason (plist-get failure :value)))))
+ :finally (gptel-runner-elisp-step
+           :id 'finish-report
+           :function (lambda (run _node)
+                       (gptel-runner-put run 'report-attempt-finished t))))
+```
+
+The body is required, along with at least one of `:catch` and `:finally`.
+By default, the handler catches `failed` outcomes after the body's configured
+retries and output repairs have finished.  Use
+`:catch-states '(failed blocked stalled)` to also recover from blocked or
+stalled work, or a subset to handle only those outcomes.  Errors in branch
+and repeat predicates become `failed` outcomes with `:type 'flow-error`.
+
+`:error-as` receives `(:node BODY-ID :state STATE :value VALUE)` before the
+handler or cleanup starts, or nil on body success.  The value is the original
+failure data; the ID identifies the body subtree.  The error key is cleared
+when a new body attempt starts.  It must differ from `:save-as`.
+
+A successful handler makes the try succeed and allows the enclosing sequence
+to continue.  `:save-as` receives the successful body or handler value,
+including nil.  Without a matching handler, the body's failure propagates.
+Cleanup runs after the body and any handler, even if the handler fails.
+Successful cleanup preserves their outcome; failed cleanup becomes the try's
+failure.  A handler or cleanup failure can be caught by an enclosing try.
+The original child failures remain visible in node states and the event log.
+
+Recovery and cleanup obey ordinary concurrency, workspace permissions, and
+budgets.  An Elisp handler can still finish local work after an agent call or
+request budget is exhausted.  Cancellation (including a cancelled parallel
+sibling) and run duration expiry stop immediately without starting recovery
+or cleanup; `:finally` is workflow cleanup, not an Emacs `unwind-protect`.
+
+Pausing or restoring a snapshot resumes the current phase without rerunning
+an already failed body while handling it.  Retrying a failed try resumes its
+failed phase; `gptel-runner-retry :from-node` can explicitly revisit an earlier
+step.  A new repeat iteration or `gptel-runner-continue` starts a fresh try.
+Use stable node IDs and serializable outputs for durable checkpoints.
 
 ### Per-node workspaces
 

@@ -82,6 +82,27 @@ The node requires `:body' and a positive `:max'.  `:until', `:stop-when', and
    :kind 'repeat :properties properties
    :children (list (plist-get properties :body))))
 
+(defun gptel-runner-try (&rest properties)
+  "Return a recovery node described by PROPERTIES.
+`:body' is required; provide at least one of `:catch' and `:finally'.
+All three are workflow nodes.  `:catch' runs when the body fails, after its
+own retries are exhausted.  `:catch-states' defaults to (failed) and may
+also include blocked and stalled.  A successful handler recovers the try.
+`:error-as' saves the body outcome as (:node ID :state STATE :value VALUE)
+before recovery or cleanup.  It is nil when the body succeeds.
+`:finally' runs after the body and any handler.  Successful cleanup preserves
+their outcome; unsuccessful cleanup replaces it.  `:save-as' saves the
+successful body or handler value, never the cleanup value.
+Cancellation and run duration expiry stop execution immediately, including
+cleanup.  Pausing checkpoints the current phase for later resumption.
+Optional `:id' and inherited `:context' work as on other composite nodes."
+  (gptel-runner-node-create
+   :id (gptel-runner--node-id properties 'try)
+   :kind 'try :properties properties
+   :children (delq nil (list (plist-get properties :body)
+                             (plist-get properties :catch)
+                             (plist-get properties :finally)))))
+
 (defun gptel-runner-parallel (&rest arguments)
   "Return a parallel node from ARGUMENTS.
 Leading keyword/value pairs set `:id', `:policy', `:minimum-successes', and
@@ -246,7 +267,7 @@ Return a cons of label and text, or nil when a function omits its context."
   (let* ((kind (gptel-runner-node-kind node))
          (props (gptel-runner-node-properties node)))
     (pcase kind
-      ((or 'agent 'elisp 'parallel) (plist-get props :save-as))
+      ((or 'agent 'elisp 'parallel 'try) (plist-get props :save-as))
       ('repeat (plist-get props :save-history-as)))))
 
 (defun gptel-runner--find-node (root id)
@@ -274,6 +295,10 @@ Return a cons of label and text, or nil when a function omits its context."
   "Return all blackboard keys written by NODE and its descendants."
   (let ((own (gptel-runner--node-save-key node)))
     (append (and own (list own))
+            (when (eq (gptel-runner-node-kind node) 'try)
+              (when-let* ((key (plist-get (gptel-runner-node-properties node)
+                                          :error-as)))
+                (list key)))
             (apply #'append
                    (mapcar #'gptel-runner--node-save-keys
                            (gptel-runner-node-children node))))))
@@ -355,6 +380,26 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
                   directory))
                (unless (plist-member props :prompt)
                  (user-error "Agent node %S has no :prompt" id)))
+              ('try
+               (unless (gptel-runner-node-p (plist-get props :body))
+                 (user-error "Try node %S needs a :body node" id))
+               (unless (or (plist-get props :catch) (plist-get props :finally))
+                 (user-error "Try node %S needs :catch or :finally" id))
+               (dolist (key '(:catch :finally))
+                 (when (and (plist-get props key)
+                            (not (gptel-runner-node-p (plist-get props key))))
+                   (user-error "Try node %S needs a node for %S" id key)))
+               (when (plist-member props :catch-states)
+                 (unless (and (plist-get props :catch)
+                              (proper-list-p (plist-get props :catch-states))
+                              (cl-every (lambda (state)
+                                          (memq state '(failed blocked stalled)))
+                                        (plist-get props :catch-states)))
+                   (user-error "Try node %S has invalid :catch-states" id)))
+               (when (and (plist-get props :error-as)
+                          (equal (plist-get props :error-as)
+                                 (plist-get props :save-as)))
+                 (user-error "Try node %S needs distinct result and error keys" id)))
               ('repeat
                (let ((max (plist-get props :max)))
                  (unless (and (integerp max) (> max 0))
@@ -437,6 +482,12 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
 
 (defun gptel-runner--reset-subtree (run node)
   "Reset NODE and descendants to pending in RUN before a new iteration."
+  (when (eq (gptel-runner-node-kind node) 'try)
+    (remhash (list 'gptel-runner-try (gptel-runner-node-id node))
+             (gptel-runner-run-blackboard run))
+    (dolist (property '(:save-as :error-as))
+      (when-let* ((key (plist-get (gptel-runner-node-properties node) property)))
+        (remhash key (gptel-runner-run-blackboard run)))))
   (puthash (gptel-runner-node-id node) 'pending
            (gptel-runner-run-node-states run))
   (mapc (lambda (child) (gptel-runner--reset-subtree run child))
@@ -689,26 +740,42 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
       (gptel-runner--set-node-state run node 'running)
       (next))))
 
+(defun gptel-runner--evaluate-flow-function (run node function next done)
+  "Evaluate FUNCTION on RUN for NODE, then invoke NEXT or DONE.
+NEXT receives a successful value.  Lisp errors and quits become terminal
+node outcomes passed to DONE.  Invoke continuations outside the error
+handler so errors in later nodes are not attributed to this function."
+  (let ((outcome
+         (condition-case err
+             (cons 'succeeded (funcall function run))
+           (error (cons 'failed (list :type 'flow-error :error err)))
+           (quit (cons 'cancelled (list :type 'flow-quit :error err))))))
+    (when (eq (gptel-runner-run-state run) 'running)
+      (if (eq (car outcome) 'succeeded)
+          (funcall next (cdr outcome))
+        (gptel-runner--set-node-state run node (car outcome) (cdr outcome))
+        (funcall done (car outcome) (cdr outcome))))))
+
 (defun gptel-runner--execute-branch (run node done)
   "Execute branch NODE in RUN and invoke DONE."
   (let* ((props (gptel-runner-node-properties node))
-         (predicate (or (plist-get props :predicate) (plist-get props :if)))
-         (choice (if (funcall predicate run)
-                     (plist-get props :then)
-                   (plist-get props :else)))
-         (unused (if (eq choice (plist-get props :then))
-                     (plist-get props :else)
-                   (plist-get props :then))))
+         (predicate (or (plist-get props :predicate) (plist-get props :if))))
     (gptel-runner--set-node-state run node 'running)
-    (when unused (gptel-runner--skip-subtree run unused 'branch-not-selected))
-    (if choice
-        (gptel-runner--execute-node
-         run choice
-         (lambda (state value)
-           (gptel-runner--set-node-state run node state value)
-           (funcall done state value)))
-      (gptel-runner--set-node-state run node 'succeeded)
-      (funcall done 'succeeded nil))))
+    (gptel-runner--evaluate-flow-function
+     run node predicate
+     (lambda (selected)
+       (let ((choice (plist-get props (if selected :then :else)))
+             (unused (plist-get props (if selected :else :then))))
+         (when unused (gptel-runner--skip-subtree run unused 'branch-not-selected))
+         (if choice
+             (gptel-runner--execute-node
+              run choice
+              (lambda (state value)
+                (gptel-runner--set-node-state run node state value)
+                (funcall done state value)))
+           (gptel-runner--set-node-state run node 'succeeded)
+           (funcall done 'succeeded nil))))
+     done)))
 
 (defun gptel-runner--node-key-succeeded-p (run node key)
   "Return non-nil when NODE or a descendant wrote KEY successfully in RUN."
@@ -766,53 +833,51 @@ Return the new history entry, or nil when NODE does not collect history."
          (continue-current (or retry-body (gptel-runner--subtree-state-p
                                           run body 'succeeded))))
     (cl-labels
-        ((iterate
-          (resume-body)
-          (if (>= (gptel-runner-iteration run (gptel-runner-node-id node))
-                  maximum)
-              (let ((failure (list :type 'iteration-budget :max maximum)))
-                (gptel-runner--set-node-state run node 'failed failure)
-                (funcall done 'failed failure))
-            (unless resume-body (gptel-runner--reset-subtree run body))
-            (gptel-runner--execute-node
-             run body
-             (lambda (state value)
-               (if (not (eq state 'succeeded))
-                   (progn
-                     (gptel-runner--set-node-state run node state value)
-                     (funcall done state value))
-                 (let* ((id (gptel-runner-node-id node))
-                        (iteration (1+ (gptel-runner-iteration run id)))
-                        (key (and progress-fn (funcall progress-fn run))))
-                   (puthash id iteration (gptel-runner-run-iterations run))
-                   (remhash retry-slot (gptel-runner-run-blackboard run))
-                   (gptel-runner--collect-repeat-history run node iteration)
-                   (gptel-runner--emit run 'iteration-completed node nil
-                                       (list :iteration iteration
-                                             :progress key))
-                   (cond
-                    ((and stop (funcall stop run))
-                     (gptel-runner--set-node-state run node 'blocked value)
-                     (funcall done 'blocked value))
-                    ((and until (funcall until run))
-                     (gptel-runner--set-node-state run node 'succeeded value)
-                     (funcall done 'succeeded value))
-                    ((and key previous-key (equal key previous-key))
-                     (let ((failure (list :type 'stalled :progress-key key)))
-                       (gptel-runner--set-node-state run node 'stalled failure)
-                       (funcall done 'stalled failure)))
-                    (t
-                     (setq previous-key key)
-                     (puthash progress-slot key
-                              (gptel-runner-run-blackboard run))
-                     (gptel-runner--checkpoint run)
-                     (iterate nil))))))))))
+        ((finish (state value)
+           (gptel-runner--set-node-state run node state value)
+           (funcall done state value))
+         (evaluate (function next)
+           (gptel-runner--evaluate-flow-function run node function next done))
+         (after-iteration (value key)
+           (let* ((id (gptel-runner-node-id node))
+                  (iteration (1+ (gptel-runner-iteration run id))))
+             (puthash id iteration (gptel-runner-run-iterations run))
+             (remhash retry-slot (gptel-runner-run-blackboard run))
+             (gptel-runner--collect-repeat-history run node iteration)
+             (gptel-runner--emit run 'iteration-completed node nil
+                                 (list :iteration iteration :progress key))
+             (evaluate
+              (lambda (run)
+                (cond ((and stop (funcall stop run)) 'blocked)
+                      ((and until (funcall until run)) 'succeeded)))
+              (lambda (decision)
+                (cond
+                 (decision (finish decision value))
+                 ((and key previous-key (equal key previous-key))
+                  (finish 'stalled (list :type 'stalled :progress-key key)))
+                 (t
+                  (setq previous-key key)
+                  (puthash progress-slot key (gptel-runner-run-blackboard run))
+                  (gptel-runner--checkpoint run)
+                  (iterate nil)))))))
+         (after-body (state value)
+           (if (not (eq state 'succeeded))
+               (finish state value)
+             (evaluate (or progress-fn #'ignore)
+                       (lambda (key) (after-iteration value key)))))
+         (iterate (resume-body)
+           (if (>= (gptel-runner-iteration run (gptel-runner-node-id node))
+                   maximum)
+               (finish 'failed (list :type 'iteration-budget :max maximum))
+             (unless resume-body (gptel-runner--reset-subtree run body))
+             (gptel-runner--execute-node run body #'after-body))))
       (gptel-runner--set-node-state run node 'running)
-      (if (and (not retry-body) until (funcall until run))
-          (progn
-            (gptel-runner--set-node-state run node 'succeeded)
-            (funcall done 'succeeded nil))
-        (iterate continue-current)))))
+      (evaluate
+       (lambda (run) (and (not retry-body) until (funcall until run)))
+       (lambda (finished)
+         (if finished
+             (finish 'succeeded nil)
+           (iterate continue-current)))))))
 
 (defun gptel-runner--execute-parallel (run node done)
   "Execute parallel NODE in RUN and invoke DONE according to its join policy."
@@ -877,6 +942,104 @@ Return the new history entry, or nil when NODE does not collect history."
           (gptel-runner--execute-node
            run child (lambda (state value) (joined child state value))))))))
 
+(defun gptel-runner--execute-try (run node done)
+  "Execute recovery NODE in RUN, checkpointing phases before invoking DONE."
+  (let* ((props (gptel-runner-node-properties node))
+         (body (plist-get props :body))
+         (handler (plist-get props :catch))
+         (cleanup (plist-get props :finally))
+         (states (if (plist-member props :catch-states)
+                     (plist-get props :catch-states) '(failed)))
+         (slot (list 'gptel-runner-try (gptel-runner-node-id node)))
+         (checkpoint (or (gptel-runner-get run slot) '(:phase body)))
+         (generation (gptel-runner-run-generation run))
+         finalized)
+    (cl-labels
+        ((live-p ()
+           (and (not finalized)
+                (= generation (gptel-runner-run-generation run))
+                (eq (gptel-runner-run-state run) 'running)))
+         (remember (data)
+           (setq checkpoint data)
+           (puthash slot data (gptel-runner-run-blackboard run))
+           (gptel-runner--checkpoint run))
+         (reset (child)
+           (when child
+             (gptel-runner--clear-workflow-results run child)
+             (gptel-runner--reset-subtree run child)
+             (gptel-runner--clear-repeat-progress run child)))
+         (finish (state value)
+           (when (live-p)
+             (setq finalized t)
+             (when (eq state 'succeeded)
+               (remember (list :phase 'complete :state state :value value))
+               (when-let* ((key (plist-get props :save-as)))
+                 (gptel-runner-put run key value)))
+             (gptel-runner--set-node-state run node state value)
+             (funcall done state value)))
+         (cancel (state value)
+           ;; In particular, aborting a sibling in a fail-fast parallel must
+           ;; not enqueue a new cleanup call in the cancelled subtree.
+           (dolist (child (list handler cleanup))
+             (when child (gptel-runner--skip-subtree run child 'try-cancelled)))
+           (finish state value))
+         (after-cleanup (state value)
+           (when (live-p)
+             (if (eq state 'succeeded)
+                 (let ((outcome-state (plist-get checkpoint :state))
+                       (outcome-value (plist-get checkpoint :value)))
+                   ;; A later retry targets the phase whose outcome cleanup
+                   ;; preserved.  A cleanup failure instead resumes cleanup.
+                   (remember (plist-put checkpoint :phase
+                                        (plist-get checkpoint :source)))
+                   (finish outcome-state outcome-value))
+               (finish state value))))
+         (finalize (source state value)
+           (remember (list :phase 'finally :source source
+                           :state state :value value))
+           (if cleanup
+               (gptel-runner--execute-node run cleanup #'after-cleanup)
+             (after-cleanup 'succeeded nil)))
+         (after-handler (state value)
+           (when (live-p)
+             (if (eq state 'cancelled)
+                 (cancel state value)
+               (finalize 'catch state value))))
+         (recover ()
+           (reset cleanup)
+           (gptel-runner--execute-node run handler #'after-handler))
+         (after-body (state value)
+           (when (live-p)
+             (when-let* ((key (plist-get props :error-as)))
+               (gptel-runner-put
+                run key (unless (eq state 'succeeded)
+                          (list :node (gptel-runner-node-id body)
+                                :state state :value value))))
+             (cond
+              ((eq state 'cancelled) (cancel state value))
+              ((and handler (memq state states))
+               (remember (list :phase 'catch))
+               (recover))
+              (t
+               (when handler
+                 (gptel-runner--skip-subtree run handler 'try-not-caught))
+               (finalize 'body state value))))))
+      (gptel-runner--set-node-state run node 'running)
+      (pcase (plist-get checkpoint :phase)
+        ('catch (recover))
+        ('finally
+         (if cleanup
+             (gptel-runner--execute-node run cleanup #'after-cleanup)
+           (after-cleanup 'succeeded nil)))
+        (_
+         (reset handler)
+         (reset cleanup)
+         (dolist (property '(:save-as :error-as))
+           (when-let* ((key (plist-get props property)))
+             (remhash key (gptel-runner-run-blackboard run))))
+         (remember (list :phase 'body))
+         (gptel-runner--execute-node run body #'after-body))))))
+
 (defun gptel-runner--execute-node (run node done)
   "Execute NODE in RUN, then call DONE with terminal state and value."
   (let ((saved-state
@@ -885,11 +1048,15 @@ Return the new history entry, or nil when NODE does not collect history."
     (cond
      ((eq saved-state 'succeeded)
       (funcall done 'succeeded
-               (when (memq (gptel-runner-node-kind node) '(agent elisp))
-                 (when-let ((key (plist-get
-                                  (gptel-runner-node-properties node)
-                                  :save-as)))
-                   (gptel-runner-get run key)))))
+               (if (eq (gptel-runner-node-kind node) 'try)
+                   (plist-get (gptel-runner-get
+                               run (list 'gptel-runner-try
+                                         (gptel-runner-node-id node))) :value)
+                 (when (memq (gptel-runner-node-kind node) '(agent elisp))
+                   (when-let ((key (plist-get
+                                    (gptel-runner-node-properties node)
+                                    :save-as)))
+                     (gptel-runner-get run key))))))
      ((not (eq (gptel-runner-run-state run) 'running)) nil)
      (t
       (when (eq saved-state 'skipped)
@@ -902,6 +1069,7 @@ Return the new history entry, or nil when NODE does not collect history."
         ('branch (gptel-runner--execute-branch run node done))
         ('repeat (gptel-runner--execute-repeat run node done))
         ('parallel (gptel-runner--execute-parallel run node done))
+        ('try (gptel-runner--execute-try run node done))
         (_ (funcall done 'failed
                     (list :type 'invalid-node
                           :kind (gptel-runner-node-kind node)))))))))
@@ -1038,13 +1206,36 @@ CALLBACK runs exactly once with the terminal run."
       (gptel-runner--checkpoint run)
       run)))
 
+(defun gptel-runner--try-completed-children (run node)
+  "Return children of try NODE whose outcomes are already checkpointed in RUN."
+  (when (eq (gptel-runner-node-kind node) 'try)
+    (let* ((props (gptel-runner-node-properties node))
+           (phase (plist-get
+                   (gptel-runner-get
+                    run (list 'gptel-runner-try (gptel-runner-node-id node)))
+                   :phase)))
+      (delq nil
+            (mapcar (lambda (key) (plist-get props key))
+                    (pcase phase
+                      ('catch '(:body))
+                      ('finally '(:body :catch))
+                      ('complete '(:body :catch :finally))))))))
+
 (defun gptel-runner--prepare-node-states-for-resume (run)
   "Reset unfinished node states in RUN while preserving completed work."
-  (maphash
-   (lambda (id state)
-     (unless (memq state '(succeeded skipped))
-       (puthash id 'pending (gptel-runner-run-node-states run))))
-   (gptel-runner-run-node-states run)))
+  (let ((completed (make-hash-table :test #'equal)))
+    (cl-labels
+        ((walk (node)
+           (dolist (child (gptel-runner--try-completed-children run node))
+             (dolist (id (gptel-runner--subtree-ids child))
+               (puthash id t completed)))
+           (mapc #'walk (gptel-runner-node-children node))))
+      (walk (gptel-runner-workflow-root (gptel-runner-run-workflow run))))
+    (maphash
+     (lambda (id state)
+       (unless (or (gethash id completed) (memq state '(succeeded skipped)))
+         (puthash id 'pending (gptel-runner-run-node-states run))))
+     (gptel-runner-run-node-states run))))
 
 (defun gptel-runner--prepare-terminal-repeat-bodies (run root)
   "Reset completed repeat bodies in RUN that made ROOT blocked or stalled.
@@ -1064,7 +1255,9 @@ can resume at the narrowest safe checkpoint."
                      'succeeded))
             (gptel-runner--reset-subtree
              run (plist-get (gptel-runner-node-properties node) :body))
-          (mapc #'walk (gptel-runner-node-children node)))))
+          (dolist (child (gptel-runner-node-children node))
+            (unless (memq child (gptel-runner--try-completed-children run node))
+              (walk child))))))
     (walk root)))
 
 (defun gptel-runner--supersede-paused-calls (run)
@@ -1342,6 +1535,17 @@ Enclosing repeat histories and counters are retained."
              (when (eq (gptel-runner-node-kind node) 'parallel)
                (when-let* ((key (gptel-runner--node-save-key node)))
                  (remhash key (gptel-runner-run-blackboard run))))
+             (when (eq (gptel-runner-node-kind node) 'try)
+               (let* ((props (gptel-runner-node-properties node))
+                      (slot (list 'gptel-runner-try (gptel-runner-node-id node)))
+                      (phase (cond ((eq child (plist-get props :body)) 'body)
+                                   ((eq child (plist-get props :catch)) 'catch)
+                                   (t 'finally))))
+                 (puthash slot (plist-put (gptel-runner-get run slot)
+                                          :phase phase)
+                          (gptel-runner-run-blackboard run))
+                 (when-let* ((key (plist-get props :save-as)))
+                   (remhash key (gptel-runner-run-blackboard run)))))
              (when (eq (gptel-runner-node-kind node) 'repeat)
                (puthash (list 'gptel-runner-retry-repeat
                               (gptel-runner-node-id node))
