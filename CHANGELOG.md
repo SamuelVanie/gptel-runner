@@ -2,6 +2,10 @@
 
 ## 0.1.0 - unreleased
 
+- Add background dashboard cleanup keys matching the classic run menu: forget
+  a run, forget workflow history, or clear finished runs. Preserve saved history
+  by default, optionally delete recovery checkpoints, and protect active or
+  uncertain workers. Forgotten history stays hidden until a new generation.
 - Unify local and background output APIs: retain files or generated text with
   the same artifact descriptors, persist their registry across recovery, and
   resolve artifacts through public readers and agent context sources. Share

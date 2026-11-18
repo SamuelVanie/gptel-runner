@@ -417,6 +417,42 @@ An interrupted or corrupt manifest does not hide other invocations."
   (and (not (eq (plist-get invocation :phase) 'closed))
        (gptel-runner-jobs--owner-live-p (plist-get invocation :worker))))
 
+(defun gptel-runner-invocation-forgettable-p (invocation)
+  "Return non-nil when INVOCATION's worker has stopped safely.
+Paused workers and unconfirmed launch reservations remain protected."
+  (or (eq (plist-get invocation :phase) 'closed)
+      (and (memq (plist-get invocation :phase) '(open closing))
+           (eq (gptel-runner-jobs--lock-owner-state
+                (plist-get invocation :worker)) 'dead))))
+
+(defun gptel-runner-invocation-forgotten-p (invocation)
+  "Return non-nil when INVOCATION's current generation was forgotten."
+  (and (plist-member invocation :forgotten-epoch)
+       (equal (plist-get invocation :forgotten-epoch)
+              (plist-get invocation :epoch))))
+
+(defun gptel-runner-invocation-forget (invocation &optional delete-checkpoint)
+  "Hide stopped INVOCATION or its ID from the dashboard persistently.
+Keep saved history accessible through `gptel-runner-invocation-list' and
+other inspection APIs.  A new worker generation becomes visible again.
+With DELETE-CHECKPOINT, also delete its recovery checkpoint; results,
+transcripts, artifacts, job definitions, and schedules are preserved."
+  (when (stringp invocation)
+    (setq invocation (gptel-runner-invocation-get invocation)))
+  (let ((gptel-runner-job-directory (plist-get invocation :root)))
+    (gptel-runner-jobs--with-control-lock
+     invocation
+     (lambda ()
+       (let ((fresh (gptel-runner-invocation-get (plist-get invocation :id))))
+         (unless (and (equal (plist-get fresh :epoch) (plist-get invocation :epoch))
+                      (gptel-runner-invocation-forgettable-p fresh))
+           (user-error "Background run changed or still has a worker; refresh after it stops"))
+         (when delete-checkpoint
+           (let ((file (expand-file-name "checkpoint.el" (plist-get fresh :directory))))
+             (when (file-exists-p file) (delete-file file))))
+         (setq fresh (plist-put fresh :forgotten-epoch (plist-get fresh :epoch)))
+         (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file fresh) fresh))))))
+
 (defun gptel-runner-jobs--lock-owner-state (owner)
   "Classify OWNER as `live', `dead', or `unknown' by exact process identity.
 Incomplete identities and owners on another host are never declared dead."

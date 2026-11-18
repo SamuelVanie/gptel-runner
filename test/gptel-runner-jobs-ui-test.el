@@ -255,5 +255,70 @@
          (lambda () (ert-fail "External row opened local actions")))
         (should remote)))))
 
+(ert-deftest gptel-runner-jobs-ui-menu-includes-state-aware-cleanup ()
+  (dolist (binding '(("x" gptel-runner-background-forget-run
+                     gptel-runner-jobs-ui--forgettable-at-point-p)
+                    ("X" gptel-runner-background-forget-workflow
+                     gptel-runner-jobs-ui--forgettable-workflow-p)
+                    ("C" gptel-runner-background-clear-finished
+                     gptel-runner-jobs-ui--finished-invocations)
+                    (":" gptel-runner-background-command)))
+    (let ((suffix (cdr (transient-get-suffix 'gptel-runner-background-menu
+                                            (car binding)))))
+      (should (eq (plist-get suffix :command) (nth 1 binding)))
+      (should (eq (plist-get suffix :inapt-if-not) (nth 2 binding))))))
+
+(ert-deftest gptel-runner-jobs-ui-forgotten-history-stays-hidden-until-restarted ()
+  (let ((run '(:id "invocation-1" :epoch 1 :forgotten-epoch 1
+               :workflow checks :phase closed :state succeeded
+               :calls ((:id "call-1" :epoch 1 :state succeeded)))))
+    (cl-letf (((symbol-function 'gptel-runner-invocation-list) (lambda () (list run))))
+      (should-not (gptel-runner-jobs-ui--entries))
+      (should-not (gptel-runner-jobs-ui--finished-invocations))
+      (setq run (plist-put run :epoch 2))
+      (should (= (length (gptel-runner-jobs-ui--entries)) 2)))))
+
+(ert-deftest gptel-runner-jobs-ui-cleanup-protects-workers-and-scopes-history ()
+  (let* ((finished '(:id "done" :workflow checks :phase closed :state succeeded))
+         (active '(:id "active" :workflow checks :phase open :state paused))
+         (other '(:id "other" :workflow other :phase closed :state skipped))
+         (hidden '(:id "hidden" :workflow checks :phase closed
+                   :epoch 1 :forgotten-epoch 1))
+         (runs (list finished active other hidden))
+         forgotten prompts)
+    (with-temp-buffer
+      (setq-local gptel-runner-background--target '(background-call "done" 1 "call-1"))
+      (cl-letf (((symbol-function 'gptel-runner-jobs-ui--selection)
+                 (lambda () (list finished nil gptel-runner-background--target)))
+                ((symbol-function 'gptel-runner-invocation-list) (lambda () runs))
+                ((symbol-function 'gptel-runner-invocation-forget)
+                 (lambda (run prefix) (push (list (plist-get run :id) prefix) forgotten)))
+                ((symbol-function 'yes-or-no-p)
+                 (lambda (_) (cl-incf prompts) t))
+                ((symbol-function 'gptel-runner-dashboard-refresh) #'ignore))
+        (setq prompts 0)
+        (should (gptel-runner-jobs-ui--forgettable-at-point-p))
+        (should-not (gptel-runner-jobs-ui--forgettable-workflow-p))
+        (should-error (gptel-runner-background-forget-workflow) :type 'user-error)
+        (should (= prompts 0))
+        (should-not forgotten)
+        ;; A selected call forgets its owning run and passes the prefix through.
+        (set-buffer-modified-p t)
+        (gptel-runner-background-forget-run '(4))
+        (should (equal forgotten '(("done" (4)))))
+        (setq forgotten nil)
+        (gptel-runner-background-clear-finished)
+        (should (equal (reverse forgotten) '(("done" nil) ("other" nil))))
+        (setq runs (list finished other hidden) forgotten nil)
+        (should (gptel-runner-jobs-ui--forgettable-workflow-p))
+        (gptel-runner-background-forget-workflow)
+        (should (equal forgotten '(("done" nil))))))))
+
+(ert-deftest gptel-runner-jobs-ui-declining-cleanup-preserves-history ()
+  (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) nil))
+            ((symbol-function 'gptel-runner-invocation-forget)
+             (lambda (&rest _) (ert-fail "Forgot history without confirmation"))))
+    (gptel-runner-jobs-ui--forget '((:phase closed)) t "test history")))
+
 (provide 'gptel-runner-jobs-ui-test)
 ;;; gptel-runner-jobs-ui-test.el ends here

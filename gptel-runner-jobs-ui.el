@@ -54,10 +54,15 @@
                            start))
       "-")))
 
+(defun gptel-runner-jobs-ui--visible-invocations ()
+  "Return background history that has not been forgotten."
+  (cl-remove-if #'gptel-runner-invocation-forgotten-p
+                (gptel-runner-invocation-list)))
+
 (defun gptel-runner-jobs-ui--entries ()
   "Return external invocation rows using only their compact manifests."
   (let (entries)
-    (dolist (run (gptel-runner-invocation-list))
+    (dolist (run (gptel-runner-jobs-ui--visible-invocations))
       (let ((id (plist-get run :id))
             (job (or (plist-get (plist-get run :job) :name)
                      (plist-get run :job-id) "")))
@@ -342,6 +347,77 @@ receipt acknowledges submission; only the worker can acknowledge application."
   "Review and reject a pending tool request."
   (interactive) (gptel-runner-background-command 'reject))
 
+(defun gptel-runner-jobs-ui--forgettable-at-point-p ()
+  "Return non-nil when the selected background run can be forgotten."
+  (ignore-errors
+    (gptel-runner-invocation-forgettable-p
+     (car (gptel-runner-jobs-ui--selection)))))
+
+(defun gptel-runner-jobs-ui--workflow-invocations ()
+  "Return visible background history for the workflow at point."
+  (let ((name (plist-get (car (gptel-runner-jobs-ui--selection)) :workflow)))
+    (cl-remove-if-not (lambda (run) (eq (plist-get run :workflow) name))
+                      (gptel-runner-jobs-ui--visible-invocations))))
+
+(defun gptel-runner-jobs-ui--forgettable-workflow-p ()
+  "Return non-nil when the selected workflow's background history is stopped."
+  (ignore-errors
+    (let ((runs (gptel-runner-jobs-ui--workflow-invocations)))
+      (and runs (cl-every #'gptel-runner-invocation-forgettable-p runs)))))
+
+(defun gptel-runner-jobs-ui--finished-invocations ()
+  "Return visible background invocations whose workers have stopped."
+  (cl-remove-if-not #'gptel-runner-invocation-forgettable-p
+                    (gptel-runner-jobs-ui--visible-invocations)))
+
+(defun gptel-runner-jobs-ui--forget (runs delete-checkpoints description)
+  "Confirm forgetting RUNS with DESCRIPTION and optional DELETE-CHECKPOINTS."
+  (unless runs (user-error "There are no background runs to forget"))
+  (unless (cl-every #'gptel-runner-invocation-forgettable-p runs)
+    (user-error "Background workers are still active; cancel them before cleanup"))
+  (when (yes-or-no-p
+         (format "Forget %s%s? " description
+                 (if delete-checkpoints " and delete recovery checkpoints" "")))
+    (dolist (run runs)
+      (gptel-runner-invocation-forget run delete-checkpoints)
+      (dolist (buffer (buffer-list))
+        (when (with-current-buffer buffer
+                (and (equal (nth 1 gptel-runner-background--target)
+                            (plist-get run :id))
+                     (not (buffer-modified-p))))
+          (kill-buffer buffer))))
+    (when-let* ((buffer (get-buffer gptel-runner-dashboard-buffer)))
+      (with-current-buffer buffer (gptel-runner-dashboard-refresh)))
+    (message "Forgot %d background run%s" (length runs)
+             (if (= (length runs) 1) "" "s"))))
+
+(defun gptel-runner-background-forget-run (&optional delete-checkpoint)
+  "Forget the selected background run, preserving its saved history.
+With prefix argument DELETE-CHECKPOINT, also delete its recovery checkpoint."
+  (interactive "P")
+  (let ((run (car (gptel-runner-jobs-ui--selection))))
+    (gptel-runner-jobs-ui--forget
+     (list run) delete-checkpoint (format "background run %s" (plist-get run :id)))))
+
+(defun gptel-runner-background-forget-workflow (&optional delete-checkpoints)
+  "Forget the selected workflow's background runs, keeping jobs and schedules.
+With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints.
+All workers belonging to the selected history must have stopped."
+  (interactive "P")
+  (let ((runs (gptel-runner-jobs-ui--workflow-invocations)))
+    (gptel-runner-jobs-ui--forget
+     runs delete-checkpoints
+     (format "%d background runs for workflow %S"
+             (length runs) (plist-get (car runs) :workflow)))))
+
+(defun gptel-runner-background-clear-finished (&optional delete-checkpoints)
+  "Forget all stopped background runs, preserving their saved history.
+With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
+  (interactive "P")
+  (let ((runs (gptel-runner-jobs-ui--finished-invocations)))
+    (gptel-runner-jobs-ui--forget
+     runs delete-checkpoints (format "%d finished background runs" (length runs)))))
+
 (transient-define-prefix gptel-runner-background-menu ()
   "Inspect and control the selected background invocation."
   [["Inspect"
@@ -363,7 +439,16 @@ receipt acknowledges submission; only the worker can acknowledge application."
     ("a" "Accept response" gptel-runner-background-accept)
     ("y" "Approve tools" gptel-runner-background-approve)
     ("n" "Reject tools" gptel-runner-background-reject)
-    ("x" "All actions" gptel-runner-background-command)]])
+    (":" "All actions" gptel-runner-background-command)]]
+  [["Manage"
+    ("x" "Forget run" gptel-runner-background-forget-run
+     :inapt-if-not gptel-runner-jobs-ui--forgettable-at-point-p)
+    ("X" "Forget workflow runs" gptel-runner-background-forget-workflow
+     :inapt-if-not gptel-runner-jobs-ui--forgettable-workflow-p)
+    ("C" "Clear finished background runs" gptel-runner-background-clear-finished
+     :inapt-if-not gptel-runner-jobs-ui--finished-invocations)
+    ("V" "Toggle column" gptel-runner-dashboard-toggle-column)
+    ("g" "Refresh" gptel-runner-dashboard-refresh)]])
 
 (defun gptel-runner-jobs-ui--row-action (action row)
   "Handle ACTION for external dashboard ROW and report whether handled."

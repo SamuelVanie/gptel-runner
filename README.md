@@ -1169,6 +1169,24 @@ checkpoint in your interactive Emacs.  Its action menu sends commands to the
 owning worker, including pause, resume, cancel, retry, continue, budget
 extensions, decisions, call feedback, and tool approval or rejection.
 
+The background `?` menu also provides `x` to forget the selected invocation
+(or the invocation owning the selected call), `X` to forget the selected
+workflow's background history, and `C` to clear all finished background runs.
+`:` opens the full command chooser.  Cleanup hides these entries across
+dashboard refreshes and Emacs restarts while preserving results, transcripts,
+artifacts, and recovery checkpoints.  With a prefix argument, cleanup also
+deletes the corresponding recovery checkpoints.  Job definitions and schedules
+remain installed; `X` is limited to background history and `C` leaves local
+runs alone.  Use the classic menu to clean up local runs.
+
+Cleanup is disabled while workers are alive, including paused workers, or
+their launch status is uncertain.  Cancel active background runs and wait for
+their workers to stop first.  Interrupted runs can be forgotten when their
+worker is confirmed dead.  Saved history remains accessible through
+`gptel-runner-invocation-list` and the inspection APIs; resuming, retrying, or
+continuing a forgotten invocation starts a new worker generation and makes
+it visible again.  Programmatically use `gptel-runner-invocation-forget`.
+
 The programmatic control interface is:
 
 ```elisp
