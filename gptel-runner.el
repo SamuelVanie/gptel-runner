@@ -6,7 +6,8 @@
 
 ;;; Commentary:
 
-;; gptel-runner schedules inspectable workflow ASTs over stateless agent calls.
+;; gptel-runner schedules inspectable workflow ASTs over stateless agent calls
+;; and synchronous Elisp steps with explicit outputs.
 ;; It provides sequence, branch, bounded repeat, and parallel nodes together
 ;; with budgets, retries, cancellation, durable snapshots, human feedback,
 ;; an event journal, and a dashboard.

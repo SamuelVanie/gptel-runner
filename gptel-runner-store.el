@@ -101,10 +101,13 @@ terminal run transitions bypass it, but their writes are still asynchronous."
   "Return a durable classification of RUN's terminal failure."
   (when (eq (gptel-runner-run-state run) 'failed)
     (let ((data (gptel-runner-run-terminal-data run)))
-      (if (and (listp data)
-               (memq (plist-get data :type) '(budget iteration-budget)))
-          (copy-tree data t)
-        '(:type other)))))
+      (cond
+       ((and (listp data)
+             (memq (plist-get data :type) '(budget iteration-budget)))
+        (copy-tree data t))
+       ((and (listp data) (eq (plist-get data :type) 'elisp-error))
+        '(:type elisp-error))
+       (t '(:type other))))))
 
 (defun gptel-runner-store--snapshot-tokens (run)
   "Return incremental serialization tokens for a compact snapshot of RUN."
@@ -506,7 +509,8 @@ calls, events, and transcripts are deliberately not restored."
                                :persist t))))
     (when (gethash run-id gptel-runner--runs)
       (user-error "Run %s is already loaded in this Emacs session" run-id))
-    (unless (gptel-runner-run-driver run)
+    (when (and (gptel-runner--needs-driver-p root)
+               (not (gptel-runner-run-driver run)))
       (user-error "No driver configured for restored run"))
     (gptel-runner--validate-workflow
      root (plist-get (gptel-runner-run-options run) :allow-writes)

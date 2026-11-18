@@ -1,7 +1,8 @@
 # gptel-runner
 
 `gptel-runner` is a deterministic workflow engine for stateless Emacs AI
-agent calls, with durable checkpoints and inspectable agent transcripts.  It
+agent calls and local Elisp steps, with durable checkpoints and inspectable
+results and agent transcripts.  It
 composes registered gptel presets into sequences,
 branches, bounded review loops, and parallel fan-out/synthesis workflows while
 keeping budgets, retries, cancellation, and terminal decisions in Emacs Lisp.
@@ -52,7 +53,7 @@ optional schema helpers and fan-out/synthesis workflows.
 
 ## Core API
 
-Workflows are data, built with `gptel-runner-agent-step`,
+Workflows are data, built with `gptel-runner-agent-step`, `gptel-runner-elisp-step`,
 `gptel-runner-sequence`, `gptel-runner-branch`,
 `gptel-runner-repeat-until`, and `gptel-runner-parallel`.  Define one with
 `gptel-runner-defworkflow`, then start it:
@@ -65,15 +66,88 @@ Workflows are data, built with `gptel-runner-agent-step`,
  :callback (lambda (run) (message "Run: %s" (gptel-runner-run-state run))))
 ```
 
-`gptel-runner-start` returns immediately.  Its callback runs exactly once.
+Agent calls execute asynchronously; Elisp steps execute synchronously when
+the scheduler admits them.  The run's callback runs exactly once.
 Use `gptel-runner-get` and `gptel-runner-put` for structured run-local values,
 `gptel-runner-iteration` for repeat counts, and
 `gptel-runner-show-dashboard` to inspect live and completed runs.
 
+### Mixing Elisp and agent steps
+
+Use `gptel-runner-elisp-step` for local operations such as reading files,
+transforming agent output, checking results, or publishing artifacts.  Its
+`:function` receives `(run node)` and returns the node's output.  `:save-as`
+makes that value available to later steps through `gptel-runner-get`:
+
+```elisp
+(gptel-runner-defworkflow mixed-pipeline (:max-calls 1)
+  (gptel-runner-sequence
+   :id 'pipeline
+   (gptel-runner-elisp-step
+    :id 'prepare :save-as 'source
+    :function (lambda (_run _node)
+                (with-temp-buffer
+                  (insert-file-contents "README.md")
+                  (buffer-string))))
+   (gptel-runner-agent-step
+    :id 'summarize :agent 'summarizer ; Register this agent first.
+    :prompt (lambda (run _node)
+              (concat "Summarize this project:\n"
+                      (gptel-runner-get run 'source)))
+    :save-as 'summary)
+   (gptel-runner-elisp-step
+    :id 'format :save-as 'report
+    :function (lambda (run _node)
+                (list :summary (gptel-runner-get run 'summary)
+                      :characters (length (gptel-runner-get run 'summary)))))))
+
+(setq my-run (gptel-runner-start 'mixed-pipeline :workspace "/path/to/project/"))
+;; Once the run succeeds:
+(gptel-runner-get my-run 'report)
+```
+
+The [mixed Elisp example](examples/mixed-elisp.el) includes a fake-driver
+invocation you can try without a model connection.  Entirely local workflows
+can load just `gptel-runner-flow` and need no driver or registered agents.
+
+Elisp steps work inside sequences, branches, parallel groups, and repeat
+bodies, including repeat history collection.  Any return value is valid,
+including `nil`, empty strings, lists, and hash tables.  Outputs and errors
+appear in the event journal and background history; the dashboard labels
+these calls `Elisp`.  Opening a local Elisp row shows the event journal.
+
+Each function runs in a temporary buffer with `default-directory` set to its
+effective `:workspace`.  Set `:workspace-mode 'write` for functions that modify
+the workspace and start the run with `:allow-writes t`.  The default mode is
+`read`; these declarations are scheduling metadata, not access restrictions.
+Elisp steps share concurrency limits and writer locks with agent calls,
+including background worker locks, and consume neither `:max-calls` nor
+`:max-requests`.  They execute trusted Lisp directly, without gptel tool
+confirmation.
+
+Functions run synchronously in the owning Emacs process, even inside a
+parallel group.  Keep them short; long computations block that process, and
+duration limits cannot preempt Lisp that does not yield.  The runner checks
+elapsed duration again before accepting a function's return value.  There is
+no asynchronous completion callback or agent conversation for Elisp steps.
+
+An error fails the node with `:type 'elisp-error`; quitting cancels it.
+`:retries` defaults to zero and opts into additional attempts after errors.
+Agent-only options such as `:prompt`, `:parser`, `:validator`, `:context`, and
+`:pause-after` are rejected on Elisp steps; inherited context still applies
+to agent steps.  Put transformations and validation in the function itself.
+
+Checkpoint recovery retains completed Elisp nodes and their saved outputs.
+Unfinished nodes restart, and `gptel-runner-retry :from-node` accepts Elisp
+step IDs.  Use stable explicit IDs and reload the workflow's function
+definitions before restoring a snapshot.  Saved values must be readable Lisp
+data.  Functions with side effects should tolerate repeated execution after
+retries or recovery; pausing or cancellation cannot undo effects already made.
+
 ### Per-node workspaces
 
-Set `:workspace` on an agent step to run it in a different directory.  An
-omitted or nil value inherits the workspace passed to `gptel-runner-start`.
+Set `:workspace` on an agent or Elisp step to run it in a different directory.
+An omitted or nil value inherits the workspace passed to `gptel-runner-start`.
 Relative paths are resolved from that run workspace; absolute paths are used
 directly.  Overrides must name existing directories and are validated before
 any calls start.
@@ -107,8 +181,8 @@ three repositories concurrently:
 Use `gptel-runner-node-workspace` in prompt and context functions to get the
 selected node directory.  `gptel-runner-run-workspace` continues to return the
 run's default.  Each worker buffer uses its node directory as
-`default-directory`.  Workspace overrides belong to agent steps; sequence,
-parallel, branch, and repeat nodes do not set a subtree workspace.
+`default-directory`.  Workspace overrides belong to agent and Elisp steps;
+sequence, parallel, branch, and repeat nodes do not set a subtree workspace.
 
 Within a run, writers targeting the same canonical directory (including
 symlink aliases) are serialized.  Writers in different directories can run
@@ -236,7 +310,7 @@ whereas `r` resumes an entire paused run.  Snapshot loading, column changes,
 and cleanup remain available in the menu without occupying permanent keys;
 all actions can also be invoked by command name through `M-x`.
 Workflow headers contain their run summary rows, and each run contains its
-agent-call rows; registered workflows with no runs remain visible.  The
+agent and Elisp call rows; registered workflows with no runs remain visible.  The
 automatic refresh timer is stopped when the dashboard buffer is closed or
 changes to another major mode.
 

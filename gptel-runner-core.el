@@ -109,7 +109,8 @@ deactivated, and to roll back a refused or failed admission attempt.")
 
 (cl-defstruct (gptel-runner-call
                (:constructor gptel-runner-call-create))
-  "One logical agent invocation."
+  "One logical agent or Elisp invocation.
+AGENT is nil for Elisp calls, which do not use a provider driver."
   id run node agent prompt workspace buffer fsm
   (state 'pending) (request-attempt 0) retry-timer (generation 0)
   response-parts result error started-at finished-at on-complete
@@ -146,7 +147,7 @@ An absent or nil override falls back to WORKSPACE."
     workspace))
 
 (defun gptel-runner-node-workspace (run node)
-  "Return the effective workspace for agent NODE in RUN.
+  "Return the effective workspace for agent or Elisp NODE in RUN.
 NODE's non-nil `:workspace' overrides the run workspace.  Relative paths
 are resolved from the run workspace, and symbolic links are canonicalized.
 Use this function in prompts and context functions that need NODE's directory."
@@ -543,9 +544,16 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
     (or (null maximum)
         (< (gptel-runner-budget-requests budget) maximum))))
 
+(defun gptel-runner--elisp-call-p (call)
+  "Return non-nil when CALL executes an Elisp step."
+  (eq (gptel-runner-node-kind (gptel-runner-call-node call)) 'elisp))
+
 (defun gptel-runner--writer-p (call)
-  "Return non-nil when CALL's agent writes its workspace."
-  (eq (gptel-runner-agent-workspace-mode (gptel-runner-call-agent call))
+  "Return non-nil when CALL declares writes to its workspace."
+  (eq (if (gptel-runner--elisp-call-p call)
+          (plist-get (gptel-runner-node-properties (gptel-runner-call-node call))
+                     :workspace-mode)
+        (gptel-runner-agent-workspace-mode (gptel-runner-call-agent call)))
       'write))
 
 (defun gptel-runner--call-observe (call generation type data)
@@ -667,6 +675,41 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
           call 'failed (list :type (or status 'driver-error)
                              :value value :metadata metadata))))))
 
+(defun gptel-runner--dispatch-elisp (call)
+  "Execute CALL's Elisp function and finish with its value or error.
+Keep the continuation outside the error handler so failures in downstream
+nodes are never attributed to this function.  Discard results if the run
+was cancelled or paused while the function yielded to Emacs."
+  (let* ((run (gptel-runner-call-run call))
+         (node (gptel-runner-call-node call))
+         (generation (gptel-runner-call-generation call)))
+    (when (and (eq (gptel-runner-run-state run) 'running)
+               (not (gptel-runner--call-terminal-p call)))
+      (setf (gptel-runner-call-state call) 'running)
+      (let ((outcome
+             (condition-case err
+                 (cons 'succeeded
+                       (with-temp-buffer
+                         (setq default-directory
+                               (gptel-runner-call-workspace call))
+                         (funcall (plist-get (gptel-runner-node-properties node)
+                                             :function)
+                                  run node)))
+               (error (cons 'failed (list :type 'elisp-error :error err)))
+               (quit (cons 'cancelled (list :type 'elisp-quit :error err))))))
+        (when (and (= generation (gptel-runner-call-generation call))
+                   (eq (gptel-runner-call-state call) 'running)
+                   (eq (gptel-runner-run-state run) 'running))
+          ;; CPU-bound Lisp cannot service the duration timer.  Check again
+          ;; before publishing its result or starting another workflow node.
+          (if (and (gptel-runner-run-duration-remaining run)
+                   (gptel-runner-run-active-started-at run)
+                   (>= (- (float-time) (gptel-runner-run-active-started-at run))
+                       (gptel-runner-run-duration-remaining run)))
+              (gptel-runner--duration-expired
+               run (gptel-runner-run-generation run))
+            (gptel-runner--finish-call call (car outcome) (cdr outcome))))))))
+
 (defun gptel-runner--dispatch-attempt (call)
   "Dispatch one provider attempt for CALL."
   (let ((run (gptel-runner-call-run call)))
@@ -765,12 +808,16 @@ Roll back acquisitions if any admission function refuses or signals."
               (setf (gptel-runner-call-started-at found) (float-time))
               (gptel-runner--emit run 'call-started
                                   (gptel-runner-call-node found) found nil)
-              (gptel-runner--dispatch-attempt found))
+              (if (gptel-runner--elisp-call-p found)
+                  (gptel-runner--dispatch-elisp found)
+                (gptel-runner--dispatch-attempt found)))
             (setq progress t)))))))
 
 (defun gptel-runner--submit-call (run node agent prompt done &optional repair-p)
-  "Queue an AGENT call for NODE in RUN, invoking DONE on terminalization."
-  (if (not (gptel-runner--consume-call run))
+  "Queue a call for NODE in RUN, invoking DONE on terminalization.
+AGENT and PROMPT are nil for Elisp steps.  REPAIR-P marks an agent repair."
+  (if (and (not (eq (gptel-runner-node-kind node) 'elisp))
+           (not (gptel-runner--consume-call run)))
       (progn
         (funcall done nil 'failed
                  (gptel-runner--budget-failure
@@ -801,9 +848,10 @@ Roll back acquisitions if any admission function refuses or signals."
       (setf (gptel-runner-call-retry-timer call) nil
             (gptel-runner-run-queue run)
             (delq call (gptel-runner-run-queue run)))
-      (when (memq (gptel-runner-call-state call)
-                  '(running retry-wait waiting-tool waiting-confirmation
-                    waiting-feedback))
+      (when (and (not (gptel-runner--elisp-call-p call))
+                 (memq (gptel-runner-call-state call)
+                       '(running retry-wait waiting-tool waiting-confirmation
+                         waiting-feedback)))
         (ignore-errors
           (gptel-runner-driver-cancel (gptel-runner-run-driver run) call)))
       (gptel-runner--finish-call call 'cancelled (or reason 'user)))))
@@ -828,8 +876,9 @@ feedback without asking the driver to stop external work."
           (ignore-errors
             (gptel-runner-driver-await-feedback
              (gptel-runner-run-driver run) call))
-        (when (memq (gptel-runner-call-state call)
-                    '(running retry-wait waiting-tool waiting-confirmation))
+        (when (and (not (gptel-runner--elisp-call-p call))
+                   (memq (gptel-runner-call-state call)
+                         '(running retry-wait waiting-tool waiting-confirmation)))
           (ignore-errors
             (gptel-runner-driver-pause
              (gptel-runner-run-driver run) call))))
@@ -852,6 +901,8 @@ latest response to the workflow."
    (list (and (boundp 'gptel-runner--call) gptel-runner--call) 'user))
   (unless (gptel-runner-call-p call)
     (user-error "No runner call is associated with this buffer"))
+  (when (gptel-runner--elisp-call-p call)
+    (user-error "Elisp steps have no feedback conversation; pause the run instead"))
   (unless (gptel-runner--suspend-call
            call 'waiting-feedback (or reason 'user) t)
     (user-error "Call %s cannot be paused from state %s"

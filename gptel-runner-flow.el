@@ -31,6 +31,20 @@ nil values inherit the workspace passed to `gptel-runner-start'."
    :id (gptel-runner--node-id properties 'agent)
    :kind 'agent :properties properties))
 
+(defun gptel-runner-elisp-step (&rest properties)
+  "Return an Elisp node described by PROPERTIES.
+`:function' is required and receives (RUN NODE).  Its return value, including
+nil, is the node output; `:save-as' stores it on the run blackboard.
+Optional `:id', `:workspace', `:workspace-mode' (read or write), and `:retries'
+customize execution.  The function runs synchronously in a temporary buffer
+with `default-directory' set to the node workspace.  Write steps require
+`:allow-writes t' and share workspace locks with agent steps.
+Errors fail the step; explicit `:retries' allow that many additional attempts.
+Elisp steps consume concurrency slots but no agent-call or request budget."
+  (gptel-runner-node-create
+   :id (gptel-runner--node-id properties 'elisp)
+   :kind 'elisp :properties properties))
+
 (defun gptel-runner-sequence (&rest arguments)
   "Return a fail-fast sequence described by ARGUMENTS.
 Leading keyword/value pairs set properties such as `:id' and inherited
@@ -232,7 +246,7 @@ Return a cons of label and text, or nil when a function omits its context."
   (let* ((kind (gptel-runner-node-kind node))
          (props (gptel-runner-node-properties node)))
     (pcase kind
-      ((or 'agent 'parallel) (plist-get props :save-as))
+      ((or 'agent 'elisp 'parallel) (plist-get props :save-as))
       ('repeat (plist-get props :save-history-as)))))
 
 (defun gptel-runner--find-node (root id)
@@ -265,14 +279,23 @@ Return a cons of label and text, or nil when a function omits its context."
                            (gptel-runner-node-children node))))))
 
 (defun gptel-runner--node-writable-p (node)
-  "Return non-nil when NODE has a registered write agent."
-  (or (and (eq (gptel-runner-node-kind node) 'agent)
+  "Return non-nil when NODE or a descendant declares workspace writes."
+  (or (and (eq (gptel-runner-node-kind node) 'elisp)
+           (eq (plist-get (gptel-runner-node-properties node) :workspace-mode)
+               'write))
+      (and (eq (gptel-runner-node-kind node) 'agent)
            (let ((agent (gethash
                          (plist-get (gptel-runner-node-properties node) :agent)
                          gptel-runner--agents)))
              (and agent
                   (eq (gptel-runner-agent-workspace-mode agent) 'write))))
       (cl-some #'gptel-runner--node-writable-p
+               (gptel-runner-node-children node))))
+
+(defun gptel-runner--needs-driver-p (node)
+  "Return non-nil when NODE or a descendant invokes an agent."
+  (or (eq (gptel-runner-node-kind node) 'agent)
+      (cl-some #'gptel-runner--needs-driver-p
                (gptel-runner-node-children node))))
 
 (defun gptel-runner--validate-workflow
@@ -300,9 +323,26 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
             (when (plist-member props :context)
               (gptel-runner--validate-context
                (plist-get props :context) (format "node %S" id)))
-            (when (and (plist-get props :workspace) (not (eq kind 'agent)))
-              (user-error "Only agent nodes support :workspace (node %S)" id))
+            (when (and (plist-get props :workspace)
+                       (not (memq kind '(agent elisp))))
+              (user-error
+               "Only agent and Elisp nodes support :workspace (node %S)" id))
+            (when (memq kind '(agent elisp))
+              (let ((retries (or (plist-get props :retries) 0)))
+                (unless (and (integerp retries) (>= retries 0))
+                  (user-error "Node %S has invalid :retries" id))))
             (pcase kind
+              ('elisp
+               (unless (functionp (plist-get props :function))
+                 (user-error "Elisp node %S needs a :function" id))
+               (unless (memq (or (plist-get props :workspace-mode) 'read)
+                             '(read write))
+                 (user-error "Elisp node %S has invalid :workspace-mode" id))
+               (gptel-runner--node-workspace node workspace)
+               (dolist (key '(:agent :prompt :parser :validator :repair-invalid
+                             :pause-after :context))
+                 (when (plist-member props key)
+                   (user-error "Elisp node %S does not support %S" id key))))
               ('agent
                (let ((agent (gptel-runner--agent (plist-get props :agent)))
                      (directory (gptel-runner--node-workspace node workspace)))
@@ -314,10 +354,7 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
                   (format "agent %S" (gptel-runner-agent-name agent))
                   directory))
                (unless (plist-member props :prompt)
-                 (user-error "Agent node %S has no :prompt" id))
-               (let ((retries (or (plist-get props :retries) 0)))
-                 (unless (and (integerp retries) (>= retries 0))
-                   (user-error "Agent node %S has invalid :retries" id))))
+                 (user-error "Agent node %S has no :prompt" id)))
               ('repeat
                (let ((max (plist-get props :max)))
                  (unless (and (integerp max) (> max 0))
@@ -605,6 +642,30 @@ ORIGINAL-PROMPT is included because each repair call is stateless."
       (gptel-runner--set-node-state run node 'running)
       (resolve-and-launch))))
 
+(defun gptel-runner--execute-elisp (run node done)
+  "Execute Elisp NODE in RUN and invoke DONE with state and result."
+  (let* ((props (gptel-runner-node-properties node))
+         (retries (or (plist-get props :retries) 0)))
+    (cl-labels
+        ((launch ()
+           (when (eq (gptel-runner-run-state run) 'running)
+             (gptel-runner--submit-call
+              run node nil nil
+              (lambda (_call state value)
+                (if (and (eq state 'failed) (> retries 0)
+                         (eq (gptel-runner-run-state run) 'running))
+                    (progn
+                      (cl-decf retries)
+                      (gptel-runner--emit run 'elisp-step-retry node nil value)
+                      (launch))
+                  (when (eq state 'succeeded)
+                    (when-let* ((key (plist-get props :save-as)))
+                      (gptel-runner-put run key value)))
+                  (gptel-runner--set-node-state run node state value)
+                  (funcall done state value)))))))
+      (gptel-runner--set-node-state run node 'running)
+      (launch))))
+
 (defun gptel-runner--execute-sequence (run node done)
   "Execute sequence NODE in RUN and invoke DONE."
   (let ((remaining (copy-sequence (gptel-runner-node-children node))))
@@ -767,7 +828,7 @@ Return the new history entry, or nil when NODE does not collect history."
           (unless finalized
             (setq finalized t)
             (when-let ((key (plist-get props :save-as)))
-              (gptel-runner-put run key (nreverse results)))
+              (gptel-runner-put run key value))
             (gptel-runner--set-node-state run node state value)
             (funcall done state value)))
          (cancel-others
@@ -824,7 +885,7 @@ Return the new history entry, or nil when NODE does not collect history."
     (cond
      ((eq saved-state 'succeeded)
       (funcall done 'succeeded
-               (when (eq (gptel-runner-node-kind node) 'agent)
+               (when (memq (gptel-runner-node-kind node) '(agent elisp))
                  (when-let ((key (plist-get
                                   (gptel-runner-node-properties node)
                                   :save-as)))
@@ -836,6 +897,7 @@ Return the new history entry, or nil when NODE does not collect history."
                  (gptel-runner-run-node-states run)))
       (pcase (gptel-runner-node-kind node)
         ('agent (gptel-runner--execute-agent run node done))
+        ('elisp (gptel-runner--execute-elisp run node done))
         ('sequence (gptel-runner--execute-sequence run node done))
         ('branch (gptel-runner--execute-branch run node done))
         ('repeat (gptel-runner--execute-repeat run node done))
@@ -873,15 +935,17 @@ INPUTS is an alist or hash table.  Runner-owned history keys are reserved."
               max-concurrency max-duration allow-writes
               allow-unconfirmed-tools decision-memory persist context callback
               &allow-other-keys)
-  "Start WORKFLOW with keyword ARGUMENTS and return its run immediately.
-GOAL and WORKSPACE describe the stateless task.  Agent nodes may override
+  "Start WORKFLOW with keyword ARGUMENTS and return its run.
+Agent calls are asynchronous; admitted Elisp steps run synchronously.
+GOAL and WORKSPACE describe the task.  Agent and Elisp nodes may override
 WORKSPACE with their own `:workspace' property.  An omitted WORKSPACE uses
 the workflow's `:workspace' default, or `default-directory'.  INPUTS is an
 alist or hash table copied into the run blackboard before any node starts.
 DRIVER defaults to
-`gptel-runner-default-driver'.  MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
+`gptel-runner-default-driver'; Elisp-only workflows need no driver.
+MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
 MAX-DURATION override workflow defaults.  ALLOW-WRITES must be explicitly
-non-nil for any workflow containing a write agent.
+non-nil for any workflow containing a write step.
 ALLOW-UNCONFIRMED-TOOLS disables gptel confirmation only when explicitly set.
 DECISION-MEMORY controls automatic propagation of recorded decisions and
 defaults to non-nil.
@@ -901,8 +965,7 @@ CALLBACK runs exactly once with the terminal run."
                 (t (user-error "Invalid workflow: %S" workflow))))
          (defaults (gptel-runner-workflow-options definition))
          (root (gptel-runner-workflow-root definition))
-         (selected-driver (or driver gptel-runner-default-driver
-                              (user-error "No gptel-runner driver configured")))
+         (selected-driver (or driver gptel-runner-default-driver))
          (selected-workspace
           (gptel-runner--option :workspace arguments defaults default-directory))
          (directory
@@ -942,6 +1005,8 @@ CALLBACK runs exactly once with the terminal run."
      root allow-writes directory
      (list (cons "workflow" (plist-get defaults :context))
            (cons "run" (plist-get options :context))))
+    (when (and (gptel-runner--needs-driver-p root) (not selected-driver))
+      (user-error "No gptel-runner driver configured"))
     (let* ((budget (gptel-runner-budget-create
                     :max-requests (plist-get options :max-requests)
                     :max-calls (plist-get options :max-calls)
@@ -1237,7 +1302,7 @@ Return an ordered plist describing the increments that were reapplied."
         node))))
 
 (defun gptel-runner--retry-node-path (run node-id)
-  "Return the path to an executed agent NODE-ID in RUN, or signal an error."
+  "Return the path to an executed step NODE-ID in RUN, or signal an error."
   (let ((root (gptel-runner-workflow-root (gptel-runner-run-workflow run))))
     (cl-labels
         ((walk (node)
@@ -1248,8 +1313,8 @@ Return an ordered plist describing the increments that were reapplied."
                (cons node path)))))
       (let* ((path (walk root))
              (target (car (last path))))
-        (unless (and target (eq (gptel-runner-node-kind target) 'agent))
-          (user-error "No agent node %S in this workflow" node-id))
+        (unless (and target (memq (gptel-runner-node-kind target) '(agent elisp)))
+          (user-error "No agent or Elisp node %S in this workflow" node-id))
         (dolist (node path)
           (unless (memq (gethash (gptel-runner-node-id node)
                                 (gptel-runner-run-node-states run))
@@ -1258,7 +1323,7 @@ Return an ordered plist describing the increments that were reapplied."
         path))))
 
 (defun gptel-runner--prepare-retry-path (run path)
-  "Invalidate PATH's agent and dependent sequence nodes in RUN.
+  "Invalidate PATH's step and dependent sequence nodes in RUN.
 Completed preceding nodes and independent parallel siblings remain complete.
 Enclosing repeat histories and counters are retained."
   (cl-labels
@@ -1293,12 +1358,13 @@ which restart as a whole.  The failed, blocked, stalled, or cancelled
 checkpoint is reset and retried; later skipped nodes remain gated until it
 succeeds.
 
-FROM-NODE explicitly selects an executed agent node by ID, even if its call
+FROM-NODE explicitly selects an executed agent or Elisp node by ID, even if it
 succeeded but its verdict blocked a surrounding loop.  Rerun that node and
 later sequence nodes, retaining earlier results and independent parallel
 siblings.  Enclosing repeats retain their history and consume another
 iteration on completion.  FEEDBACK is an optional string added to the selected
-node's next prompt, or the next dispatched prompt when FROM-NODE is nil.
+agent's next prompt, or the next dispatched agent prompt when FROM-NODE is nil
+or selects an Elisp step.
 
 Budget-exhaustion failures must normally use `gptel-runner-extend', and repeat
 limits must normally use `gptel-runner-extend-repeat'.  When the failed work
@@ -1320,6 +1386,14 @@ use it for the retried run's next terminal transition."
                          (gptel-runner--terminal-failure-data run)))
            (budgets (and (eq state 'failed)
                          (gptel-runner--budget-kinds-at-limit run)))
+           ;; Retrying a local error needs no provider capacity.  If a later
+           ;; agent needs more, its ordinary dispatch enforces that budget.
+           (budgets (if (and (eq (plist-get failure :type) 'elisp-error)
+                             (or (null path)
+                                 (eq (gptel-runner-node-kind (car (last path)))
+                                     'elisp)))
+                        (remq 'calls (remq 'requests budgets))
+                      budgets))
            (context (gptel-runner-run-extension-context run))
            (missing
             (cl-remove-if
@@ -1363,7 +1437,11 @@ use it for the retried run's next terminal transition."
         (remhash 'gptel-runner-retry-feedback (gptel-runner-run-blackboard run))
         (when feedback
           (puthash 'gptel-runner-retry-feedback
-                   (list :node from-node :text feedback)
+                   (list :node (and path
+                                    (eq (gptel-runner-node-kind (car (last path)))
+                                        'agent)
+                                    from-node)
+                         :text feedback)
                    (gptel-runner-run-blackboard run)))
         (gptel-runner--restart-run
          run 'run-retried

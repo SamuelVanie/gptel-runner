@@ -77,8 +77,10 @@
                  (gptel-runner-ui--row-vector
                   `((node . ,(format "%s" (plist-get call :node)))
                     (job . ,job)
-                    (agent . ,(if (plist-get call :agent)
-                                  (format "%s" (plist-get call :agent)) ""))
+                    (agent . ,(cond ((eq (plist-get call :kind) 'elisp) "Elisp")
+                                   ((plist-get call :agent)
+                                    (format "%s" (plist-get call :agent)))
+                                   (t "")))
                     (call . ,(plist-get call :id))
                     (state . ,(gptel-runner-ui--state (plist-get call :state)))
                     (elapsed . ,(gptel-runner-jobs-ui--elapsed call))

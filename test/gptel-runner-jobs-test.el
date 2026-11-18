@@ -465,6 +465,45 @@
                     (file-name-as-directory (file-truename nested))))
      (should-not (gethash 'job-inherited-workspace gptel-runner--workflows)))))
 
+(ert-deftest gptel-runner-jobs-elisp-only-worker-retains-results-and-artifacts ()
+  (gptel-runner-jobs-test--isolated
+    (let ((init (expand-file-name "elisp-init.el" gptel-runner-job-directory)))
+      (gptel-runner-jobs--write
+       init
+       '(progn
+          (require 'gptel-runner)
+          (setq gptel-runner-default-driver nil)
+          (gptel-runner-defworkflow job-elisp-only nil
+            (gptel-runner-sequence
+             :id 'pipeline
+             (gptel-runner-elisp-step
+              :id 'prepare :save-as 'report
+              :function (lambda (run _node)
+                          (upcase (gptel-runner-get run 'subject))))
+             (gptel-runner-elisp-step
+              :id 'publish :save-as 'artifact :workspace-mode 'write
+              :function (lambda (run _node)
+                          (with-temp-file "report.txt"
+                            (insert (gptel-runner-get run 'report)))
+                          (gptel-runner-publish-artifact
+                           run "report" "report.txt" "text/plain")))))))
+      (let* ((job (gptel-runner-jobs-test--job
+                   'job-elisp-only "Local Lisp" init '(:allow-writes t)))
+             (invocation (gptel-runner-jobs-test--finished (gptel-runner-job-run job)))
+             (calls (plist-get invocation :calls)))
+        (should (eq (plist-get invocation :state) 'succeeded))
+        (should (= (length calls) 2))
+        (dolist (call calls)
+          (should (eq (plist-get call :kind) 'elisp))
+          (should-not (plist-get call :agent))
+          (should (zerop (plist-get call :attempts))))
+        (should (equal (plist-get (gptel-runner-invocation-call invocation (car calls))
+                                  :result)
+                       "PARALLEL PROCESSES"))
+        (should (equal (alist-get 'report (gptel-runner-invocation-outputs invocation))
+                       "PARALLEL PROCESSES"))
+        (should (= (length (plist-get invocation :artifacts)) 1))))))
+
 (ert-deftest gptel-runner-jobs-bootstrap-captures-and-preserves-library-paths ()
   (gptel-runner-jobs-test--isolated
    (let* ((default-directory (file-name-as-directory gptel-runner-job-directory))

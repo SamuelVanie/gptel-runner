@@ -226,8 +226,9 @@ An elided value retains its complete unpropertized text as hover help."
      (list 'call (gptel-runner-call-id call))
      (gptel-runner-ui--row-vector
       `((node . ,(format "%s" (gptel-runner-node-id node)))
-        (agent . ,(when-let* ((agent (gptel-runner-call-agent call)))
-                    (format "%s" (gptel-runner-agent-name agent))))
+        (agent . ,(if (gptel-runner--elisp-call-p call) "Elisp"
+                    (when-let* ((agent (gptel-runner-call-agent call)))
+                      (format "%s" (gptel-runner-agent-name agent)))))
         (call . ,(gptel-runner-call-id call))
         (state . ,(gptel-runner-ui--call-state call))
         (elapsed . ,(gptel-runner-ui--elapsed run call))
@@ -509,6 +510,7 @@ CALL may supply explicit provenance when this function is called from Lisp."
   "Return non-nil when the call at point can be paused for feedback."
   (let ((call (gptel-runner-ui--call-at-point)))
     (and call
+         (not (gptel-runner--elisp-call-p call))
          (not (gptel-runner--call-terminal-p call))
          (not (memq (gptel-runner-call-state call)
                     '(paused waiting-feedback))))))
@@ -629,9 +631,10 @@ Visit a call's worker transcript, or inspect a run's event journal."
   (unless (run-hook-with-args-until-success
            'gptel-runner-dashboard-row-action-functions
            'open (tabulated-list-get-id))
-    (if (gptel-runner-ui--call-at-point)
-        (gptel-runner-dashboard-visit-worker)
-      (gptel-runner-dashboard-inspect-events))))
+    (let ((call (gptel-runner-ui--call-at-point)))
+      (if (and call (not (gptel-runner--elisp-call-p call)))
+          (gptel-runner-dashboard-visit-worker)
+        (gptel-runner-dashboard-inspect-events)))))
 
 (defun gptel-runner-dashboard-visit-worker ()
   "Visit the retained or active worker transcript for the call at point."

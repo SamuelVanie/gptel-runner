@@ -903,7 +903,9 @@ Opaque runtime objects and circular references are represented by type."
                (transcript (concat base ".txt"))
                (record (list :id (gptel-runner-call-id call) :epoch epoch
                              :node (gptel-runner-node-id (gptel-runner-call-node call))
-                             :agent (gptel-runner-agent-name (gptel-runner-call-agent call))
+                             :kind (gptel-runner-node-kind (gptel-runner-call-node call))
+                             :agent (when-let* ((agent (gptel-runner-call-agent call)))
+                                      (gptel-runner-agent-name agent))
                              :state (gptel-runner-call-state call)
                              :generation (gptel-runner-call-generation call)
                              :started-at (gptel-runner-call-started-at call)
