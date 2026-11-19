@@ -277,13 +277,10 @@ must route replies back to that owning process.")
            owner (overlay-get overlay 'gptel-tool) fsm scope overlay))))
     prompt))
 
-(defun gptel-runner-gptel-answer-interaction (call interaction-id approve
-                                                &optional allow-outside)
-  "Answer CALL's pending INTERACTION-ID, running tools when APPROVE is non-nil.
-Rejecting cancels the call.  Replies are accepted once and only while the
-interaction's generation is current.  ALLOW-OUTSIDE uses gptel-agent's public
-approval action to remember outside file access in this request's conversation.
-Ordinary confirmations and file reviews remain enabled."
+(defun gptel-runner-gptel--answer-interaction (call interaction-id decision &optional allow-outside)
+  "Apply DECISION to CALL's live INTERACTION-ID once.
+DECISION is `approve', `deny', or `cancel'.  ALLOW-OUTSIDE is an explicit
+outside-file grant for the conversation owning an approved request."
   (unless (gptel-runner-call-p call)
     (user-error "Unknown runner call"))
   (let* ((pending (cl-find interaction-id (gptel-runner-gptel--interactions call)
@@ -295,7 +292,7 @@ Ordinary confirmations and file reviews remain enabled."
                  (gptel-runner-gptel--interaction-live-p call pending))
       (user-error "Interaction %s is no longer pending" interaction-id))
     (when (and allow-outside
-               (not (and approve (plist-get description :outside-access)
+               (not (and (eq decision 'approve) (plist-get description :outside-access)
                          (fboundp 'gptel-agent-allow-outside-access))))
       (user-error "This request cannot grant outside file access"))
     ;; Consume before executing: synchronous tools may create a new gate.
@@ -305,42 +302,65 @@ Ordinary confirmations and file reviews remain enabled."
     (gptel-runner--emit
      (gptel-runner-call-run call) 'interaction-answered
      (gptel-runner-call-node call) call
-     (list :id interaction-id :approved (and approve t)
+     (list :id interaction-id :approved (eq decision 'approve) :decision decision
            :allow-outside (and allow-outside t)))
-    (if approve
-        (with-current-buffer (or (plist-get pending :buffer)
-                                 (gptel-runner-call-buffer call))
-          (gptel-runner-gptel--observe
-           call 'waiting-tool
-           (mapcar (lambda (tool) (plist-get tool :name))
-                   (plist-get description :tools)))
-          (unwind-protect
-              (if allow-outside
-                  (progn
-                    ;; Retain owners for revocation, never for persistence or
-                    ;; inheritance by another call or child conversation.
-                    (setf (gptel-runner-call-driver-data call)
-                          (plist-put
-                           (gptel-runner-call-driver-data call) :outside-access-buffers
-                           (cl-adjoin
-                            (current-buffer)
-                            (plist-get (gptel-runner-call-driver-data call)
-                                       :outside-access-buffers))))
-                    (gptel-agent-allow-outside-access (plist-get pending :tools)))
-                (gptel--accept-tool-calls (plist-get pending :tools)))
-            (gptel-runner-gptel--sync-interactions call)))
-      (gptel-runner-abort-call call 'tool-rejected))
+    (if (eq decision 'cancel)
+        (gptel-runner-abort-call call 'tool-rejected)
+      (with-current-buffer (or (plist-get pending :buffer)
+                               (gptel-runner-call-buffer call))
+        (gptel-runner-gptel--observe
+         call 'waiting-tool
+         (mapcar (lambda (tool) (plist-get tool :name))
+                 (plist-get description :tools)))
+        (unwind-protect
+            (cond
+             ((eq decision 'deny)
+              ;; Give each tool its result in the requesting conversation.
+              (dolist (tool (plist-get pending :tools))
+                (funcall (nth 2 tool) "Tool call rejected by user.")))
+             (allow-outside
+              ;; Retain owners for revocation, never for persistence or
+              ;; inheritance by another call or child conversation.
+              (setf (gptel-runner-call-driver-data call)
+                    (plist-put
+                     (gptel-runner-call-driver-data call) :outside-access-buffers
+                     (cl-adjoin (current-buffer)
+                               (plist-get (gptel-runner-call-driver-data call)
+                                          :outside-access-buffers))))
+              (gptel-agent-allow-outside-access (plist-get pending :tools)))
+             (t (gptel--accept-tool-calls (plist-get pending :tools))))
+          (gptel-runner-gptel--sync-interactions call))))
     call))
+
+(defun gptel-runner-gptel-answer-interaction (call interaction-id approve
+                                                &optional allow-outside)
+  "Answer CALL's pending INTERACTION-ID, running tools when APPROVE is non-nil.
+Rejecting cancels the call.  Replies are accepted once and only while the
+interaction's generation is current.  ALLOW-OUTSIDE uses gptel-agent's public
+approval action to remember outside file access in this request's conversation.
+Ordinary confirmations and file reviews remain enabled."
+  (gptel-runner-gptel--answer-interaction
+   call interaction-id (if approve 'approve 'cancel) allow-outside))
+
+(defun gptel-runner-gptel--check-interaction-ids (call ids)
+  "Check that every displayed interaction in IDS is distinct and live on CALL."
+  (unless (and ids (equal ids (delete-dups (copy-sequence ids))))
+    (user-error "Supply a nonempty set of distinct interaction IDs"))
+  (dolist (id ids)
+    (unless (gptel-runner-gptel-interaction-pending-p call id)
+      (user-error "Interaction %s is no longer pending; refresh the panel" id))))
+
+(defun gptel-runner-gptel-deny-interactions (call ids)
+  "Decline exactly the pending request IDS on CALL and let their agents continue."
+  (gptel-runner-gptel--check-interaction-ids call ids)
+  (dolist (id ids)
+    (gptel-runner-gptel--answer-interaction call id 'deny)))
 
 (defun gptel-runner-gptel-approve-interactions (call ids &optional allow-outside)
   "Approve exactly IDS on CALL, optionally remembering ALLOW-OUTSIDE access.
 Validate the complete displayed set before executing any tools.  New requests
 created by these tools are never included.  Every execution rechecks liveness."
-  (unless (and ids (equal ids (delete-dups (copy-sequence ids))))
-    (user-error "Supply a nonempty set of distinct interaction IDs"))
-  (dolist (id ids)
-    (unless (gptel-runner-gptel-interaction-pending-p call id)
-      (user-error "Interaction %s is no longer pending; refresh the panel" id)))
+  (gptel-runner-gptel--check-interaction-ids call ids)
   (let ((outside-ids
          (cl-loop for pending in (gptel-runner-gptel--interactions call)
                   for description = (plist-get pending :description)

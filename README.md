@@ -1199,9 +1199,18 @@ recurring triggers, use `gptel-runner-job-schedule` as described below.
 (setq my-invocation (gptel-runner-job-run "parallel-example"))
 ```
 
-Use `M-x gptel-runner-show-jobs` to inspect registered jobs and their
-schedules or start a run. Use `M-x gptel-runner-show-dashboard` to follow
-invocations and interact with running workflows.
+In `M-x gptel-runner-show-jobs`, select a job and press `?` or `RET` for
+its menu. Use `r` in the menu to start it and `R` to visit the run dashboard.
+The following shortcuts also work directly on a job row.
+
+| Key | Action |
+| --- | --- |
+| `x` | Delete this job's saved definition and schedule after confirmation. Existing workers continue and their history stays available. |
+| `C` | Clear this job's finished runs from the run dashboard after confirmation. Active runs stay visible, including paused workers. |
+
+Cleanup uses the job ID, so jobs that share a workflow can be cleared
+independently. Saved results and chats stay on disk. Use `C-u C` to delete
+the cleared runs' recovery checkpoints as well.
 
 Workers automatically load `gptel` and `gptel-agent` **before** the job's
 `:init-file`, then call `gptel-agent-update` to discover agent definitions
@@ -1306,13 +1315,20 @@ and replies. From a waiting node, `? f` sends feedback to its worker.
 Use `n` and `p` to move between nodes, `TAB` to move between buttons, and
 `q` to return to the dashboard.
 
-Requests are grouped by node, including requests from its child conversations.
-Choose **Approve once** for an individual request, or **Approve all N pending**
-(`a`) for all requests currently displayed on that node.  The displayed arguments
-are the review step; clicking an approval submits it without another prompt.
-**Reject & cancel node** makes the effect of rejection explicit.  Pending counts
-appear in the dashboard.  Submission receipts and worker errors appear inside
-the panel, without opening a receipt buffer; `? h` still opens the full history.
+Press `RET` or `? y` on a node with pending permissions. Its panel shows
+the tool arguments for each request, including those from child conversations.
+
+| Scope in the node panel | Approve once | Deny and let the agent continue |
+| --- | --- | --- |
+| Request at point | `y` | `d` |
+| Requests in the active region (set the mark with `C-SPC`) | `y` | `d` |
+| All pending requests shown for this node and its children | `a` | `D` |
+
+The worker applies each decision to the selected request IDs. Denial
+returns a rejection to the requesting conversation.
+Choose **Reject & cancel node** to stop the owning node and its children.
+The panel shows submission receipts and worker errors. Use `? h` for the
+full receipt history, `? v` for the node's chat, and `? j` for child transcripts.
 
 For outside-directory file requests from `gptel-agent`, **Approve all + allow
 outside paths** (`A`) also remembers outside access in the conversations owning
@@ -1353,9 +1369,10 @@ operation, target generation, and current state before applying a command.
 One-time approvals authorize only the exact request IDs displayed in the
 panel, even when submitted as a group; stale approvals cannot authorize a later
 tool call.  The separate outside-path option explicitly grants future file
-access using gptel-agent's scoped approval API.  Rejecting an
-approval cancels that call.  Tool confirmation policy remains explicit;
-running in the background does not automatically authorize tools.
+access using gptel-agent's scoped approval API.  The `deny` command takes
+`:call-id`, `:call-epoch`, `:generation`, and a list of `:interaction-ids`.
+The `reject` command cancels the owning call. Background workers follow
+the configured tool confirmation policy.
 
 Pipeline agent presets can include `Agent`, `Discussion`, and
 `DiscussionControl` from `gptel-agent`.  The runner applies the preset's prompt
@@ -1387,8 +1404,8 @@ behavior.
 In jobs, tool confirmations from subagents and discussions appear as pending
 interactions on the owning node.  Each includes its source buffer, tool names,
 and arguments; several children can await approval simultaneously.  Approve
-or reject them through the existing background commands.  Approval executes
-in the child request's context, and rejection cancels the owning node.
+or deny them through the node panel. Each child receives its own tool
+results or denials.
 Replies to cancelled, completed, or superseded requests cannot run tools.
 Question forms and separate interactive file-review interfaces still require
 their own headless adapters; this bridge handles gptel tool confirmations.

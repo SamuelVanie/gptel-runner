@@ -21,8 +21,10 @@
 (declare-function gptel-runner-launchd-start-worker "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-install "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-remove "gptel-runner-launchd")
+(declare-function gptel-runner-launchd-delete-schedule "gptel-runner-launchd")
 (declare-function gptel-runner-gptel-answer-interaction "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-approve-interactions "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-deny-interactions "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-revoke-outside-access "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-interaction-pending-p "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-feedback "gptel-runner-gptel")
@@ -78,7 +80,7 @@ executes directly and does not need this launcher."
 (define-error 'gptel-runner-job-storage-error "Background job storage failed")
 (defconst gptel-runner-jobs--operations
   '(pause resume cancel retry rerun continue extend extend-repeat decision
-	  pause-call cancel-call feedback accept approve approve-all reject
+	  pause-call cancel-call feedback accept approve approve-all deny reject
           revoke-outside))
 
 (defvar gptel-runner-headless nil)
@@ -390,7 +392,7 @@ history, and running workers."
    id (lambda (job)
         (when (eq system-type 'darwin)
           (require 'gptel-runner-launchd)
-          (gptel-runner-launchd-remove job))
+          (gptel-runner-launchd-delete-schedule job))
         (delete-file (gptel-runner-jobs--definition-file (plist-get job :id))))))
 
 (defun gptel-runner-jobs--manifest-file (invocation)
@@ -852,6 +854,7 @@ invocation is recorded as skipped without starting another worker."
             ('accept (cons :result call-keys))
             ('approve (append '(:interaction-id :generation :allow-outside) call-keys))
             ('approve-all (append '(:interaction-ids :generation :allow-outside) call-keys))
+            ('deny (append '(:interaction-ids :generation) call-keys))
             ('revoke-outside (cons :generation call-keys))
             ('reject (append '(:interaction-id :generation) call-keys))))
          seen)
@@ -881,7 +884,7 @@ invocation is recorded as skipped without starting another worker."
                    ('extend-repeat '(:node :additional-iterations))
                    ((or 'pause-call 'cancel-call 'accept) call-keys)
                    ('revoke-outside (cons :generation call-keys))
-                   ('approve-all (append '(:interaction-ids :generation) call-keys))
+                   ((or 'approve-all 'deny) (append '(:interaction-ids :generation) call-keys))
                    ('feedback (cons :feedback call-keys))
                    ((or 'approve 'reject) (cons :interaction-id call-keys))))
       (unless (plist-get arguments key)
@@ -1207,6 +1210,11 @@ Opaque runtime objects and circular references are represented by type."
       (error "Unsupported worker operation: %S" operation))
     (unless (and (proper-list-p args) (cl-evenp (length args)))
       (error "Command arguments must be a property list"))
+    ;; A stale selection can be rejected cleanly before the first decision.
+    ;; After a tool callback runs, a failure may indicate partial application.
+    (dolist (id (plist-get args :interaction-ids))
+      (unless (gptel-runner-gptel-interaction-pending-p call id)
+        (user-error "Interaction %s is no longer pending; refresh the panel" id)))
     (setq gptel-runner-jobs--command-started t)
     (pcase operation
       ('pause (gptel-runner-pause-run run))
@@ -1235,6 +1243,7 @@ Opaque runtime objects and circular references are represented by type."
       ('approve-all
        (gptel-runner-gptel-approve-interactions
         call (plist-get args :interaction-ids) (plist-get args :allow-outside)))
+      ('deny (gptel-runner-gptel-deny-interactions call (plist-get args :interaction-ids)))
       ('revoke-outside (gptel-runner-gptel-revoke-outside-access call))
       (_ (error "Unsupported worker operation: %S" operation)))))
 

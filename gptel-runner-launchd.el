@@ -281,6 +281,16 @@ This does not start the pipeline immediately.  Return the saved job record."
     (when (file-exists-p file) (delete-file file)))
   (gptel-runner-launchd--status job 'removed 'remove))
 
+(defun gptel-runner-launchd-delete-schedule (job)
+  "Unload and remove the recurring trigger for the JOB being deleted.
+The definition can be retired even if its init file or workspace is gone."
+  (let ((file (gptel-runner-launchd--schedule-file job))
+        (state (plist-get (plist-get job :scheduler) :state)))
+    ;; An interrupted installation can leave a plist before status is saved.
+    (when (or (file-exists-p file) (not (memq state '(nil removed))))
+      (gptel-runner-launchd--unload (gptel-runner-launchd--schedule-label job))
+      (when (file-exists-p file) (delete-file file)))))
+
 (defun gptel-runner-launchd-diagnostics (job)
   "Return schedule diagnostics for JOB without changing its state.
 The raw launchctl display is intended for people, not parsed as an API."

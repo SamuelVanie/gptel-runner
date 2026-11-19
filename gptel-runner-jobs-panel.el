@@ -38,10 +38,11 @@
               (setq start candidate)
             (setq candidate (next-single-property-change
                              candidate 'runner-section nil (point-max))))))
-      (if start
-          (min (+ start offset) (1- (next-single-property-change
-                                    start 'runner-section nil (point-max))))
-        (min offset (point-max))))))
+      (cond
+       (start (min (+ start offset) (1- (next-single-property-change
+                                         start 'runner-section nil (point-max)))))
+       (section (point-min))
+       (t (min offset (point-max)))))))
 
 (defun gptel-runner-panel--button (label key function)
   "Insert a button with LABEL and stable KEY calling FUNCTION."
@@ -79,6 +80,8 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
       ('approve-all
        (setq arguments (append arguments (list :interaction-ids ids
                                                :allow-outside (and outside t)))))
+      ('deny
+       (setq arguments (append arguments (list :interaction-ids ids))))
       ((or 'approve 'reject)
        (setq arguments (append arguments (list :interaction-id (car ids))))
        (when outside (setq arguments (append arguments '(:allow-outside t))))))
@@ -148,12 +151,20 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
          (outside (cl-some (lambda (item) (plist-get item :outside-access)) pending)))
     (when pending
       (let ((approve (lambda () (gptel-runner-panel--submit run call pending 'approve-all)))
+            (deny (lambda () (gptel-runner-panel--submit run call pending 'deny)))
             (allow (lambda () (gptel-runner-panel--submit run call pending 'approve-all t))))
         (gptel-runner-panel--button
          (format "Approve all %d pending" (length pending))
          (list (plist-get call :id) 'approve-all) approve)
+        (gptel-runner-panel--button
+         (format "Deny all %d pending" (length pending))
+         (list (plist-get call :id) 'deny-all) deny)
         (when (equal gptel-runner-background--target (gptel-runner-panel--target run call))
-          (push (cons 'approve approve) gptel-runner-panel--actions))
+          (push (cons 'approve approve) gptel-runner-panel--actions)
+          (push (cons 'deny deny) gptel-runner-panel--actions)
+          (push (cons 'decide (lambda (requests operation)
+                                (gptel-runner-panel--submit run call requests operation)))
+                gptel-runner-panel--actions))
         (when outside
           (insert "\n")
           (gptel-runner-panel--button
@@ -167,14 +178,19 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
 
 (defun gptel-runner-panel--request (run call interaction)
   "Insert a readable INTERACTION and its individual actions for CALL in RUN."
-  (let ((id (plist-get interaction :id)) (start (point)))
+  (let* ((id (plist-get interaction :id))
+         (submitted (gptel-runner-panel--submitted-p id))
+         (start (point)))
     (gptel-runner-ui--insert-tool-request interaction)
-    (if (gptel-runner-panel--submitted-p id)
+    (if submitted
         (insert (propertize "  Decision submitted — awaiting worker update\n" 'face 'shadow))
       (insert "  ")
       (gptel-runner-panel--button
        "Approve once" (list id 'approve)
        (lambda () (gptel-runner-panel--submit run call (list interaction) 'approve)))
+      (gptel-runner-panel--button
+       "Deny once" (list id 'deny)
+       (lambda () (gptel-runner-panel--submit run call (list interaction) 'deny)))
       (when (plist-get interaction :outside-access)
         (gptel-runner-panel--button
          "Approve + allow outside paths" (list id 'outside)
@@ -184,7 +200,9 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
        (lambda () (gptel-runner-panel--submit run call (list interaction) 'reject)))
       (insert "\n"))
     (insert "\n")
-    (put-text-property start (point) 'runner-section id)))
+    (put-text-property start (point) 'runner-section id)
+    (unless submitted
+      (put-text-property start (point) 'runner-request interaction))))
 
 (defun gptel-runner-panel--call (run call)
   "Insert CALL's state and approval group in RUN."
@@ -205,6 +223,8 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
         (progn
           (insert (propertize (format "Needs your approval · %d requests\n\n" (length interactions))
                               'face 'warning))
+          (insert "Use y to approve or d to deny the request at point or the requests in a region.\n"
+                  "Use a to approve all shown or D to deny all shown.\n\n")
           (gptel-runner-panel--approval-buttons run call interactions)
           (dolist (interaction interactions)
             (gptel-runner-panel--request run call interaction)))
@@ -242,6 +262,8 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
                (button (button-at (point)))
                (key (and button (button-get button 'runner-action)))
                (inhibit-read-only t))
+    ;; An explicit refresh ends a selection made against the old rendering.
+    (when (region-active-p) (deactivate-mark))
     (erase-buffer)
     (setq gptel-runner-panel--actions nil)
     (insert (propertize (format "%s\n" (or (plist-get (plist-get run :job) :name)
@@ -295,6 +317,39 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
   (funcall (or (alist-get 'approve gptel-runner-panel--actions)
                (user-error "Open a node with pending approvals first"))))
 
+(defun gptel-runner-panel-deny-all ()
+  "Deny all pending requests displayed for this node and let the agent continue."
+  (interactive)
+  (funcall (or (alist-get 'deny gptel-runner-panel--actions)
+               (user-error "Open a node with pending approvals first"))))
+
+(defun gptel-runner-panel--decide-selection (operation)
+  "Send OPERATION for displayed requests at point or in the active region."
+  (let* ((region (use-region-p))
+         (start (if region (region-beginning) (point)))
+         (end (if region (region-end) (min (1+ start) (point-max))))
+         (submit (alist-get 'decide gptel-runner-panel--actions))
+         requests)
+    (while (< start end)
+      (when-let* ((request (get-text-property start 'runner-request)))
+        (push request requests))
+      (setq start (next-single-property-change start 'runner-request nil end)))
+    (unless (and submit requests)
+      (user-error "Place point on a pending request or select requests with the region"))
+    (setq requests (nreverse requests))
+    (funcall submit requests
+             (if (and (eq operation 'approve) (cdr requests)) 'approve-all operation))))
+
+(defun gptel-runner-panel-approve-selection ()
+  "Approve the displayed request at point or the requests in the active region."
+  (interactive)
+  (gptel-runner-panel--decide-selection 'approve))
+
+(defun gptel-runner-panel-deny-selection ()
+  "Deny the displayed request at point or in the active region and continue."
+  (interactive)
+  (gptel-runner-panel--decide-selection 'deny))
+
 (defun gptel-runner-panel-allow-outside ()
   "Approve displayed requests and remember their outside file access."
   (interactive)
@@ -328,6 +383,9 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
     (define-key map (kbd "g") #'gptel-runner-panel-refresh)
     (define-key map (kbd "a") #'gptel-runner-panel-approve-all)
     (define-key map (kbd "A") #'gptel-runner-panel-allow-outside)
+    (define-key map (kbd "y") #'gptel-runner-panel-approve-selection)
+    (define-key map (kbd "d") #'gptel-runner-panel-deny-selection)
+    (define-key map (kbd "D") #'gptel-runner-panel-deny-all)
     (define-key map (kbd "n") #'gptel-runner-panel-next-node)
     (define-key map (kbd "p") #'gptel-runner-panel-previous-node)
     (define-key map (kbd "?") #'gptel-runner-background-menu)
@@ -351,8 +409,10 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
              (lambda ()
                (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
                  (with-current-buffer buffer
-                   (condition-case err (gptel-runner-panel-refresh)
-                     (error (setq header-line-format (error-message-string err))))))))))))
+                   ;; Keep the selected requests fixed while the user reviews a region.
+                   (unless (region-active-p)
+                     (condition-case err (gptel-runner-panel-refresh)
+                       (error (setq header-line-format (error-message-string err)))))))))))))
 
 (defun gptel-runner-background-open (&optional target)
   "Open a live node panel for TARGET or the background row at point."

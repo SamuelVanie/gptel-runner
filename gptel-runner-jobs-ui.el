@@ -356,10 +356,9 @@ Approval and rejection open the node panel for review before submission."
    (list (intern
           (completing-read
            "Background action: "
-           '(pause resume cancel retry rerun continue extend extend-repeat decision
-		   pause-call cancel-call feedback accept approve reject revoke-outside)
+           gptel-runner-jobs--operations
            nil t))))
-  (if (memq operation '(approve reject))
+  (if (memq operation '(approve approve-all deny reject))
       (gptel-runner-background-open)
     (pcase-let* ((`(,run ,call ,_) (gptel-runner-jobs-ui--selection))
 		 (arguments (copy-sequence arguments)))
@@ -457,10 +456,12 @@ Approval and rejection open the node panel for review before submission."
     (let ((runs (gptel-runner-jobs-ui--workflow-invocations)))
       (and runs (cl-every #'gptel-runner-invocation-forgettable-p runs)))))
 
-(defun gptel-runner-jobs-ui--finished-invocations ()
-  "Return visible background invocations whose workers have stopped."
-  (cl-remove-if-not #'gptel-runner-invocation-forgettable-p
-                    (gptel-runner-jobs-ui--visible-invocations)))
+(defun gptel-runner-jobs-ui--finished-invocations (&optional job-id)
+  "Return visible stopped invocations, limiting them to JOB-ID when given."
+  (cl-loop for run in (gptel-runner-jobs-ui--visible-invocations)
+           when (and (or (null job-id) (equal job-id (plist-get run :job-id)))
+                     (gptel-runner-invocation-forgettable-p run))
+           collect run))
 
 (defun gptel-runner-jobs-ui--forget (runs delete-checkpoints description)
   "Confirm forgetting RUNS with DESCRIPTION and optional DELETE-CHECKPOINTS."
@@ -626,12 +627,13 @@ No timer is installed: cleanup is requested only when the jobs view refreshes."
       (user-error "Select a saved background job")))
 
 (define-derived-mode gptel-runner-jobs-mode tabulated-list-mode "Runner-Jobs"
-  "View registered background jobs and their schedules."
+  "Manage registered background jobs and their run history."
   (setq tabulated-list-format
         [("Job" 26 t) ("Workflow" 24 t) ("State" 12 t)
          ("Schedule" 35 nil) ("Revision" 8 t)]
         tabulated-list-entries #'gptel-runner-jobs-ui--job-entries
         tabulated-list-padding 2)
+  (setq-local mode-line-process "  ? Actions · x Delete job · C Clear job's finished runs")
   (add-hook 'tabulated-list-revert-hook #'gptel-runner-jobs-refresh nil t)
   (tabulated-list-init-header))
 
@@ -653,11 +655,40 @@ No timer is installed: cleanup is requested only when the jobs view refreshes."
    "*gptel-runner schedule diagnostics*"
    (gptel-runner-launchd-diagnostics (gptel-runner-jobs-ui--job))))
 
+(defun gptel-runner-jobs-remove ()
+  "Delete the selected job and its schedule, preserving its runs."
+  (interactive)
+  (let ((id (plist-get (gptel-runner-jobs-ui--job) :id)))
+    (when (yes-or-no-p (format "Delete job %s and its schedule, keeping existing runs? " id))
+      (gptel-runner-job-delete id)
+      (gptel-runner-jobs-refresh)
+      (message "Deleted job %s" id))))
+
+(defun gptel-runner-jobs-clear-finished (&optional delete-checkpoints)
+  "Clear the selected job's finished runs from the run dashboard.
+With prefix argument DELETE-CHECKPOINTS, also delete their recovery checkpoints."
+  (interactive "P")
+  (let* ((id (plist-get (gptel-runner-jobs-ui--job) :id))
+         (runs (gptel-runner-jobs-ui--finished-invocations id)))
+    (unless runs (user-error "No finished runs to clear for job %s" id))
+    (gptel-runner-jobs-ui--forget
+     runs delete-checkpoints
+     (format "%d finished %s for job %s"
+             (length runs) (if (cdr runs) "runs" "run") id))))
+
+(defun gptel-runner-jobs-ui--job-has-finished-runs-p ()
+  "Return non-nil when the selected job has runs to clear."
+  (when-let* ((id (tabulated-list-get-id)))
+    (gptel-runner-jobs-ui--finished-invocations id)))
+
 (transient-define-prefix gptel-runner-jobs-menu ()
-  "Run registered jobs and inspect schedule diagnostics."
+  "Run and manage jobs, schedules, and dashboard history."
   [["Job"
-    ("r" "Run now" gptel-runner-jobs-run)
-    ("i" "Schedule diagnostics" gptel-runner-jobs-diagnostics)]
+    ("r" "Run now" gptel-runner-jobs-run :inapt-if-not tabulated-list-get-id)
+    ("i" "Schedule diagnostics" gptel-runner-jobs-diagnostics :inapt-if-not tabulated-list-get-id)
+    ("x" "Delete job and schedule" gptel-runner-jobs-remove :inapt-if-not tabulated-list-get-id)
+    ("C" "Clear this job's finished runs" gptel-runner-jobs-clear-finished
+     :inapt-if-not gptel-runner-jobs-ui--job-has-finished-runs-p)]
    ["View"
     ("g" "Refresh" gptel-runner-jobs-refresh)
     ("R" "Runs" gptel-runner-show-dashboard)]])
@@ -665,6 +696,8 @@ No timer is installed: cleanup is requested only when the jobs view refreshes."
 (let ((map gptel-runner-jobs-mode-map))
   (define-key map (kbd "?") #'gptel-runner-jobs-menu)
   (define-key map (kbd "RET") #'gptel-runner-jobs-menu)
+  (define-key map (kbd "x") #'gptel-runner-jobs-remove)
+  (define-key map (kbd "C") #'gptel-runner-jobs-clear-finished)
   (define-key map (kbd "g") #'gptel-runner-jobs-refresh))
 
 ;;;###autoload

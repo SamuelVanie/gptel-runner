@@ -62,6 +62,91 @@
     (gptel-runner-panel-refresh)
     (should (string-match-p "Revoke outside access" (buffer-string)))))
 
+(ert-deftest gptel-runner-panel-decides-child-request-at-point-once ()
+  (dolist (key '("y" "d"))
+    (gptel-runner-panel-test--with-panel
+      (should-error (call-interactively (key-binding (kbd key))) :type 'user-error)
+      (search-forward "Shell")
+      (call-interactively (key-binding (kbd key)))
+      (should (equal sent
+                     (if (equal key "y")
+                         '((approve :call-id "c1" :call-epoch 2 :generation 3
+                                    :interaction-id "i2"))
+                       '((deny :call-id "c1" :call-epoch 2 :generation 3
+                               :interaction-ids ("i2"))))))
+      (should-error (call-interactively (key-binding (kbd key))) :type 'user-error)
+      (should (= (length sent) 1)))))
+
+(ert-deftest gptel-runner-panel-decides-only-parent-and-child-requests-in-region ()
+  (dolist (key '("y" "d"))
+    (gptel-runner-panel-test--with-panel
+      (let ((transient-mark-mode t))
+        (push '(:id "before" :call-id "c1" :epoch 2 :generation 3 :source-buffer "sibling")
+              (plist-get run :interactions))
+        (gptel-runner-panel-refresh)
+        (search-forward "/outside/a")
+        (push-mark (point) t t)
+        (search-forward "Shell")
+        (push '(:id "new" :call-id "c1" :epoch 2 :generation 3)
+              (plist-get run :interactions))
+        (call-interactively (key-binding (kbd key)))
+        (should (equal sent
+                       (if (equal key "y")
+                           '((approve-all :call-id "c1" :call-epoch 2 :generation 3
+                                          :interaction-ids ("i1" "i2") :allow-outside nil))
+                         '((deny :call-id "c1" :call-epoch 2 :generation 3
+                                 :interaction-ids ("i1" "i2"))))))
+        (should-not (region-active-p))))))
+
+(ert-deftest gptel-runner-panel-denies-all-shown-without-cancelling-node ()
+  (gptel-runner-panel-test--with-panel
+    (push '(:id "new" :call-id "c1" :epoch 2 :generation 3) (plist-get run :interactions))
+    (call-interactively (key-binding (kbd "D")))
+    (should (equal sent '((deny :call-id "c1" :call-epoch 2 :generation 3
+                                :interaction-ids ("i1" "i2")))))
+    (should (string-match-p "Deny all 1 pending" (buffer-string)))
+    (should (string-match-p "Reject & cancel node" (buffer-string)))))
+
+(ert-deftest gptel-runner-panel-region-skips-requests-with-submitted-decisions ()
+  (gptel-runner-panel-test--with-panel
+    (let ((transient-mark-mode t))
+      (search-forward "/outside/a")
+      (call-interactively (key-binding (kbd "y")))
+      (push-mark (point) t t)
+      (search-forward "Shell")
+      (call-interactively (key-binding (kbd "d")))
+      (should (equal sent '((deny :call-id "c1" :call-epoch 2 :generation 3
+                                  :interaction-ids ("i2"))
+                            (approve :call-id "c1" :call-epoch 2 :generation 3
+                                     :interaction-id "i1")))))))
+
+(ert-deftest gptel-runner-panel-disappearing-request-clears-keyboard-target ()
+  (gptel-runner-panel-test--with-panel
+    (search-forward "/outside/a")
+    (setf (plist-get run :interactions) (list second))
+    (gptel-runner-panel-refresh)
+    (should (= (point) (point-min)))
+    (should-error (call-interactively (key-binding (kbd "y"))) :type 'user-error)
+    (should-not sent)))
+
+(ert-deftest gptel-runner-panel-auto-refresh-waits-for-active-region ()
+  (let ((gptel-runner-dashboard-refresh-interval 1)
+        (transient-mark-mode t) timer-function refreshed)
+    (save-window-excursion
+      (with-temp-buffer
+        (set-window-buffer (selected-window) (current-buffer))
+        (cl-letf (((symbol-function 'run-with-timer)
+                   (lambda (_delay _interval function) (setq timer-function function)))
+                  ((symbol-function 'gptel-runner-panel-refresh) (lambda () (setq refreshed t))))
+          (gptel-runner-panel-mode)
+          (let ((inhibit-read-only t)) (insert "two requests"))
+          (push-mark (point-min) t t)
+          (funcall timer-function)
+          (should-not refreshed)
+          (deactivate-mark)
+          (funcall timer-function)
+          (should refreshed))))))
+
 (ert-deftest gptel-runner-panel-rejected-receipt-is-visible-and-retryable ()
   (gptel-runner-panel-test--with-panel
     (gptel-runner-panel-approve-all)
@@ -119,17 +204,22 @@
 
 (ert-deftest gptel-runner-jobs-batch-command-schema-requires-exact-identities ()
   (let ((args '(:call-id "c1" :call-epoch 2 :generation 0
-                :interaction-ids ("i1" "i2") :allow-outside t)))
-    (gptel-runner-jobs--validate-command-arguments 'approve-all args)
-    (dolist (invalid '((:interaction-ids nil) (:interaction-ids ("i1" "i1"))
-                       (:interaction-ids (all)) (:allow-outside everything)))
-      (should-error
-       (gptel-runner-jobs--validate-command-arguments
-        'approve-all (plist-put (copy-sequence args) (car invalid) (cadr invalid)))))
-    (dolist (key '(:call-id :call-epoch :generation :interaction-ids))
-      (let ((missing (copy-sequence args)))
-        (cl-remf missing key)
-        (should-error (gptel-runner-jobs--validate-command-arguments 'approve-all missing))))))
+                :interaction-ids ("i1" "i2"))))
+    (dolist (operation '(approve-all deny))
+      (gptel-runner-jobs--validate-command-arguments operation args)
+      (dolist (invalid '(nil ("i1" "i1") (all)))
+        (should-error
+         (gptel-runner-jobs--validate-command-arguments
+          operation (plist-put (copy-sequence args) :interaction-ids invalid))))
+      (dolist (key '(:call-id :call-epoch :generation :interaction-ids))
+        (let ((missing (copy-sequence args)))
+          (cl-remf missing key)
+          (should-error (gptel-runner-jobs--validate-command-arguments operation missing)))))
+    (gptel-runner-jobs--validate-command-arguments 'approve-all (append args '(:allow-outside t)))
+    (should-error (gptel-runner-jobs--validate-command-arguments
+                   'approve-all (append args '(:allow-outside everything))))
+    (should-error (gptel-runner-jobs--validate-command-arguments
+                   'deny (append args '(:allow-outside t))))))
 
 (ert-deftest gptel-runner-background-command-keeps-current-buffer ()
   (gptel-runner-panel-test--with-panel
