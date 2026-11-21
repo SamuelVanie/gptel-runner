@@ -578,8 +578,7 @@ created by these tools are never included.  Every execution rechecks liveness."
 (defun gptel-runner-gptel-protected-request (buffer)
   "Return the protected workflow request owned by BUFFER, if any."
   (when-let* (((fboundp 'gptel-agent-policy-request-ceiling))
-              (call (buffer-local-value 'gptel-runner--call buffer))
-              ((eq buffer (gptel-runner-call-buffer call)))
+              (call (gptel-runner--buffer-call buffer))
               (fsm (gptel-runner-call-fsm call))
               ((gptel-agent-policy-request-ceiling fsm)))
     fsm))
@@ -1487,8 +1486,7 @@ node result and reconstructs the continuation from the workflow AST."
               (buffer-substring-no-properties
                (region-beginning) (region-end)))
          nil))
-  (setq call (or call
-                 (and (boundp 'gptel-runner--call) gptel-runner--call)))
+  (setq call (or call (gptel-runner--buffer-call)))
   (unless (gptel-runner-call-p call)
     (user-error "No runner call is associated with this buffer"))
   (unless (memq (gptel-runner-call-state call) '(waiting-feedback paused))
@@ -1516,15 +1514,17 @@ node result and reconstructs the continuation from the workflow AST."
 
 (defun gptel-runner-gptel--before-send (&optional arg)
   "Guard live node chats from duplicate sends, allowing menus and steering ARG."
-  (when (and (not (member arg '(0 (4)))) (gptel-runner-call-p gptel-runner--call)
-             (memq (gptel-runner-call-state gptel-runner--call)
-                   '(ready running retry-wait waiting-tool waiting-confirmation)))
+  (when-let* (((not (member arg '(0 (4)))))
+              (call (gptel-runner--buffer-call))
+              ((memq (gptel-runner-call-state call)
+                     '(ready running retry-wait waiting-tool waiting-confirmation))))
     (user-error "This node is running; pause it to send feedback")))
 
 (defun gptel-runner-gptel--around-send (original &optional arg)
   "Resume open node discussions on a normal send through ORIGINAL with ARG."
   (gptel-runner-gptel--before-send arg)
-  (if (or arg (use-region-p) (not (gptel-runner-gptel--open-discussion-p gptel-runner--call)))
+  (if (or arg (use-region-p)
+          (not (gptel-runner-gptel--open-discussion-p (gptel-runner--buffer-call))))
       (funcall original arg)
     (save-restriction
       (widen)
@@ -1539,24 +1539,25 @@ node result and reconstructs the continuation from the workflow AST."
              (text (and (< start end) (buffer-substring-no-properties start end))))
         (unless (and text (not (string-blank-p text)))
           (user-error "Type a reply after the latest response"))
-        (gptel-runner-gptel--continue-discussion gptel-runner--call text (point-marker))))))
+        (gptel-runner-gptel--continue-discussion
+         (gptel-runner--buffer-call) text (point-marker))))))
 
 (defun gptel-runner-gptel--wake-chat-queue ()
   "Wake the chat's queued workflow turns after gptel or buffer cleanup."
-  (when-let* ((call gptel-runner--call)
+  (when-let* ((call (gptel-runner--buffer-call))
               (run (gptel-runner-call-run call))
               ((gptel-runner-run-queue run)))
     (run-at-time 0 nil #'gptel-runner--drain-queue run)))
 
 (defun gptel-runner-gptel--release-send (buffer fsm)
   "Release FSM's reservation of BUFFER, then admit waiting workflow turns."
-  (when (buffer-live-p buffer)
+  (when (gptel-runner--buffer-call buffer)
     (with-current-buffer buffer
       (gptel-runner-gptel--note-rendered-end (gptel-fsm-info fsm))
       (setq gptel-runner-gptel--manual-requests (delq fsm gptel-runner-gptel--manual-requests))
       (unless gptel-runner-gptel--manual-requests
         (remove-hook 'kill-buffer-hook #'gptel-runner-gptel--wake-chat-queue t)
-        (when-let* ((call gptel-runner--call)
+        (when-let* ((call (gptel-runner--buffer-call))
                     (run (gptel-runner-call-run call))
                     ((gptel-runner-run-queue run)))
           (gptel-runner--drain-queue run))))))
@@ -1565,7 +1566,7 @@ node result and reconstructs the continuation from the workflow AST."
   "Track an ordinary send through ORIGINAL with PROMPT and ARGS in a node chat."
   (let* ((buffer (or (plist-get args :buffer) (current-buffer)))
          (fsm (plist-get args :fsm)))
-    (if (not (and (buffer-live-p buffer) (buffer-local-value 'gptel-runner--call buffer)
+    (if (not (and (gptel-runner--buffer-call buffer)
                   fsm (eq (gptel-fsm-handlers fsm) gptel-send--handlers)
                   (not (plist-get args :dry-run))))
         (apply original prompt args)
@@ -1599,8 +1600,7 @@ node result and reconstructs the continuation from the workflow AST."
 (defun gptel-runner-gptel--around-abort (original &optional buffer)
   "Integrate ORIGINAL `gptel-abort' with runner worker BUFFER."
   (let* ((target (or buffer (current-buffer)))
-         (call (and (buffer-live-p target)
-                    (buffer-local-value 'gptel-runner--call target))))
+         (call (gptel-runner--buffer-call target)))
     (when (and call (not gptel-runner-gptel--cancelling)
                (memq (gptel-runner-call-state call)
                      '(running retry-wait waiting-tool waiting-confirmation))
@@ -1618,8 +1618,7 @@ RESPONSE and OVERLAY are the arguments accepted by
                      (and (overlayp overlay) (overlay-buffer overlay))
                      (current-buffer)))
          (call (or (car interaction)
-                   (and (buffer-live-p target)
-                        (buffer-local-value 'gptel-runner--call target)))))
+                   (gptel-runner--buffer-call target))))
     ;; A gptel inspection buffer can retain the old overlay after a dashboard
     ;; approval or a pause.  Its edited callbacks must not execute a second time.
     (when (and interaction

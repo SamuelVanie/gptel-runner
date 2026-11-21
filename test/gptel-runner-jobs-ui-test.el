@@ -396,6 +396,7 @@
           (gptel-runner-dashboard-open-at-point)
           (should (eq visited chat))
           (setq visited nil)
+          (setf (gptel-runner-call-buffer call) chat)
           (setq-local gptel-runner--call call)
           (call-interactively #'gptel-runner-visit-node-chat)
           (should (eq visited chat)))))))
@@ -414,7 +415,8 @@
     (unwind-protect
         (save-window-excursion
           (with-temp-buffer
-            (setq-local gptel-runner--call (gptel-runner-call-create :run run))
+            (setq-local gptel-runner--call
+                        (gptel-runner-call-create :run run :buffer (current-buffer)))
             (cl-letf (((symbol-function 'gptel-runner-load-run)
                        (lambda (_) (ert-fail "Tried to reload a live run")))
                       ((symbol-function 'gptel-runner-save-run)
