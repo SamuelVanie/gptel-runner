@@ -1240,6 +1240,16 @@ Return the new history entry, or nil when NODE does not collect history."
 
 (defun gptel-runner--complete-finalization (run state value)
   "Record finalizer STATE and VALUE, then publish RUN's original outcome."
+  ;; Quiescence deliberately advances the generation.  Errors raised by this
+  ;; transition belong to that new generation, unlike an obsolete caller's
+  ;; later errors after a reentrant pause, resume, or cancellation.
+  (let ((generation (1+ (gptel-runner-run-generation run))))
+    (condition-case err
+        (gptel-runner--complete-finalization-1 run state value)
+      ((error quit) (gptel-runner--execution-error run generation err)))))
+
+(defun gptel-runner--complete-finalization-1 (run state value)
+  "Complete RUN's finalization transition with finalizer STATE and VALUE."
   (let* ((root (gptel-runner--source-root run))
          (finalizer (plist-get (gptel-runner-node-properties root) :finally))
          (record (gptel-runner-run-finalization run))
@@ -1275,6 +1285,24 @@ Return the new history entry, or nil when NODE does not collect history."
 
 (defun gptel-runner--finalize-run (run state value)
   "Handle terminal STATE and VALUE for RUN's explicit finalization wrapper."
+  (let ((generation (1+ (gptel-runner-run-generation run)))
+        (body-budget (gptel-runner-run-budget run)))
+    (condition-case err
+        (gptel-runner--finalize-run-1 run state value)
+      ((error quit)
+       (when (and (= generation (gptel-runner-run-generation run))
+                  (eq (gptel-runner-run-state run) 'finishing)
+                  (not (gptel-runner-run-finalization run)))
+         ;; A cleanup or observer may have interrupted initial quiescence
+         ;; before the body outcome was recorded.  Preserve it for recovery.
+         (setf (gptel-runner-run-finalization run)
+               (list :phase 'finalizing :body (list :state state :value value)
+                     :body-budget body-budget
+                     :body-duration (gptel-runner-run-duration-remaining run))))
+       (gptel-runner--execution-error run generation err)))))
+
+(defun gptel-runner--finalize-run-1 (run state value)
+  "Perform RUN's finalization transition for body STATE and VALUE."
   (pcase (plist-get (gptel-runner-run-finalization run) :phase)
     ('complete nil)
     ('finalizing (gptel-runner--complete-finalization run state value))

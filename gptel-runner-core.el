@@ -1169,18 +1169,27 @@ completed and detached its callback into this queue."
   "Finish RUN after unexpected ERROR-DATA in execution GENERATION.
 Invalidate old continuations and stop active work before running any explicit
 finalizer.  An obsolete execution must not replace a newer phase's outcome.
-Errors after terminalization, such as a failing user callback, still signal."
-  (when (and (= generation (gptel-runner-run-generation run))
-             (not (eq (gptel-runner-run-state run) 'running)))
+Errors after terminalization still signal, including callbacks invoked by a
+finalization transition that advanced the generation before calling them."
+  (when (or (gptel-runner--run-terminal-p run)
+            (and (= generation (gptel-runner-run-generation run))
+                 (not (memq (gptel-runner-run-state run) '(running finishing)))))
     (signal (car error-data) (cdr error-data)))
   (when (and (= generation (gptel-runner-run-generation run))
-             (eq (gptel-runner-run-state run) 'running))
+             (memq (gptel-runner-run-state run) '(running finishing)))
     ;; The original error may itself have come from an observer.  Keep other
     ;; observers informed without letting that observer strand teardown too.
     (let ((gptel-runner-event-hook
            (gptel-runner--recovery-hook gptel-runner-event-hook))
           (gptel-runner-call-release-hook
            (gptel-runner--recovery-hook gptel-runner-call-release-hook)))
+      (when (eq (plist-get (gptel-runner-run-finalization run) :phase) 'complete)
+        ;; Finalization has committed its result and restored the body budget.
+        ;; An observer must not interrupt publication or rewrite that outcome.
+        (let ((body (plist-get (gptel-runner-run-finalization run) :body)))
+          (gptel-runner--terminalize-run run (plist-get body :state)
+                                       (plist-get body :value)))
+        (signal (car error-data) (cdr error-data)))
       (setf (gptel-runner-run-state run) 'failing)
       (cl-incf (gptel-runner-run-generation run))
       (dolist (call (copy-sequence (gptel-runner-run-calls run)))
