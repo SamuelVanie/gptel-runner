@@ -1181,6 +1181,52 @@
           (gptel-runner-gptel-test--reply next "Second plan" "stop"))
         (should (eq (gptel-runner-run-state run) 'succeeded))))))
 
+(ert-deftest gptel-runner-gptel-mode-change-preserves-ordinary-send-reservation ()
+  (dolist (end '(reply kill))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'planner)
+      (let* ((gptel-default-mode 'text-mode)
+             (run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'plan :agent 'planner :prompt "Plan")
+                   :completion 'response
+                   :driver (gptel-runner-gptel-driver-create)))
+             (chat (gptel-runner-node-buffer run 'plan))
+             manual)
+        (gptel-runner-gptel-test--reply (pop requests) "First plan" "stop")
+        (with-current-buffer chat
+          (goto-char (point-max))
+          (insert "My follow-up")
+          (gptel-send)
+          (setq manual (pop requests))
+          (should manual)
+          (org-mode)
+          (gptel-mode 1)
+          (should (equal gptel-runner-gptel--manual-requests (list manual)))
+          (should (memq #'gptel-runner-gptel--wake-chat-queue kill-buffer-hook)))
+        (gptel-runner-continue run "Plan again")
+        (should-not requests)
+        (should (= 1 (length (gptel-runner-run-queue run))))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (pcase end
+          ('reply
+           (setf (plist-get (gptel-fsm-info manual) :callback) #'gptel--insert-response)
+           (gptel-runner-gptel-test--reply manual "Manual answer" "stop"))
+          ('kill
+           (should-not (kill-buffer chat))
+           ;; A forced close must wake the queued turn even after changing mode.
+           (with-current-buffer chat
+             (let ((kill-buffer-query-functions nil))
+               (should (kill-buffer chat))))))
+        (should-not requests)
+        (accept-process-output nil 0.02)
+        (should (= 1 (length requests)))
+        (let ((next (pop requests)))
+          (when (eq end 'reply)
+            (should (string-search "Manual answer"
+                                   (prin1-to-string (plist-get (gptel-fsm-info next) :data)))))
+          (gptel-runner-gptel-test--reply next "Second plan" "stop"))
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
 (ert-deftest gptel-runner-gptel-native-chat-round-trip ()
   (gptel-runner-gptel-test--with-transport
     (dolist (mode '(text-mode org-mode))

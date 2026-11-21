@@ -31,6 +31,8 @@
 (declare-function gptel-agent-session-write-record "gptel-agent-session")
 (declare-function gptel-agent-session-import-buffer "gptel-agent-session")
 
+(defvar gptel-mode)
+
 (defgroup gptel-runner-store nil
   "Persistent snapshots for gptel-runner."
   :group 'gptel-runner)
@@ -125,10 +127,15 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (defun gptel-runner-store--archive (buffer)
   "Capture BUFFER in its native chat format."
   (if (gptel-runner-store--agent-sessions-p)
-      (cons 'gptel-agent
-            (if-let* ((fsm (gptel-runner-gptel-protected-request buffer)))
-                (gptel-agent-session-buffer-record buffer fsm)
-              (gptel-agent-session-buffer-record buffer)))
+      (with-current-buffer buffer
+        ;; A major-mode change disables gptel-mode, but an owned node remains
+        ;; a chat.  Permit native record capture without enabling UI hooks.
+        (let ((gptel-mode (or (bound-and-true-p gptel-mode)
+                              (and (gptel-runner-store--chat-owner) t))))
+          (cons 'gptel-agent
+                (if-let* ((fsm (gptel-runner-gptel-protected-request buffer)))
+                    (gptel-agent-session-buffer-record buffer fsm)
+                  (gptel-agent-session-buffer-record buffer)))))
     (cons 'gptel (gptel-runner-gptel-chat-text buffer))))
 
 (defun gptel-runner-store--import-agent-chat (function data)
@@ -208,6 +215,22 @@ terminal run transitions bypass it, but their writes are still asynchronous."
              (gptel-runner-run-chats run))
     (gptel-runner--checkpoint run)))
 
+(defun gptel-runner-store--install-chat-hooks ()
+  "Install lifecycle hooks for the current owned node chat."
+  (when (gptel-runner-store--chat-owner)
+    ;; Reinstall after changing modes too: Emacs can retain a permanent
+    ;; after-change function without activating it until the hook is read.
+    (add-hook 'after-change-functions #'gptel-runner-store--chat-changed nil t)
+    (add-hook 'kill-buffer-query-functions #'gptel-runner-store--allow-chat-kill-p -90 t)
+    (add-hook 'kill-buffer-hook #'gptel-runner-store--close-chat nil t)
+    (add-hook 'after-change-major-mode-hook #'gptel-runner-store--install-chat-hooks nil t)))
+
+(dolist (function '(gptel-runner-store--install-chat-hooks
+                    gptel-runner-store--chat-changed
+                    gptel-runner-store--allow-chat-kill-p
+                    gptel-runner-store--close-chat))
+  (put function 'permanent-local-hook t))
+
 (defun gptel-runner-store-track-chat (call buffer)
   "Associate CALL with its node's ordinary gptel BUFFER and return BUFFER."
   (setf (gptel-runner-call-buffer call) buffer)
@@ -215,9 +238,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
            (gptel-runner-run-chats (gptel-runner-call-run call)))
   (with-current-buffer buffer
     (setq-local gptel-runner--call call)
-    (add-hook 'after-change-functions #'gptel-runner-store--chat-changed nil t)
-    (add-hook 'kill-buffer-query-functions #'gptel-runner-store--allow-chat-kill-p -90 t)
-    (add-hook 'kill-buffer-hook #'gptel-runner-store--close-chat nil t))
+    (gptel-runner-store--install-chat-hooks))
   buffer)
 
 (defun gptel-runner-node-buffer (run node)
