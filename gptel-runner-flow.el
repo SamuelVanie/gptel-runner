@@ -73,7 +73,9 @@ Leading keyword/value pairs set properties such as `:id' and inherited
 (defun gptel-runner-branch (&rest properties)
   "Return a predicate branch described by PROPERTIES.
 Use `:predicate' (or `:if'), `:then', `:else', and optional `:id'.  A
-`:context' value is inherited by the selected subtree."
+`:context' value is inherited by the selected subtree.  Once selected, the
+arm is retained across pause/resume and checkpoint retries.  Starting a fresh
+execution of the subtree evaluates the predicate again."
   (gptel-runner--make-node
    'branch properties (delq nil (list (plist-get properties :then)
                                       (plist-get properties :else)))))
@@ -595,6 +597,9 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
 (defun gptel-runner--reset-subtree (run node)
   "Reset NODE and descendants to pending in RUN before a new iteration."
   (remhash (gptel-runner-node-id node) (gptel-runner-run-discussions run))
+  (when (eq (gptel-runner-node-kind node) 'branch)
+    (remhash (list 'gptel-runner-branch (gptel-runner-node-id node))
+             (gptel-runner-run-blackboard run)))
   (when (eq (gptel-runner-node-kind node) 'try)
     (remhash (list 'gptel-runner-try (gptel-runner-node-id node))
              (gptel-runner-run-blackboard run))
@@ -913,23 +918,35 @@ handler so errors in later nodes are not attributed to this function."
 (defun gptel-runner--execute-branch (run node done)
   "Execute branch NODE in RUN and invoke DONE."
   (let* ((props (gptel-runner-node-properties node))
-         (predicate (or (plist-get props :predicate) (plist-get props :if))))
+         (predicate (or (plist-get props :predicate) (plist-get props :if)))
+         (slot (list 'gptel-runner-branch (gptel-runner-node-id node)))
+         (saved (gptel-runner-get run slot)))
     (gptel-runner--set-node-state run node 'running)
-    (gptel-runner--evaluate-flow-function
-     run node predicate
-     (lambda (selected)
-       (let ((choice (plist-get props (if selected :then :else)))
-             (unused (plist-get props (if selected :else :then))))
-         (when unused (gptel-runner--skip-subtree run unused 'branch-not-selected))
-         (if choice
-             (gptel-runner--execute-node
-              run choice
-              (lambda (state value)
-                (gptel-runner--set-node-state run node state value)
-                (funcall done state value)))
-           (gptel-runner--set-node-state run node 'succeeded)
-           (funcall done 'succeeded nil))))
-     done)))
+    (cl-labels
+        ((follow (arm)
+           (let ((choice (plist-get props arm))
+                 (unused (plist-get props (if (eq arm :then) :else :then))))
+             (when unused
+               (gptel-runner--skip-subtree run unused 'branch-not-selected))
+             (if choice
+                 (gptel-runner--execute-node
+                  run choice
+                  (lambda (state value)
+                    (gptel-runner--set-node-state run node state value)
+                    (funcall done state value)))
+               (gptel-runner--set-node-state run node 'succeeded)
+               (funcall done 'succeeded nil)))))
+      (if saved
+          (follow saved)
+        (gptel-runner--evaluate-flow-function
+         run node predicate
+         (lambda (selected)
+           (let ((arm (if selected :then :else)))
+             ;; Record the decision before any child changes predicate inputs.
+             ;; An explicit :else distinguishes a false answer from no decision.
+             (gptel-runner-put run slot arm)
+             (follow arm)))
+         done)))))
 
 (defun gptel-runner--node-key-succeeded-p (run node key)
   "Return non-nil when NODE or a descendant wrote KEY successfully in RUN."
@@ -984,8 +1001,16 @@ Return the new history entry, or nil when NODE does not collect history."
                            (gptel-runner-node-id node)))
          (retry-body (gptel-runner-get run retry-slot))
          (previous-key (gptel-runner-get run progress-slot))
-         (continue-current (or retry-body (gptel-runner--subtree-state-p
-                                          run body 'succeeded))))
+         (continue-current
+          (or retry-body (gptel-runner--subtree-state-p run body 'succeeded)
+              ;; An entered branch is progress even before its first async
+              ;; child succeeds.  Preserve its decision when resuming the body.
+              (cl-some (lambda (child)
+                         (and (eq (gptel-runner-node-kind child) 'branch)
+                              (gptel-runner-get
+                               run (list 'gptel-runner-branch
+                                         (gptel-runner-node-id child)))))
+                       (gptel-runner-list-nodes body)))))
     (cl-labels
         ((finish (state value)
            (gptel-runner--set-node-state run node state value)
