@@ -2,6 +2,12 @@
 
 ## 0.1.0 - unreleased
 
+- Move the optional Atelier chat presentation and its tests into the separate
+  `gptel-ui` project. Add that repository to `load-path` and enable
+  `gptel-ui-global-mode`; compatibility loaders there preserve the previous
+  `gptel-runner-chat-*` public interface. Jobs, pipelines, and their dashboards
+  remain in `gptel-runner`.
+
 - Agent nodes now hand results to the next agent in a sequence with
   `RunnerHandoff`. A recipient can use `RunnerAskPrevious` to get a reply
   from its predecessor's existing chat. The final agent submits its result
