@@ -1323,6 +1323,14 @@ Return the new history entry, or nil when NODE does not collect history."
 
 (defun gptel-runner--execute-node (run node done)
   "Execute NODE in RUN, then call DONE with terminal state and value."
+  (let ((generation (gptel-runner-run-generation run)))
+    (condition-case err
+        (gptel-runner--execute-node-1
+         run node (gptel-runner--continuation run done))
+      ((error quit) (gptel-runner--execution-error run generation err)))))
+
+(defun gptel-runner--execute-node-1 (run node done)
+  "Execute NODE in RUN with the scheduler-wrapped completion DONE."
   (let ((saved-state
          (gethash (gptel-runner-node-id node)
                   (gptel-runner-run-node-states run) 'pending)))

@@ -135,6 +135,7 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   (node-outcomes (make-hash-table :test #'equal))
   (chats (make-hash-table :test #'equal))
   iterations repeat-limits active-calls calls events budget driver queue
+  dispatching continuations
   (active-count 0)
   (writer-active 0) started-at finished-at terminal-data
   extension-context finalization
@@ -966,6 +967,10 @@ are never attributed to this function."
          (node (gptel-runner-call-node call))
          (props (gptel-runner-node-properties node))
          (generation (gptel-runner-call-generation call))
+         (complete (gptel-runner--continuation
+                    run (lambda (state value)
+                          (gptel-runner--elisp-result
+                           call generation state value))))
          (timeout (plist-get props :timeout))
          (starting t)
          outcome)
@@ -978,7 +983,7 @@ are never attributed to this function."
                         (gptel-runner--elisp-current-p call generation))
                (setq outcome (cons state value))
                (unless starting
-                 (gptel-runner--elisp-result call generation state value))
+                 (funcall complete state value))
                t)))
         (condition-case err
             (progn
@@ -1015,8 +1020,7 @@ are never attributed to this function."
             ;; Cancellation or pause may have happened while startup yielded.
             (gptel-runner--cleanup-elisp call reason)
           (when outcome
-            (gptel-runner--elisp-result
-             call generation (car outcome) (cdr outcome))))))))
+            (funcall complete (car outcome) (cdr outcome))))))))
 
 (defun gptel-runner--dispatch-attempt (call)
   "Dispatch one provider attempt for CALL."
@@ -1032,7 +1036,11 @@ are never attributed to this function."
       (cl-incf (gptel-runner-call-request-attempt call))
       (setf (gptel-runner-call-state call) 'running
             (gptel-runner-call-tool-names call) nil)
-      (let ((generation (gptel-runner-call-generation call)))
+      (let* ((generation (gptel-runner-call-generation call))
+             (complete (gptel-runner--continuation
+                        run (lambda (status &optional value metadata)
+                              (gptel-runner--driver-result
+                               call generation status value metadata)))))
         (unless driver-counts
           (gptel-runner--emit
            run 'request-started (gptel-runner-call-node call) call
@@ -1040,14 +1048,11 @@ are never attributed to this function."
         (condition-case err
             (gptel-runner-driver-start
              (gptel-runner-run-driver run) call
-             (lambda (status &optional value metadata)
-               (gptel-runner--driver-result
-                call generation status value metadata))
+             complete
              (lambda (type &optional data)
                (gptel-runner--call-observe call generation type data)))
           (error
-           (gptel-runner--driver-result
-            call generation 'permanent err (list :permanent t))))))))
+           (funcall complete 'permanent err (list :permanent t))))))))
 
 (defun gptel-runner--finish-call (call state &optional value)
   "Terminalize CALL as STATE with VALUE exactly once."
@@ -1116,38 +1121,121 @@ queued siblings cannot start before those groups cancel them."
              ,@body)
          (gptel-runner--drain-queue ,run-var)))))
 
+(defun gptel-runner--continuation (run function)
+  "Wrap FUNCTION as a stack-safe continuation for RUN's current generation.
+Completions take priority over call dispatch.  The outermost scheduler drains
+them synchronously; recursive completions only enqueue work.  In particular,
+returning from `gptel-runner-start' still completes purely synchronous flows."
+  (let ((generation (gptel-runner-run-generation run)))
+    (lambda (&rest arguments)
+      (when (and (= generation (gptel-runner-run-generation run))
+                 (eq (gptel-runner-run-state run) 'running))
+        (setf (gptel-runner-run-continuations run)
+              (nconc (gptel-runner-run-continuations run)
+                     (list (list generation function arguments
+                                 (and (memq run gptel-runner--dispatch-deferred-runs)
+                                      t)))))
+        (gptel-runner--drain-queue run)))))
+
+(defun gptel-runner--recovery-hook (hook)
+  "Wrap HOOK functions so observer errors cannot interrupt error recovery."
+  (mapcar (lambda (function)
+            (lambda (&rest arguments)
+              (condition-case nil
+                  (apply function arguments)
+                ((error quit) nil))))
+          hook))
+
+(defun gptel-runner--execution-error (run generation error-data)
+  "Finish RUN after unexpected ERROR-DATA in execution GENERATION.
+Invalidate old continuations and stop active work before running any explicit
+finalizer.  An obsolete execution must not replace a newer phase's outcome.
+Errors after terminalization, such as a failing user callback, still signal."
+  (when (and (= generation (gptel-runner-run-generation run))
+             (not (eq (gptel-runner-run-state run) 'running)))
+    (signal (car error-data) (cdr error-data)))
+  (when (and (= generation (gptel-runner-run-generation run))
+             (eq (gptel-runner-run-state run) 'running))
+    ;; The original error may itself have come from an observer.  Keep other
+    ;; observers informed without letting that observer strand teardown too.
+    (let ((gptel-runner-event-hook
+           (gptel-runner--recovery-hook gptel-runner-event-hook))
+          (gptel-runner-call-release-hook
+           (gptel-runner--recovery-hook gptel-runner-call-release-hook)))
+      (setf (gptel-runner-run-state run) 'failing)
+      (cl-incf (gptel-runner-run-generation run))
+      (dolist (call (copy-sequence (gptel-runner-run-calls run)))
+        (setf (gptel-runner-call-on-complete call) nil)
+        (if (gptel-runner--call-terminal-p call)
+            ;; Completion marks a call terminal before releasing resources.
+            ;; An observer can have interrupted that release halfway through.
+            (gptel-runner--deactivate-call call)
+          (gptel-runner-abort-call call 'execution-error)))
+      (gptel-runner--finish-run
+       run (if (eq (car error-data) 'quit) 'cancelled 'failed)
+       (list :type (if (eq (car error-data) 'quit)
+                       'execution-quit 'execution-error)
+             :error error-data)))))
+
+(defun gptel-runner--dispatch-next (run)
+  "Dispatch at most one eligible call in RUN, returning non-nil for progress."
+  (let ((rest (gptel-runner-run-queue run)) found)
+    (while (and rest (not found))
+      (when (gptel-runner--can-start-p run (car rest))
+        (setq found (car rest)))
+      (setq rest (cdr rest)))
+    (when found
+      (setf (gptel-runner-run-queue run)
+            (delq found (gptel-runner-run-queue run)))
+      (unless (gptel-runner--call-terminal-p found)
+        (push found (gptel-runner-run-active-calls run))
+        (cl-incf (gptel-runner-run-active-count run))
+        (when (gptel-runner--writer-p found)
+          (cl-incf (gptel-runner-run-writer-active run)))
+        (setf (gptel-runner-call-started-at found) (float-time))
+        (gptel-runner--emit run 'call-started
+                            (gptel-runner-call-node found) found nil)
+        (if (gptel-runner--elisp-call-p found)
+            (gptel-runner--dispatch-elisp found)
+          (gptel-runner--dispatch-attempt found)))
+      t)))
+
 (defun gptel-runner--drain-queue (run)
-  "Process queued work in RUN as budgets and locks permit."
-  (when (and (eq (gptel-runner-run-state run) 'running)
-             (not (memq run gptel-runner--dispatch-deferred-runs)))
-    (let ((progress t))
-      (while progress
-        (setq progress nil)
-        (let ((rest (gptel-runner-run-queue run)) found)
-          (while (and rest (not found))
-            (when (gptel-runner--can-start-p run (car rest))
-              (setq found (car rest)))
-            (setq rest (cdr rest)))
-          (when found
-            (setf (gptel-runner-run-queue run)
-                  (delq found (gptel-runner-run-queue run)))
-            (unless (gptel-runner--call-terminal-p found)
-              (push found (gptel-runner-run-active-calls run))
-              (cl-incf (gptel-runner-run-active-count run))
-              (when (gptel-runner--writer-p found)
-                (cl-incf (gptel-runner-run-writer-active run)))
-              (setf (gptel-runner-call-started-at found) (float-time))
-              (gptel-runner--emit run 'call-started
-                                  (gptel-runner-call-node found) found nil)
-              (if (gptel-runner--elisp-call-p found)
-                  (gptel-runner--dispatch-elisp found)
-                (gptel-runner--dispatch-attempt found)))
-            (setq progress t)))))))
+  "Drain RUN's continuations and eligible calls without recursive dispatch.
+The pump is per run, so a step can synchronously start a different run.
+Always process completions before admitting the next call: a failed child
+must be able to cancel queued siblings before their side effects begin.
+Recheck state and generation between actions, including finalization phases.
+Continuations queued inside a teardown retain its dispatch barrier while they
+propagate failure to ancestors.  The barrier never delays an independent run.
+These transient queues and guards are deliberately not persisted."
+  (unless (or (gptel-runner-run-dispatching run)
+              (memq run gptel-runner--dispatch-deferred-runs))
+    (setf (gptel-runner-run-dispatching run) t)
+    (unwind-protect
+        (let ((progress t))
+          (while (and progress (eq (gptel-runner-run-state run) 'running))
+            (let ((generation (gptel-runner-run-generation run)))
+              (condition-case err
+                  (if-let* ((next (pop (gptel-runner-run-continuations run))))
+                      (when (= (car next) generation)
+                        (let ((gptel-runner--dispatch-deferred-runs
+                               (if (nth 3 next)
+                                   (cons run gptel-runner--dispatch-deferred-runs)
+                                 gptel-runner--dispatch-deferred-runs)))
+                          (apply (cadr next) (caddr next))))
+                    (setq progress (gptel-runner--dispatch-next run)))
+                ((error quit)
+                 (gptel-runner--execution-error run generation err))))))
+      (setf (gptel-runner-run-dispatching run) nil)
+      (unless (eq (gptel-runner-run-state run) 'running)
+        (setf (gptel-runner-run-continuations run) nil)))))
 
 (defun gptel-runner--submit-call (run node agent prompt done &optional repair-p owner)
   "Queue a call for NODE in RUN, invoking DONE on terminalization.
 AGENT and PROMPT are nil for Elisp steps.  REPAIR-P marks an agent repair.
 OWNER identifies the downstream node whose question this call serves."
+  (setq done (gptel-runner--continuation run done))
   (if (and (not (eq (gptel-runner-node-kind node) 'elisp))
            (not (gptel-runner--consume-call run)))
       (progn
