@@ -1038,36 +1038,47 @@ are never attributed to this function."
 (defun gptel-runner--dispatch-attempt (call)
   "Dispatch one provider attempt for CALL."
   (let* ((run (gptel-runner-call-run call))
+         (run-generation (gptel-runner-run-generation run))
          (driver-counts (gptel-runner-driver-counts-requests-p
                          (gptel-runner-run-driver run))))
-    (if (not (or driver-counts (gptel-runner--consume-request run)))
-        (gptel-runner--finish-call
-         call 'failed
-         (gptel-runner--budget-failure
-          run 'requests
-          (gptel-runner-budget-max-requests (gptel-runner-run-budget run))))
-      (cl-incf (gptel-runner-call-request-attempt call))
-      (setf (gptel-runner-call-state call) 'running
-            (gptel-runner-call-tool-names call) nil)
-      (let* ((generation (gptel-runner-call-generation call))
-             (complete (gptel-runner--continuation
-                        run (lambda (status &optional value metadata)
-                              (gptel-runner--driver-result
-                               call generation status value metadata))
-                        (or (gptel-runner-call-discussion-owner call)
-                            (gptel-runner-call-node call)))))
-        (unless driver-counts
-          (gptel-runner--emit
-           run 'request-started (gptel-runner-call-node call) call
-           (list :attempt (gptel-runner-call-request-attempt call))))
-        (condition-case err
-            (gptel-runner-driver-start
-             (gptel-runner-run-driver run) call
-             complete
-             (lambda (type &optional data)
-               (gptel-runner--call-observe call generation type data)))
-          (error
-           (funcall complete 'permanent err (list :permanent t))))))))
+    ;; Admission and call-started observers may have paused or cancelled the
+    ;; call, including by yielding to an interactive command.  Never revive it.
+    (when (and (eq (gptel-runner-run-state run) 'running)
+               (eq (gptel-runner-call-state call) 'ready)
+               (memq call (gptel-runner-run-active-calls run)))
+      (if (not (or driver-counts (gptel-runner--consume-request run)))
+          (gptel-runner--finish-call
+           call 'failed
+           (gptel-runner--budget-failure
+            run 'requests
+            (gptel-runner-budget-max-requests (gptel-runner-run-budget run))))
+        (cl-incf (gptel-runner-call-request-attempt call))
+        (setf (gptel-runner-call-state call) 'running
+              (gptel-runner-call-tool-names call) nil)
+        (let* ((generation (gptel-runner-call-generation call))
+               (complete (gptel-runner--continuation
+                          run (lambda (status &optional value metadata)
+                                (gptel-runner--driver-result
+                                 call generation status value metadata))
+                          (or (gptel-runner-call-discussion-owner call)
+                              (gptel-runner-call-node call)))))
+          (unless driver-counts
+            (gptel-runner--emit
+             run 'request-started (gptel-runner-call-node call) call
+             (list :attempt (gptel-runner-call-request-attempt call))))
+          (when (and (= run-generation (gptel-runner-run-generation run))
+                     (= generation (gptel-runner-call-generation call))
+                     (eq (gptel-runner-run-state run) 'running)
+                     (eq (gptel-runner-call-state call) 'running)
+                     (memq call (gptel-runner-run-active-calls run)))
+            (condition-case err
+                (gptel-runner-driver-start
+                 (gptel-runner-run-driver run) call
+                 complete
+                 (lambda (type &optional data)
+                   (gptel-runner--call-observe call generation type data)))
+              (error
+               (funcall complete 'permanent err (list :permanent t))))))))))
 
 (defun gptel-runner--finish-call (call state &optional value)
   "Terminalize CALL as STATE with VALUE exactly once."

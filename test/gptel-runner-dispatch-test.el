@@ -512,3 +512,32 @@
 
 (provide 'gptel-runner-dispatch-test)
 ;;; gptel-runner-dispatch-test.el ends here
+
+(ert-deftest gptel-runner-dispatch-observer-stop-prevents-provider-start ()
+  (dolist (event-type '(call-started request-started))
+    (dolist (action '(cancel pause))
+      (gptel-runner-dispatch-test--isolated
+        (gptel-runner-register-agent 'worker)
+        (gptel-runner-defworkflow observer-stop ()
+          (gptel-runner-agent-step :id 'work :agent 'worker :prompt "work"))
+        (let* ((driver (gptel-runner-fake-driver-create))
+               (gptel-runner-event-hook
+                (list (lambda (event)
+                        (when (eq (gptel-runner-event-type event) event-type)
+                          (let ((run (gptel-runner-find-run
+                                      (gptel-runner-event-run-id event))))
+                            (if (eq action 'cancel)
+                                (gptel-runner-abort-run run)
+                              (gptel-runner-pause-run run))))))))
+          (gptel-runner-fake-queue driver 'worker '(:value "done"))
+          (let ((run (gptel-runner-start 'observer-stop :driver driver)))
+            (should (eq (gptel-runner-run-state run)
+                        (if (eq action 'cancel) 'cancelled 'paused)))
+            (should-not (gptel-runner-fake-driver-starts driver))
+            (should-not (gptel-runner-run-active-calls run))
+            (should (zerop (gptel-runner-run-active-count run)))
+            (when (eq action 'pause)
+              (let ((gptel-runner-event-hook nil))
+                (gptel-runner-resume-run run))
+              (should (eq (gptel-runner-run-state run) 'succeeded))
+              (should (= (length (gptel-runner-fake-driver-starts driver)) 1)))))))))
