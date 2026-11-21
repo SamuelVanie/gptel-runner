@@ -317,15 +317,43 @@ TARGET defaults to the selected background run or node."
        (gptel-runner-jobs-ui--insert-messages (gptel-runner-invocation-get id) node)))
     (setq-local gptel-runner-background--target target)))
 
+(defun gptel-runner-jobs-ui--artifact-choices (artifacts)
+  "Return a completion alist with distinct labels for ARTIFACTS.
+Keep unique names unchanged.  Qualify repeated names with the epoch, when
+available, and retained filename.  Resolve remaining label collisions in
+publication order, reserving literal names even when they resemble labels."
+  (let ((names (make-hash-table :test #'equal))
+        (used (make-hash-table :test #'equal))
+        (choices (mapcar (lambda (item)
+                           (cons (or (plist-get item :name)
+                                     (plist-get item :file)) item))
+                         artifacts)))
+    (dolist (choice choices)
+      (puthash (car choice) (1+ (gethash (car choice) names 0)) names))
+    (dolist (choice choices)
+      (when (> (gethash (car choice) names) 1)
+        (let* ((item (cdr choice))
+               (epoch (plist-get item :epoch))
+               (base (format "%s [%s%s]" (car choice)
+                             (if epoch (format "epoch %s; " epoch) "")
+                             (plist-get item :file)))
+               (label base)
+               (number 1))
+          ;; Filenames distinguish normal publications, including repeated
+          ;; names in one epoch.  Also handle duplicate imported descriptors
+          ;; and literal names that happen to match a generated label.
+          (while (or (gethash label names) (gethash label used))
+            (setq label (format "%s #%d" base (cl-incf number))))
+          (setcar choice label)))
+      (puthash (car choice) t used))
+    choices))
+
 (defun gptel-runner-background-artifact ()
   "Open a selected artifact belonging to the background invocation."
   (interactive)
   (pcase-let* ((`(,run ,_call ,target) (gptel-runner-jobs-ui--selection))
-               (choices
-                (mapcar (lambda (item)
-                          (cons (or (plist-get item :name)
-                                    (plist-get item :file)) item))
-                        (gptel-runner-artifacts run))))
+               (choices (gptel-runner-jobs-ui--artifact-choices
+                         (gptel-runner-artifacts run))))
     (unless choices (user-error "This invocation has no artifacts"))
     (let* ((choice (completing-read "Artifact: " choices nil t))
            (path (gptel-runner-artifact-file
