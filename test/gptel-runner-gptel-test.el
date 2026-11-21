@@ -1656,8 +1656,7 @@
         (gptel-runner-complete-call-from-buffer nil call)
         (should (eq (gptel-runner-run-state run) 'succeeded))))))
 
-(provide 'gptel-runner-gptel-test)
-;;; gptel-runner-gptel-test.el ends here
+
 
 (ert-deftest gptel-runner-gptel-cancel-before-dispatch-sends-no-request ()
   (gptel-runner-gptel-test--with-transport
@@ -1677,3 +1676,6 @@
       (should-not (buffer-live-p (gptel-runner-call-buffer call)))
       (should (zerop (gptel-runner-budget-requests
                      (gptel-runner-run-budget run)))))))
+
+(provide 'gptel-runner-gptel-test)
+;;; gptel-runner-gptel-test.el ends here

@@ -510,8 +510,7 @@
           (funcall resolve 'duplicate)
           (should (= callbacks 1)))))))
 
-(provide 'gptel-runner-dispatch-test)
-;;; gptel-runner-dispatch-test.el ends here
+
 
 (ert-deftest gptel-runner-dispatch-observer-stop-prevents-provider-start ()
   (dolist (event-type '(call-started request-started))
@@ -541,3 +540,6 @@
                 (gptel-runner-resume-run run))
               (should (eq (gptel-runner-run-state run) 'succeeded))
               (should (= (length (gptel-runner-fake-driver-starts driver)) 1)))))))))
+
+(provide 'gptel-runner-dispatch-test)
+;;; gptel-runner-dispatch-test.el ends here

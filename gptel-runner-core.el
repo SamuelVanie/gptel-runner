@@ -275,23 +275,24 @@ RUN may also be a background invocation record."
         (plist-get outcome :value)
       default)))
 
-(defun gptel-runner--node-workspace (node workspace)
+(defun gptel-runner--node-workspace (node workspace &optional allow-missing)
   "Resolve NODE's workspace override relative to run WORKSPACE.
-An absent or nil override falls back to WORKSPACE."
-  (if-let* ((override (plist-get (gptel-runner-node-properties node)
-                                :workspace)))
-      (progn
-        (unless (and (stringp override) (not (string-empty-p override)))
-          (user-error "Node %S workspace must be a non-empty directory name"
-                      (gptel-runner-node-id node)))
-        (let ((directory (file-name-as-directory
-                          (file-truename
-                           (expand-file-name override workspace)))))
-          (unless (file-directory-p directory)
-            (user-error "Node %S workspace is not a directory: %s"
-                        (gptel-runner-node-id node) directory))
-          directory))
-    workspace))
+An absent or nil override falls back to WORKSPACE.  ALLOW-MISSING permits
+restoring historical conversations after their workspace was removed."
+  (let* ((override (plist-get (gptel-runner-node-properties node) :workspace))
+         (directory
+          (if override
+              (progn
+                (unless (and (stringp override) (not (string-empty-p override)))
+                  (user-error "Node %S workspace must be a non-empty directory name"
+                              (gptel-runner-node-id node)))
+                (file-name-as-directory
+                 (file-truename (expand-file-name override workspace))))
+            workspace)))
+    (when (and directory (not allow-missing) (not (file-directory-p directory)))
+      (user-error "Node %S workspace is not a directory: %s"
+                  (gptel-runner-node-id node) directory))
+    directory))
 
 (defun gptel-runner-node-workspace (run node)
   "Return the effective workspace for agent or Elisp NODE in RUN.

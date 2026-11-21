@@ -803,5 +803,85 @@
       (when (buffer-live-p clone) (kill-buffer clone))
       (delete-directory gptel-agent-session-directory t))))
 
+
+
+(ert-deftest gptel-runner-session-history-survives-missing-inputs ()
+  (dolist (missing '(context workspace override))
+    (gptel-runner-session-test--with-run
+      (let* ((workspace (expand-file-name "workspace/" gptel-runner-snapshot-directory))
+             (context (expand-file-name "context.txt" workspace)))
+        (make-directory workspace)
+        (with-temp-file context (insert "Original context"))
+        (gptel-runner-defworkflow historical-inputs (:persist t)
+          (gptel-runner-agent-step
+           :id 'read :agent 'reader :prompt "Inspect" :completion 'response
+           :workspace (and (eq missing 'override) workspace)
+           :context (gptel-runner-context-file "context.txt")))
+        (let* ((run (gptel-runner-start
+                     'historical-inputs :workspace
+                     (if (eq missing 'override) gptel-runner-snapshot-directory workspace)))
+               (file (gptel-runner-run-snapshot-file run)))
+          (gptel-runner-gptel-test--reply (pop requests) "Archived findings" "stop")
+          (gptel-runner-forget-run run)
+          (if (eq missing 'context) (delete-file context) (delete-directory workspace t))
+          (setq run (gptel-runner-load-run file))
+          (should (eq (gptel-runner-run-state run) 'succeeded))
+          (with-current-buffer (gptel-runner-node-buffer run 'read)
+            (should (string-search "Archived findings" (buffer-string))))
+          (should-not requests)
+          ;; Viewing history needs no old files, but new execution still does.
+          (gptel-runner-rerun run)
+          (should (eq (gptel-runner-run-state run) 'failed))
+          (should-not requests))))))
+
+(ert-deftest gptel-runner-session-resume-checks-only-unfinished-inputs ()
+  (dolist (missing '(finished unfinished))
+    (gptel-runner-session-test--with-run
+      (let* ((first (expand-file-name "first.txt" gptel-runner-snapshot-directory))
+             (second (expand-file-name "second.txt" gptel-runner-snapshot-directory)))
+        (dolist (file (list first second))
+          (with-temp-file file (insert "Original context")))
+        (gptel-runner-defworkflow historical-resume (:persist t :completion response)
+          (gptel-runner-sequence
+           (gptel-runner-agent-step :id 'first :agent 'reader :prompt "First"
+                                    :context (gptel-runner-context-file first))
+           (gptel-runner-agent-step :id 'second :agent 'reader :prompt "Second"
+                                    :context (gptel-runner-context-file second))))
+        (let* ((run (gptel-runner-start 'historical-resume))
+               (file (gptel-runner-run-snapshot-file run)))
+          (gptel-runner-gptel-test--reply (pop requests) "First completed" "stop")
+          (should (pop requests))
+          (gptel-runner-pause-run run)
+          (gptel-runner-forget-run run)
+          (delete-file (if (eq missing 'finished) first second))
+          (setq run (gptel-runner-load-run file))
+          (should (eq (gptel-runner-run-state run) 'paused))
+          (gptel-runner-resume-run run)
+          (if (eq missing 'finished)
+              (progn
+                (should (= (length requests) 1))
+                (gptel-runner-gptel-test--reply (pop requests) "Second completed" "stop")
+                (should (eq (gptel-runner-run-state run) 'succeeded)))
+            (should (eq (gptel-runner-run-state run) 'failed)))
+          (should-not requests))))))
+
+(ert-deftest gptel-runner-session-history-still-validates-workflow-contracts ()
+  (gptel-runner-session-test--with-run
+    (gptel-runner-register-agent 'writer :workspace-mode 'write)
+    (gptel-runner-defworkflow historical-contracts (:persist t :completion response)
+      (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect"))
+    (let* ((run (gptel-runner-start 'historical-contracts))
+           (file (gptel-runner-run-snapshot-file run))
+           (node (gptel-runner-workflow-root (gptel-runner-run-workflow run)))
+           (original (gptel-runner-node-properties node)))
+      (gptel-runner-gptel-test--reply (pop requests) "Archived findings" "stop")
+      (gptel-runner-forget-run run)
+      (dolist (change '((:context (:file 42)) (:workspace 42) (:agent writer)))
+        (setf (gptel-runner-node-properties node)
+              (plist-put (copy-sequence original) (car change) (cadr change)))
+        (should-error (gptel-runner-load-run file) :type 'user-error)
+        (should-not (gptel-runner-find-run (gptel-runner-run-id run))))
+      (should-not requests))))
+
 (provide 'gptel-runner-session-test)
 ;;; gptel-runner-session-test.el ends here

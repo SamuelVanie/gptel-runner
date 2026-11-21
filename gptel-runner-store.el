@@ -913,7 +913,9 @@ Noninteractive shutdown relies on the best-effort `kill-emacs-hook' flush."
       (user-error "Invalid saved chat call %S" id))
     (gptel-runner-store--notice-id id)
     (gptel-runner-call-create
-     :id id :run run :node node :workspace (gptel-runner-node-workspace run node)
+     :id id :run run :node node
+     :workspace (gptel-runner--node-workspace
+                 node (gptel-runner-run-workspace run) t)
      :agent (gptel-runner--agent (plist-get (gptel-runner-node-properties node) :agent))
      :state (if (or (gptel-runner--terminal-p state) (eq state 'waiting-feedback))
                 state 'paused)
@@ -929,7 +931,9 @@ Noninteractive shutdown relies on the best-effort `kill-emacs-hook' flush."
 (defun gptel-runner-load-run (file &optional callback driver)
   "Open the run saved in FILE using CALLBACK and DRIVER.
 The workflow and agents must already be registered.  Its node conversations
-open on demand.  A version 2 checkpoint restores execution state only."
+open on demand, even if original context files or workspaces were removed.
+New execution still requires its node's inputs and workspace to be available.
+A version 2 checkpoint restores execution state only."
   (setq file (expand-file-name file))
   (let* ((snapshot (gptel-runner-store--read-file file))
          (data (plist-get snapshot :run))
@@ -1006,7 +1010,8 @@ open on demand.  A version 2 checkpoint restores execution state only."
      (gptel-runner-run-workspace run)
      (list (cons "workflow" (plist-get (gptel-runner-workflow-options workflow)
                                        :context))
-           (cons "run" (plist-get (gptel-runner-run-options run) :context))))
+           (cons "run" (plist-get (gptel-runner-run-options run) :context)))
+     t)
     (gptel-runner--validate-discussions run)
     (dolist (entry (plist-get data :node-states))
       (unless (gptel-runner-store--node root (car entry))
