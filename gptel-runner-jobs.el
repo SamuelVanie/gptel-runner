@@ -1238,6 +1238,13 @@ Opaque runtime objects and circular references are represented by type."
       (signal 'gptel-runner-job-storage-error '("Worker checkpoint could not be committed")))
     (gptel-runner-jobs--publish)))
 
+(defun gptel-runner-jobs--cancel-snapshot ()
+  "Detach the worker's snapshot coordinator before relinquishing ownership."
+  (when gptel-runner-jobs--run
+    ;; Even a failed temporary-file cleanup must not retain save work that
+    ;; could overwrite a successor's checkpoint during process shutdown.
+    (ignore-errors (gptel-runner-store-cancel-save gptel-runner-jobs--run))))
+
 (defun gptel-runner-jobs--apply-command (command)
   "Execute validated COMMAND in its owning worker."
   (gptel-runner-jobs--validate-command-arguments
@@ -1422,7 +1429,7 @@ initialization or persistence error.  This function does not call `kill-emacs'."
          ;; configuration.  Already installed native code remains usable.
          (native-comp-enable-subr-trampolines nil)
          (native-comp-jit-compilation nil)
-         (last-publish 0) (exit-code 2) finished)
+         (last-publish 0) (exit-code 2) finished ownership-released)
     (unless (and (or (null epoch)
                      (equal epoch (plist-get gptel-runner-jobs--invocation :epoch)))
                  (eq (plist-get gptel-runner-jobs--invocation :phase) 'starting)
@@ -1492,6 +1499,11 @@ initialization or persistence error.  This function does not call `kill-emacs'."
                        (gptel-runner-jobs--flush)
                        (setq exit-code (if (eq (gptel-runner-run-state gptel-runner-jobs--run) 'succeeded) 0 1)
                              finished t)
+                       (gptel-runner-jobs--cancel-snapshot)
+                       ;; Unlock may signal after removing ownership, while
+                       ;; cleaning its guard.  Never save after attempting
+                       ;; this handoff of an already committed checkpoint.
+                       (setq ownership-released t)
                        (gptel-runner-jobs--unlock lock token)
                        (setq gptel-runner-jobs--invocation
                              (plist-put gptel-runner-jobs--invocation :phase 'closed)
@@ -1503,9 +1515,13 @@ initialization or persistence error.  This function does not call `kill-emacs'."
                 (unless finished (accept-process-output nil gptel-runner-job-poll-interval))))
           (error
            (setq exit-code 2)
-           (when gptel-runner-jobs--run
+           ;; A final manifest write can fail after releasing ownership.
+           ;; At that point the checkpoint belongs to a possible successor.
+           (when (and gptel-runner-jobs--run (not ownership-released))
              (ignore-errors (gptel-runner-abort-run gptel-runner-jobs--run 'worker-error))
              (ignore-errors (gptel-runner-jobs--flush)))
+           (gptel-runner-jobs--cancel-snapshot)
+           (setq ownership-released t)
            ;; Closed/exited is a public handoff boundary on failures too:
            ;; relinquish every resource before publishing that boundary.
            (maphash (lambda (call _lock) (gptel-runner-jobs--release call))
@@ -1528,8 +1544,16 @@ initialization or persistence error.  This function does not call `kill-emacs'."
              (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file gptel-runner-jobs--invocation)
                                        gptel-runner-jobs--invocation))
            (message "Background worker failed: %s" (error-message-string err))))
-      (maphash (lambda (call _lock) (gptel-runner-jobs--release call)) gptel-runner-jobs--writer-locks)
-      (gptel-runner-jobs--unlock lock token))
+      (unwind-protect
+          ;; Preserve queued progress on quit or another nonlocal exit while
+          ;; this worker still owns its checkpoint.
+          (when (and gptel-runner-jobs--run (not ownership-released))
+            (ignore-errors (gptel-runner-store-flush-pending)))
+        (gptel-runner-jobs--cancel-snapshot)
+        (setq ownership-released t)
+        (maphash (lambda (call _lock) (gptel-runner-jobs--release call))
+                 gptel-runner-jobs--writer-locks)
+        (gptel-runner-jobs--unlock lock token)))
     exit-code))
 
 (defun gptel-runner-jobs-batch-main ()

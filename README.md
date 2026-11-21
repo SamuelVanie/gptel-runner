@@ -1099,9 +1099,12 @@ until the run has been quiet for `gptel-runner-checkpoint-delay` seconds
 Manual saves, pauses, and terminal transitions bypass that delay, but still
 return after queueing the write.  A `snapshot-saved` or `snapshot-error` event
 reports its eventual result; `gptel-runner-store-save-status` returns `clean`,
-`pending`, `writing`, or `error` for programmatic status checks.  Pending
-writes are flushed during normal Emacs shutdown; an abnormal exit can lose the
-latest queued progress.
+`pending`, `writing`, or `error` for programmatic status checks.  Normal
+interactive Emacs shutdown flushes pending writes and retries failed saves.
+If snapshots remain unsaved, exit is canceled with the affected paths and
+errors; resolve the save problem and try exiting again.  Forced `kill-emacs`
+and batch exits only attempt a best-effort flush, without prompts or vetoes.
+These exits, or an abnormal exit, can lose the latest queued progress.
 
 Pause the entire process with `M-x gptel-runner-pause-run` from a worker, or
 choose `P` from the dashboard action menu.  The active-duration clock stops

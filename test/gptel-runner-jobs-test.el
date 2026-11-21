@@ -616,6 +616,125 @@
      (should (eq (plist-get (gptel-runner-invocation-get (plist-get invocation :id)) :state)
                  'storage-error)))))
 
+(defun gptel-runner-jobs-test--snapshot-handoff (failure)
+  "Check snapshot ownership handoff with optional FAILURE injection."
+  (gptel-runner-jobs-test--isolated
+    (let* ((gptel-runner--runs (make-hash-table :test #'equal))
+           (gptel-runner--workflows (make-hash-table :test #'eq))
+           (gptel-runner-store--coordinators (make-hash-table :test #'eq))
+           (gptel-runner-default-driver nil)
+           (init (expand-file-name "init.el" gptel-runner-job-directory))
+           (write (symbol-function 'gptel-runner-jobs--write))
+           (write-parts (symbol-function 'gptel-runner-store--flush-parts))
+           (flush (symbol-function 'gptel-runner-jobs--flush))
+           (unlock (symbol-function 'gptel-runner-jobs--unlock))
+           released coordinator-at-release progress-at-release
+           late-flush manifest-failed run)
+      (with-temp-file init)
+      (gptel-runner-defworkflow snapshot-handoff ()
+        (gptel-runner-elisp-step :id 'work :function #'ignore))
+      (let* ((job (gptel-runner-jobs-test--job 'snapshot-handoff nil init))
+             (invocation (gptel-runner-jobs--new-invocation job 'test))
+             (lock (gptel-runner-jobs--job-lock (plist-get job :id)))
+             (checkpoint (expand-file-name "checkpoint.el"
+                                           (plist-get invocation :directory)))
+             (kill-emacs-hook '(gptel-runner-store-flush-pending)))
+        (unwind-protect
+            (progn
+              (cl-letf
+                  (((symbol-function 'gptel-runner-jobs--flush)
+                    (lambda ()
+                      (when released (setq late-flush t))
+                      (funcall flush)))
+                   ((symbol-function 'gptel-runner-store--flush-parts)
+                    (lambda (writer)
+                      (when released (setq late-flush t))
+                      (when (and (eq failure 'unwind-again)
+                                 (gptel-runner-get gptel-runner-jobs--run 'latest))
+                        (throw 'worker-exit 'cleanup-unwound))
+                      (when (and (eq failure 'checkpoint) (not released))
+                        (signal 'file-error '("Checkpoint disk full")))
+                      (funcall write-parts writer)))
+                   ((symbol-function 'gptel-runner-jobs--write)
+                    (lambda (file data)
+                      (if (and (eq failure 'manifest) (not manifest-failed)
+                               (string-suffix-p "/manifest.el" file)
+                               (eq (plist-get data :phase) 'closed))
+                          (progn
+                            (setq manifest-failed t)
+                            (signal 'file-error '("Final manifest failed")))
+                        (funcall write file data))))
+                   ((symbol-function 'gptel-runner-jobs--commands)
+                    (lambda ()
+                      (when (memq failure '(unwind unwind-again))
+                        (gptel-runner-put gptel-runner-jobs--run 'latest "pending")
+                        (throw 'worker-exit 'unwound))))
+                   ((symbol-function 'gptel-runner-jobs--unlock)
+                    (lambda (directory token)
+                      (when (and (equal directory lock) (not released))
+                        (setq run gptel-runner-jobs--run
+                              coordinator-at-release
+                              (gethash run gptel-runner-store--coordinators))
+                        (when (eq failure 'unwind)
+                          (setq progress-at-release
+                                (alist-get
+                                 'latest
+                                 (plist-get
+                                  (plist-get (gptel-runner-store--read-file checkpoint)
+                                             :run)
+                                  :blackboard)))))
+                      (prog1 (funcall unlock directory token)
+                        (when (and (equal directory lock) (not released))
+                          (setq released t)
+                          ;; Stand in for a successor's newer durable state.
+                          (with-temp-file checkpoint
+                            (insert "successor checkpoint"))
+                          ;; Lock-guard cleanup can fail after owner removal.
+                          (when (eq failure 'unlock)
+                            (signal 'file-error '("Lock guard cleanup failed"))))))))
+                (should
+                 (equal (catch 'worker-exit
+                          (gptel-runner-jobs-worker
+                           (plist-get invocation :directory)))
+                        (pcase failure
+                          ('unwind 'unwound)
+                          ('unwind-again 'cleanup-unwound)
+                          ((or 'checkpoint 'manifest 'unlock) 2)
+                          (_ 0)))))
+              (should released)
+              (should run)
+              (should-not coordinator-at-release)
+              (when (eq failure 'unwind)
+                (should (equal progress-at-release "pending")))
+              (should-not late-flush)
+              (should-not (gethash run gptel-runner-store--coordinators))
+              ;; This is what the batch process does after its worker returns.
+              (run-hooks 'kill-emacs-hook)
+              (with-temp-buffer
+                (insert-file-contents checkpoint)
+                (should (equal (buffer-string) "successor checkpoint"))))
+          (maphash (lambda (owned-run _coordinator)
+                     (gptel-runner-store-cancel-save owned-run))
+                   gptel-runner-store--coordinators))))))
+
+(ert-deftest gptel-runner-jobs-success-disposes-snapshot-before-handoff ()
+  (gptel-runner-jobs-test--snapshot-handoff nil))
+
+(ert-deftest gptel-runner-jobs-checkpoint-error-disposes-snapshot-before-handoff ()
+  (gptel-runner-jobs-test--snapshot-handoff 'checkpoint))
+
+(ert-deftest gptel-runner-jobs-final-manifest-error-does-not-write-after-handoff ()
+  (gptel-runner-jobs-test--snapshot-handoff 'manifest))
+
+(ert-deftest gptel-runner-jobs-unlock-error-does-not-write-after-handoff ()
+  (gptel-runner-jobs-test--snapshot-handoff 'unlock))
+
+(ert-deftest gptel-runner-jobs-unwind-disposes-snapshot-before-handoff ()
+  (gptel-runner-jobs-test--snapshot-handoff 'unwind))
+
+(ert-deftest gptel-runner-jobs-interrupted-unwind-still-disposes-before-handoff ()
+  (gptel-runner-jobs-test--snapshot-handoff 'unwind-again))
+
 (ert-deftest gptel-runner-jobs-journal-error-retains-uncommitted-events ()
   (gptel-runner-jobs-test--isolated
    (let* ((invocation (gptel-runner-jobs--new-invocation (gptel-runner-jobs-test--job) 'test))
