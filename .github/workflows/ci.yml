@@ -29,7 +29,7 @@ jobs:
           version: '30.2'
       - run: mkdir -p .packages
       - run: git clone --depth 1 --branch v0.9.9.6 https://github.com/karthink/gptel.git .packages/gptel
-      - run: emacs -Q --batch -L . -L test -L .packages/gptel -l test/gptel-runner-session-test.el -f ert-run-tests-batch-and-exit
+      - run: emacs -Q --batch -L . -L test -L .packages/gptel -l test/gptel-runner-session-test.el -l test/gptel-runner-request-budget-test.el -f ert-run-tests-batch-and-exit
 
   gptel-master-warning:
     continue-on-error: true
@@ -41,4 +41,4 @@ jobs:
           version: '30.2'
       - run: mkdir -p .packages
       - run: git clone --depth 1 https://github.com/karthink/gptel.git .packages/gptel
-      - run: emacs -Q --batch -L . -L test -L .packages/gptel -l test/gptel-runner-session-test.el -f ert-run-tests-batch-and-exit
+      - run: emacs -Q --batch -L . -L test -L .packages/gptel -l test/gptel-runner-session-test.el -l test/gptel-runner-request-budget-test.el -f ert-run-tests-batch-and-exit
