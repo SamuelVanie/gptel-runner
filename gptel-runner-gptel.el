@@ -1062,6 +1062,59 @@ RAW is gptel's internal flag for already formatted transcript content."
       (funcall (gptel-runner-gptel--complete-function call)
                'cancelled nil nil))))
 
+(defun gptel-runner-gptel--request-budget-exhausted (call fsm)
+  "Stop CALL and FSM with a request budget failure before another send."
+  (let* ((run (gptel-runner-call-run call))
+         (failure (gptel-runner--budget-failure
+                   run 'requests
+                   (gptel-runner-budget-max-requests
+                    (gptel-runner-run-budget run)))))
+    ;; Feedback has its own terminal handler and may retain a completed
+    ;; scheduler closure.  Fail the call directly after retiring this FSM,
+    ;; before finalization can synchronously reuse the chat and its budget.
+    (cl-incf (gptel-runner-call-generation call))
+    (setf (gptel-runner-call-driver-data call)
+          (plist-put (gptel-runner-call-driver-data call) :feedback-active nil))
+    (plist-put (gptel-fsm-info fsm) :error failure)
+    (gptel-runner-gptel--retire-request call)
+    (gptel--fsm-transition fsm 'ERRS)
+    (unwind-protect
+        (progn
+          (gptel-runner-gptel--stop-supervision call)
+          (gptel-runner-gptel--update-status
+           (gptel-fsm-info fsm) " Error: request budget exhausted" 'error)
+          (gptel--handle-post fsm))
+      (gptel-runner--finish-call call 'failed failure))))
+
+(defun gptel-runner-gptel--send-request (fsm handlers)
+  "Charge runner FSM's next provider send before executing HANDLERS."
+  (let* ((call (plist-get (gptel-fsm-info fsm) :context))
+         (runner-call (gptel-runner-call-p call))
+         (generation (and runner-call (gptel-runner-call-generation call))))
+    (when (or (not runner-call)
+              (and (eq fsm (gptel-runner-call-fsm call))
+                   (memq (gptel-runner-call-state call)
+                         '(running waiting-tool waiting-confirmation))))
+      (if (and runner-call
+               (not (gptel-runner--consume-request
+                     (gptel-runner-call-run call))))
+          (gptel-runner-gptel--request-budget-exhausted call fsm)
+        (gptel-runner-gptel--prepare-request fsm)
+        (when runner-call
+          (gptel-runner--emit
+           (gptel-runner-call-run call) 'request-started
+           (gptel-runner-call-node call) call
+           (list :attempt (gptel-runner-call-request-attempt call))))
+        ;; An event hook can synchronously cancel or pause this attempt.
+        ;; Retiring the FSM does not disarm our captured native handlers.
+        (when (or (not runner-call)
+                  (and (= generation (gptel-runner-call-generation call))
+                       (not (gptel-runner--call-terminal-p call))
+                       (eq fsm (gptel-runner-call-fsm call))))
+          (mapc (lambda (handler) (funcall handler fsm)) handlers)
+          (when (eq (gptel-fsm-state fsm) 'WAIT)
+            (gptel--update-wait fsm)))))))
+
 (defun gptel-runner-gptel--make-fsm (&optional terminal-handler)
   "Create a per-call FSM with runner terminals and gptel status handlers.
 When supplied, TERMINAL-HANDLER handles all three terminal states."
@@ -1087,8 +1140,11 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
       (setf (alist-get state handlers)
             (copy-sequence (alist-get state gptel-send--handlers))))
     (setf (alist-get 'WAIT handlers)
-          (append (list #'gptel-runner-gptel--prepare-request)
-                  (alist-get 'WAIT handlers) (list #'gptel--update-wait))
+          ;; A separate guard cannot short-circuit gptel's handler list.
+          ;; Enclose the entire native send chain in the budget gate.
+          (let ((send-handlers (alist-get 'WAIT handlers)))
+            (list (lambda (fsm)
+                    (gptel-runner-gptel--send-request fsm send-handlers))))
           (alist-get 'TOOL handlers)
           (append (list #'gptel-runner-gptel--tool-started
                         #'gptel--update-tool-call)
@@ -1138,6 +1194,11 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
                (gptel-runner-run-child-chats run)))))
 
 (add-hook 'gptel-runner-event-hook #'gptel-runner-gptel--release-chats)
+
+(cl-defmethod gptel-runner-driver-counts-requests-p
+  ((_driver gptel-runner-gptel-driver))
+  "Charge each gptel transport send, including tool and feedback rounds."
+  t)
 
 (cl-defmethod gptel-runner-driver-start
   ((_driver gptel-runner-gptel-driver) call complete observe)
@@ -1385,12 +1446,15 @@ At a human approval gate the new response awaits explicit acceptance using
                            (not (gptel-runner--call-terminal-p call)))
                   (gptel-runner-gptel--callback call observe response info raw)))))
         (error
-         (gptel-runner-gptel--stop-supervision call)
-         (setf (gptel-runner-call-state call) 'waiting-feedback)
-         (gptel-runner--deactivate-call call)
-         (setf (gptel-runner-call-driver-data call)
-               (plist-put (gptel-runner-call-driver-data call)
-                          :feedback-active nil))
+         ;; A send-time budget failure may have already terminalized the
+         ;; call, even when a request cleanup hook subsequently signals.
+         (unless (gptel-runner--call-terminal-p call)
+           (gptel-runner-gptel--stop-supervision call)
+           (setf (gptel-runner-call-state call) 'waiting-feedback)
+           (gptel-runner--deactivate-call call)
+           (setf (gptel-runner-call-driver-data call)
+                 (plist-put (gptel-runner-call-driver-data call)
+                            :feedback-active nil)))
          (signal (car err) (cdr err)))))
     call))
 

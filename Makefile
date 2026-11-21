@@ -1,6 +1,6 @@
 EMACS ?= emacs
 ELFILES := $(wildcard gptel-runner*.el)
-TESTFILES := $(filter-out test/gptel-runner-gptel-test.el test/gptel-runner-delegation-test.el test/gptel-runner-session-test.el,$(wildcard test/*-test.el))
+TESTFILES := $(filter-out test/gptel-runner-gptel-test.el test/gptel-runner-delegation-test.el test/gptel-runner-session-test.el test/gptel-runner-request-budget-test.el,$(wildcard test/*-test.el))
 INTEGRATION_LOAD_PATH ?=
 
 .PHONY: test integration-test compile checkdoc package-lint clean release-check
@@ -12,10 +12,11 @@ test: clean
 integration-test:
 	$(EMACS) -Q --batch $(INTEGRATION_LOAD_PATH) -L . -L test \
 	  --eval '(setq load-prefer-newer t)' \
-	  -l test/gptel-runner-session-test.el -f ert-run-tests-batch-and-exit
+	  -l test/gptel-runner-session-test.el -l test/gptel-runner-request-budget-test.el \
+	  -f ert-run-tests-batch-and-exit
 	$(EMACS) -Q --batch $(INTEGRATION_LOAD_PATH) -L . -L test \
 	  --eval '(setq load-prefer-newer t)' \
-	  -l test/gptel-runner-delegation-test.el \
+	  -l test/gptel-runner-request-budget-delegation.el \
 	  --eval '(ert-run-tests-batch-and-exit "^gptel-runner-delegation-")'
 
 compile: clean

@@ -1574,6 +1574,14 @@ and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/ar
 - Request retries reuse one logical call and consume request attempts.  An
   agent-step retry creates a new call.  An implementation revision is a new
   workflow iteration.  These are intentionally separate counters.
+- `:max-requests` counts each runner-owned gptel provider send attempt, including
+  automatic tool rounds, discussion replies, explicit review feedback, and
+  transport retries. Preparing a request without sending it consumes no
+  request budget. Reaching the limit allows the current response to finish;
+  attempting another send fails the call with a request budget error.
+  Successful tool rounds do not consume the transport retry allowance.
+  Ordinary manual chat sends and independently managed delegated child
+  requests remain outside this counter; configure their own limits separately.
 - Requests honor `gptel-stream`, including preset overrides and backend/model
   support, just like ordinary gptel chats.  Tool calls and reasoning can stream
   into the worker transcript; a stream ending does not finish the agent until
@@ -1604,6 +1612,14 @@ the preceding agent, or `discussion` with a reply awaiting human feedback.
 Parsers and validators remain runner-owned,
 so provider schema support is a reliability hint rather than an approval
 authority.
+
+By default, custom and fake drivers consume one request per
+`gptel-runner-driver-start` invocation. A driver that sends multiple provider
+requests per invocation can implement `gptel-runner-driver-counts-requests-p`
+and return non-nil to take responsibility for checking and charging every send,
+reporting `request-started`, and terminating the call on budget exhaustion.
+The gptel adapter uses this contract to avoid charging its initial send or
+transport retries twice.
 
 ## Compatibility
 

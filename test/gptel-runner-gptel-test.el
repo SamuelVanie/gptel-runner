@@ -638,10 +638,8 @@
 (ert-deftest gptel-runner-gptel-fsm-adds-status-and-replaces-terminals ()
   (let* ((fsm (gptel-runner-gptel--make-fsm))
          (handlers (gptel-fsm-handlers fsm)))
-    (should (equal (alist-get 'WAIT handlers)
-                   (append (list #'gptel-runner-gptel--prepare-request)
-                           (alist-get 'WAIT gptel-request--handlers)
-                           (list #'gptel--update-wait))))
+    ;; The native send handlers must be enclosed by a single budget gate.
+    (should (= (length (alist-get 'WAIT handlers)) 1))
     (should (equal (alist-get 'TOOL handlers)
                    (append (list #'gptel-runner-gptel--tool-started
                                  #'gptel--update-tool-call)

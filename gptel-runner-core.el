@@ -311,6 +311,16 @@ status; request budgets, retry limits, and `:permanent' still apply.")
 (cl-defgeneric gptel-runner-driver-cancel (driver call)
   "Ask DRIVER to cancel CALL.")
 
+(cl-defgeneric gptel-runner-driver-counts-requests-p (driver)
+  "Return non-nil if DRIVER accounts for each provider send itself.
+By default the core charges one request per `gptel-runner-driver-start'.
+An opting-in driver must check and consume the request budget before every
+send, including tool continuations, and finish the call on exhaustion.")
+
+(cl-defmethod gptel-runner-driver-counts-requests-p (_driver)
+  "Keep dispatch-based accounting for drivers unless they opt in."
+  nil)
+
 (cl-defgeneric gptel-runner-driver-pause (driver call)
   "Pause CALL through DRIVER without terminalizing runner state.")
 
@@ -1010,8 +1020,10 @@ are never attributed to this function."
 
 (defun gptel-runner--dispatch-attempt (call)
   "Dispatch one provider attempt for CALL."
-  (let ((run (gptel-runner-call-run call)))
-    (if (not (gptel-runner--consume-request run))
+  (let* ((run (gptel-runner-call-run call))
+         (driver-counts (gptel-runner-driver-counts-requests-p
+                         (gptel-runner-run-driver run))))
+    (if (not (or driver-counts (gptel-runner--consume-request run)))
         (gptel-runner--finish-call
          call 'failed
          (gptel-runner--budget-failure
@@ -1021,9 +1033,10 @@ are never attributed to this function."
       (setf (gptel-runner-call-state call) 'running
             (gptel-runner-call-tool-names call) nil)
       (let ((generation (gptel-runner-call-generation call)))
-        (gptel-runner--emit
-         run 'request-started (gptel-runner-call-node call) call
-         (list :attempt (gptel-runner-call-request-attempt call)))
+        (unless driver-counts
+          (gptel-runner--emit
+           run 'request-started (gptel-runner-call-node call) call
+           (list :attempt (gptel-runner-call-request-attempt call))))
         (condition-case err
             (gptel-runner-driver-start
              (gptel-runner-run-driver run) call
