@@ -411,10 +411,12 @@ Return a cons of label and text, or nil when a function omits its context."
                (gptel-runner-node-children node))))
 
 (defun gptel-runner--validate-workflow
-    (root &optional allow-writes workspace contexts)
+    (root &optional allow-writes workspace contexts history-only)
   "Validate ROOT, including write opt-in ALLOW-WRITES, or signal an error.
 When WORKSPACE is non-nil, validate context files in each agent's workspace.
-CONTEXTS is an alist of labels and context sources inherited by every agent."
+CONTEXTS is an alist of labels and context sources inherited by every agent.
+HISTORY-ONLY retains structural validation without requiring original files
+or directories to remain available.  New execution checks its own inputs."
   (let ((ids (make-hash-table :test #'equal)))
     (dolist (entry contexts)
       (gptel-runner--validate-context (cdr entry) (car entry)))
@@ -474,7 +476,7 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
                (unless (memq (or (plist-get props :workspace-mode) 'read)
                              '(read write))
                  (user-error "Elisp node %S has invalid :workspace-mode" id))
-               (gptel-runner--node-workspace node workspace)
+               (gptel-runner--node-workspace node workspace history-only)
                (dolist (key '(:agent :prompt :parser :validator :repair-invalid
                              :pause-after :context))
                  (when (plist-member props key)
@@ -484,14 +486,15 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
                           (not (memq (plist-get props :completion) '(handoff response))))
                  (user-error "Agent node %S has invalid :completion" id))
                (let ((agent (gptel-runner--agent (plist-get props :agent)))
-                     (directory (gptel-runner--node-workspace node workspace)))
+                     (directory (gptel-runner--node-workspace
+                                 node workspace history-only)))
                  (dolist (entry contexts)
                    (gptel-runner--validate-context
-                    (cdr entry) (car entry) directory))
+                    (cdr entry) (car entry) (unless history-only directory)))
                  (gptel-runner--validate-context
                   (gptel-runner-agent-context agent)
                   (format "agent %S" (gptel-runner-agent-name agent))
-                  directory))
+                  (unless history-only directory)))
                (unless (plist-member props :prompt)
                  (user-error "Agent node %S has no :prompt" id)))
               ('try

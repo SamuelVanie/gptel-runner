@@ -1134,6 +1134,14 @@ The runner keeps exclusive ownership even with global
 independent agent chats. Use `M-x gptel-runner-open-session` to recover
 pipeline work, including chats waiting for human feedback.
 
+Saved history remains readable if an original context file or workspace was
+removed. Resuming or rerunning work checks the inputs and workspace of each
+node that executes; completed nodes need no original files to be retained.
+
+Indirect buffers of node chats and child transcripts open as read-only views.
+Send requests from the base chat. Closing a view leaves its live work running;
+if you explicitly unlock and edit shared text, the base run saves those edits.
+
 Versions 2 and 3 still open with the data they originally recorded. Version
 3 includes saved node chats. Child transcripts are available once captured
 by a version 4 checkpoint.

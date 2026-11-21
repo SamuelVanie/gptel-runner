@@ -275,23 +275,24 @@ RUN may also be a background invocation record."
         (plist-get outcome :value)
       default)))
 
-(defun gptel-runner--node-workspace (node workspace)
+(defun gptel-runner--node-workspace (node workspace &optional allow-missing)
   "Resolve NODE's workspace override relative to run WORKSPACE.
-An absent or nil override falls back to WORKSPACE."
-  (if-let* ((override (plist-get (gptel-runner-node-properties node)
-                                :workspace)))
-      (progn
-        (unless (and (stringp override) (not (string-empty-p override)))
-          (user-error "Node %S workspace must be a non-empty directory name"
-                      (gptel-runner-node-id node)))
-        (let ((directory (file-name-as-directory
-                          (file-truename
-                           (expand-file-name override workspace)))))
-          (unless (file-directory-p directory)
-            (user-error "Node %S workspace is not a directory: %s"
-                        (gptel-runner-node-id node) directory))
-          directory))
-    workspace))
+An absent or nil override falls back to WORKSPACE.  ALLOW-MISSING permits
+restoring historical conversations after their workspace was removed."
+  (let* ((override (plist-get (gptel-runner-node-properties node) :workspace))
+         (directory
+          (if override
+              (progn
+                (unless (and (stringp override) (not (string-empty-p override)))
+                  (user-error "Node %S workspace must be a non-empty directory name"
+                              (gptel-runner-node-id node)))
+                (file-name-as-directory
+                 (file-truename (expand-file-name override workspace))))
+            workspace)))
+    (when (and directory (not allow-missing) (not (file-directory-p directory)))
+      (user-error "Node %S workspace is not a directory: %s"
+                  (gptel-runner-node-id node) directory))
+    directory))
 
 (defun gptel-runner-node-workspace (run node)
   "Return the effective workspace for agent or Elisp NODE in RUN.
@@ -1038,36 +1039,47 @@ are never attributed to this function."
 (defun gptel-runner--dispatch-attempt (call)
   "Dispatch one provider attempt for CALL."
   (let* ((run (gptel-runner-call-run call))
+         (run-generation (gptel-runner-run-generation run))
          (driver-counts (gptel-runner-driver-counts-requests-p
                          (gptel-runner-run-driver run))))
-    (if (not (or driver-counts (gptel-runner--consume-request run)))
-        (gptel-runner--finish-call
-         call 'failed
-         (gptel-runner--budget-failure
-          run 'requests
-          (gptel-runner-budget-max-requests (gptel-runner-run-budget run))))
-      (cl-incf (gptel-runner-call-request-attempt call))
-      (setf (gptel-runner-call-state call) 'running
-            (gptel-runner-call-tool-names call) nil)
-      (let* ((generation (gptel-runner-call-generation call))
-             (complete (gptel-runner--continuation
-                        run (lambda (status &optional value metadata)
-                              (gptel-runner--driver-result
-                               call generation status value metadata))
-                        (or (gptel-runner-call-discussion-owner call)
-                            (gptel-runner-call-node call)))))
-        (unless driver-counts
-          (gptel-runner--emit
-           run 'request-started (gptel-runner-call-node call) call
-           (list :attempt (gptel-runner-call-request-attempt call))))
-        (condition-case err
-            (gptel-runner-driver-start
-             (gptel-runner-run-driver run) call
-             complete
-             (lambda (type &optional data)
-               (gptel-runner--call-observe call generation type data)))
-          (error
-           (funcall complete 'permanent err (list :permanent t))))))))
+    ;; Admission and call-started observers may have paused or cancelled the
+    ;; call, including by yielding to an interactive command.  Never revive it.
+    (when (and (eq (gptel-runner-run-state run) 'running)
+               (eq (gptel-runner-call-state call) 'ready)
+               (memq call (gptel-runner-run-active-calls run)))
+      (if (not (or driver-counts (gptel-runner--consume-request run)))
+          (gptel-runner--finish-call
+           call 'failed
+           (gptel-runner--budget-failure
+            run 'requests
+            (gptel-runner-budget-max-requests (gptel-runner-run-budget run))))
+        (cl-incf (gptel-runner-call-request-attempt call))
+        (setf (gptel-runner-call-state call) 'running
+              (gptel-runner-call-tool-names call) nil)
+        (let* ((generation (gptel-runner-call-generation call))
+               (complete (gptel-runner--continuation
+                          run (lambda (status &optional value metadata)
+                                (gptel-runner--driver-result
+                                 call generation status value metadata))
+                          (or (gptel-runner-call-discussion-owner call)
+                              (gptel-runner-call-node call)))))
+          (unless driver-counts
+            (gptel-runner--emit
+             run 'request-started (gptel-runner-call-node call) call
+             (list :attempt (gptel-runner-call-request-attempt call))))
+          (when (and (= run-generation (gptel-runner-run-generation run))
+                     (= generation (gptel-runner-call-generation call))
+                     (eq (gptel-runner-run-state run) 'running)
+                     (eq (gptel-runner-call-state call) 'running)
+                     (memq call (gptel-runner-run-active-calls run)))
+            (condition-case err
+                (gptel-runner-driver-start
+                 (gptel-runner-run-driver run) call
+                 complete
+                 (lambda (type &optional data)
+                   (gptel-runner--call-observe call generation type data)))
+              (error
+               (funcall complete 'permanent err (list :permanent t))))))))))
 
 (defun gptel-runner--finish-call (call state &optional value)
   "Terminalize CALL as STATE with VALUE exactly once."

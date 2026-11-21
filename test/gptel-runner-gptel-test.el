@@ -1656,5 +1656,26 @@
         (gptel-runner-complete-call-from-buffer nil call)
         (should (eq (gptel-runner-run-state run) 'succeeded))))))
 
+
+
+(ert-deftest gptel-runner-gptel-cancel-before-dispatch-sends-no-request ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'reader)
+    (let* ((gptel-runner-event-hook
+            (list (lambda (event)
+                    (when (eq (gptel-runner-event-type event) 'call-started)
+                      (gptel-runner-abort-run
+                       (gptel-runner-find-run
+                        (gptel-runner-event-run-id event)))))))
+           (run (gptel-runner-start
+                 (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect")))
+           (call (car (gptel-runner-run-calls run))))
+      (should (eq (gptel-runner-run-state run) 'cancelled))
+      (should (eq (gptel-runner-call-state call) 'cancelled))
+      (should-not requests)
+      (should-not (buffer-live-p (gptel-runner-call-buffer call)))
+      (should (zerop (gptel-runner-budget-requests
+                     (gptel-runner-run-budget run)))))))
+
 (provide 'gptel-runner-gptel-test)
 ;;; gptel-runner-gptel-test.el ends here
