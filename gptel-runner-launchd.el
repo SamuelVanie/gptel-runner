@@ -25,6 +25,8 @@
 (declare-function gptel-runner-jobs--confirm-stopped "gptel-runner-jobs")
 (declare-function gptel-runner-jobs--abandoned-start-p "gptel-runner-jobs")
 (declare-function gptel-runner-jobs--read "gptel-runner-jobs")
+(declare-function gptel-runner-jobs--manifest-file "gptel-runner-jobs")
+(declare-function gptel-runner-jobs--with-control-lock "gptel-runner-jobs")
 (defvar gptel-runner-job-directory)
 (defvar gptel-runner-jobs--package-directory)
 
@@ -400,6 +402,33 @@ may have a detached child that probing launchd cannot account for."
               (insert-file-contents (expand-file-name "worker.plist" directory))
               (search-forward (format "<key>Label</key><string>%s</string>" label) nil t)))))))
 
+(defun gptel-runner-launchd--reap-registration (invocation file)
+  "Reap registration FILE if INVOCATION's current generation permits it."
+  (gptel-runner-jobs--with-control-lock
+   invocation
+   (lambda ()
+     ;; Restart and adoption use this lock too.  The list snapshot can predate
+     ;; either transition, so keep the fresh read and stop in one critical section.
+     (let* ((fresh (gptel-runner-jobs--read
+                    (gptel-runner-jobs--manifest-file invocation)))
+            (record (gptel-runner-jobs--read file))
+            (epoch (plist-get record :epoch)))
+       (when (and (integerp epoch) (> epoch 0)
+                  (equal (file-name-nondirectory file)
+                         (format "worker-registration-%d.el" epoch))
+                  (equal (plist-get record :label)
+                         (gptel-runner-launchd--label "worker" (plist-get fresh :id) epoch))
+                  (or
+                   ;; Epochs advance only after the former owner has exited or
+                   ;; relinquished ownership.  Newer registrations stay protected.
+                   (< epoch (plist-get fresh :epoch))
+                   (and (= epoch (plist-get fresh :epoch))
+                        (or (eq (plist-get fresh :worker-state) 'exited)
+                            (and (memq (plist-get fresh :phase) '(open closing))
+                                 (not (gptel-runner-invocation-live-p fresh)))))))
+         (gptel-runner-launchd--unload (plist-get record :label))
+         (delete-file file))))))
+
 (defun gptel-runner-launchd-reap ()
   "Unload completed invocation services, preserving their result history.
 Only exited, superseded, or confirmed dead workers are reaped; terminal
@@ -430,18 +459,7 @@ Abandoned launch reservations close only after the exact service is absent."
         (dolist (file (directory-files directory t
                                       "\\`worker-registration-[0-9]+\\.el\\'"))
           (condition-case err
-              (let ((record (with-temp-buffer
-                              (insert-file-contents file)
-                              (goto-char (point-min))
-                              (read (current-buffer)))))
-                (when (or (eq (plist-get invocation :worker-state) 'exited)
-                          ;; The controller advances epochs only after the
-                          ;; former owner has exited or relinquished ownership.
-                          (< (plist-get record :epoch) (plist-get invocation :epoch))
-                          (and (memq (plist-get invocation :phase) '(open closing))
-                               (not (gptel-runner-invocation-live-p invocation))))
-                  (gptel-runner-launchd--unload (plist-get record :label))
-                  (delete-file file)))
+              (gptel-runner-launchd--reap-registration invocation file)
             (error (message "Could not reap background worker: %s"
                             (error-message-string err)))))))))
 

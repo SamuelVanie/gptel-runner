@@ -43,6 +43,20 @@
            ,@body)
        (delete-directory directory t))))
 
+(defun gptel-runner-launchd-test--save (invocation)
+  "Persist INVOCATION's manifest and return it."
+  (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file invocation) invocation))
+
+(defun gptel-runner-launchd-test--register (invocation)
+  "Write INVOCATION's exact service registration and return its filename."
+  (let* ((epoch (plist-get invocation :epoch))
+         (file (expand-file-name (format "worker-registration-%d.el" epoch)
+                                 (plist-get invocation :directory))))
+    (gptel-runner-jobs--write
+     file (list :epoch epoch :label (gptel-runner-launchd--label
+                                     "worker" (plist-get invocation :id) epoch)))
+    file))
+
 (ert-deftest gptel-runner-launchd-plist-preserves-arguments-and-escapes-values ()
   (gptel-runner-launchd-test--fixture
     (let* ((args (gptel-runner-launchd--arguments job "worker" "/tmp/a & b/"))
@@ -131,10 +145,11 @@
            (invocation (list :id "inv-test" :epoch 1 :job job
                              :directory worker-directory :state 'succeeded)))
       (gptel-runner-launchd-start-worker invocation)
-      (setq commands nil invocations (list invocation) loaded t)
+      (setq commands nil invocations (list (gptel-runner-launchd-test--save invocation)) loaded t)
       (gptel-runner-launchd-reap)
       (should-not commands)
-      (setq invocations (list (plist-put invocation :worker-state 'exited)))
+      (setq invocations (list (gptel-runner-launchd-test--save
+                               (plist-put invocation :worker-state 'exited))))
       (gptel-runner-launchd-reap)
       (should (cl-find "bootout" commands :key #'car :test #'equal))
       (should-not (file-exists-p (expand-file-name "worker-registration-1.el" worker-directory))))))
@@ -145,7 +160,8 @@
            (invocation (list :id "inv-test" :epoch 1 :job job
                              :directory worker-directory :state 'succeeded)))
       (gptel-runner-launchd-start-worker invocation)
-      (setq invocations (list (plist-put (copy-sequence invocation) :epoch 2))
+      (setq invocations (list (gptel-runner-launchd-test--save
+                               (plist-put (copy-sequence invocation) :epoch 2)))
             loaded t commands nil)
       (gptel-runner-launchd-reap)
       (should (cl-find "bootout" commands :key #'car :test #'equal))
@@ -216,7 +232,7 @@
       (gptel-runner-launchd-start-worker invocation)
       (setq invocation (plist-put invocation :worker-state 'uncertain)
             invocation (plist-put invocation :phase 'starting)
-            invocations (list invocation) loaded t)
+            invocations (list (gptel-runner-launchd-test--save invocation)) loaded t)
       (cl-letf (((symbol-function 'gptel-runner-jobs--confirm-stopped)
                  (lambda (_record) (setq confirmed t))))
         (gptel-runner-launchd-reap)
@@ -229,6 +245,133 @@
         (should confirmed)
         (should-not (file-exists-p
                      (expand-file-name "worker-registration-1.el" worker-directory)))))))
+
+(ert-deftest gptel-runner-launchd-reap-refreshes-generation-under-control-lock ()
+  (dolist (boundary '(snapshot control))
+    (dolist (operation '(retry continue rerun))
+      (gptel-runner-launchd-test--fixture
+        (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+               (id (plist-get invocation :id))
+               (control-lock (symbol-function 'gptel-runner-jobs--with-control-lock))
+               old-file new-file restart-pending)
+          (gptel-runner-jobs--launch-failed invocation '(error "Finished generation"))
+          (setq invocation (gptel-runner-invocation-get id)
+                old-file (gptel-runner-launchd-test--register invocation)
+                invocations (list invocation) loaded t)
+          (gptel-runner-jobs--write
+           (expand-file-name "checkpoint.el" (plist-get invocation :directory)) nil)
+          (let ((gptel-runner-job-launch-function
+                 (lambda (fresh)
+                   (setq new-file (gptel-runner-launchd-test--register fresh))
+                   ;; Adopt the new reservation under the real control lock,
+                   ;; with this process as the exact live worker identity.
+                   (funcall control-lock fresh
+                            (lambda ()
+                              (setq fresh (plist-put fresh :phase 'open)
+                                    fresh (plist-put fresh :worker-state 'running))
+                              (gptel-runner-launchd-test--save fresh))))))
+            (cl-labels ((restart ()
+                          (setq restart-pending nil)
+                          (gptel-runner-job-command
+                           invocation operation
+                           (when (eq operation 'continue) '(:observation "Continue")))))
+              (cl-letf (((symbol-function 'gptel-runner-invocation-list)
+                         (lambda ()
+                           (setq restart-pending t)
+                           (when (eq boundary 'snapshot) (restart))
+                           invocations))
+                        ((symbol-function 'gptel-runner-jobs--with-control-lock)
+                         (lambda (record function)
+                           ;; A controller can win the lock after discovery.
+                           (when (and restart-pending (eq boundary 'control))
+                             (restart))
+                           (funcall control-lock record function))))
+                (gptel-runner-launchd-reap))))
+          (let ((fresh (gptel-runner-invocation-get id)))
+            (should (= (plist-get fresh :epoch) 2))
+            (should (gptel-runner-invocation-live-p fresh)))
+          (should-not (file-exists-p old-file))
+          (should (file-exists-p new-file))
+          (should (equal commands
+                         (list (list "bootout" (gptel-runner-launchd--target
+                                                (gptel-runner-launchd--label "worker" id 1)))
+                               (list "print" (gptel-runner-launchd--target
+                                              (gptel-runner-launchd--label "worker" id 1)))))))))))
+
+(ert-deftest gptel-runner-launchd-reap-keeps-future-or-mismatched-registration ()
+  (dolist (kind '(future label invocation filename))
+    (gptel-runner-launchd-test--fixture
+      (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+             (id (plist-get invocation :id))
+             (epoch (if (eq kind 'future) 2 1))
+             (file (expand-file-name
+                    (format "worker-registration-%d.el" (if (eq kind 'filename) 2 epoch))
+                    (plist-get invocation :directory)))
+             (label (gptel-runner-launchd--label
+                     "worker" (if (eq kind 'invocation) "another-invocation" id)
+                     (if (eq kind 'label) 2 epoch))))
+        (gptel-runner-jobs--launch-failed invocation '(error "Finished generation"))
+        (setq invocations (list (gptel-runner-invocation-get id)) loaded t)
+        (gptel-runner-jobs--write file (list :epoch epoch :label label))
+        (gptel-runner-launchd-reap)
+        (should-not commands)
+        (should (file-exists-p file))))))
+
+(ert-deftest gptel-runner-launchd-reap-holds-control-through-stop-and-deletion ()
+  (gptel-runner-launchd-test--fixture
+    (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+           (id (plist-get invocation :id))
+           (manifest (gptel-runner-jobs--manifest-file invocation))
+           (lock (expand-file-name "control.lock" (plist-get invocation :directory)))
+           (read-record (symbol-function 'gptel-runner-jobs--read))
+           (invoke (symbol-function 'gptel-runner-launchd--invoke))
+           (delete (symbol-function 'delete-file))
+           checked file)
+      (gptel-runner-jobs--launch-failed invocation '(error "Finished generation"))
+      (setq invocations (list (gptel-runner-invocation-get id)) loaded t
+            file (gptel-runner-launchd-test--register invocation))
+      (cl-labels ((check-lock (stage)
+                    (let* ((owner (gptel-runner-jobs--owner "contender" id))
+                           (acquired (gptel-runner-jobs--lock lock owner)))
+                      (when acquired (gptel-runner-jobs--unlock lock "contender"))
+                      (should-not acquired)
+                      (push stage checked))))
+        (cl-letf (((symbol-function 'gptel-runner-jobs--read)
+                   (lambda (path)
+                     (when (equal path manifest) (check-lock 'manifest))
+                     (funcall read-record path)))
+                  ((symbol-function 'gptel-runner-launchd--invoke)
+                   (lambda (&rest args)
+                     (check-lock (car args))
+                     (apply invoke args)))
+                  ((symbol-function 'delete-file)
+                   (lambda (path &optional trash)
+                     (when (equal path file) (check-lock 'delete))
+                     (funcall delete path trash))))
+          (gptel-runner-launchd-reap)))
+      (should (equal (nreverse checked) '(manifest "print" "bootout" delete)))
+      (should-not (file-exists-p file)))))
+
+(ert-deftest gptel-runner-launchd-reap-retains-registration-on-stop-failure ()
+  (gptel-runner-launchd-test--fixture
+    (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+           (file (gptel-runner-launchd-test--register invocation)))
+      (gptel-runner-jobs--launch-failed invocation '(error "Finished generation"))
+      (setq invocations (list (gptel-runner-invocation-get (plist-get invocation :id)))
+            loaded t fail-command "bootout")
+      (gptel-runner-launchd-reap)
+      (should (cl-find "bootout" commands :key #'car :test #'equal))
+      (should (file-exists-p file))
+      (setq fail-command nil commands nil)
+      (gptel-runner-launchd-reap)
+      (should (cl-find "bootout" commands :key #'car :test #'equal))
+      (should-not (file-exists-p file)))))
+
+(ert-deftest gptel-runner-launchd-reap-is-inert-on-non-macos ()
+  (let ((system-type 'gnu/linux))
+    (cl-letf (((symbol-function 'gptel-runner-invocation-list)
+               (lambda () (ert-fail "Reaping inspected the store on non-macOS"))))
+      (gptel-runner-launchd-reap))))
 
 (provide 'gptel-runner-launchd-test)
 ;;; gptel-runner-launchd-test.el ends here
