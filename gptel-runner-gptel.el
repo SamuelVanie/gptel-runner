@@ -80,6 +80,12 @@
   "End of rendered request output, including text without a gptel property.")
 (defvar-local gptel-runner-gptel--manual-requests nil
   "Ordinary gptel sends still using this node chat.")
+;; These belong to the conversation and its in-flight requests.  Preserve the
+;; marker objects shared with the renderer, including their insertion behavior.
+(dolist (symbol '(gptel-runner-gptel--submitted-end
+                  gptel-runner-gptel--rendered-end
+                  gptel-runner-gptel--manual-requests))
+  (put symbol 'permanent-local t))
 (defvar gptel-prompt-transform-functions)
 
 ;; Optional integration uses only public gptel-agent APIs.  Agent lifecycle
@@ -1547,6 +1553,8 @@ node result and reconstructs the continuation from the workflow AST."
               (run (gptel-runner-call-run call))
               ((gptel-runner-run-queue run)))
     (run-at-time 0 nil #'gptel-runner--drain-queue run)))
+
+(put 'gptel-runner-gptel--wake-chat-queue 'permanent-local-hook t)
 
 (defun gptel-runner-gptel--release-send (buffer fsm)
   "Release FSM's reservation of BUFFER, then admit waiting workflow turns."

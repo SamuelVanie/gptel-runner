@@ -50,6 +50,8 @@ deactivated, and to roll back a refused or failed admission attempt.")
 
 (defvar-local gptel-runner--call nil
   "Runner call associated with the current worker buffer.")
+;; Ownership follows the conversation, even when its presentation mode changes.
+(put 'gptel-runner--call 'permanent-local t)
 
 (defvar gptel-runner--agents (make-hash-table :test #'eq)
   "Registered agents by symbolic name.")
