@@ -548,6 +548,8 @@
             (with-current-buffer clone
               (should-not gptel-runner--call)
               (should-not gptel--fsm-last)
+              (should-not (memq #'gptel-runner-store--install-chat-hooks
+                                after-change-major-mode-hook))
               (call-interactively #'gptel-abort)
               (goto-char (point-max))
               (insert "\nIndependent question")
@@ -574,6 +576,8 @@
             (should (eq 'succeeded (gptel-runner-run-state run)))
             (should (equal "Original answer" (gptel-runner-get run 'answer)))
             (with-current-buffer source
+              (should (memq #'gptel-runner-store--install-chat-hooks
+                            after-change-major-mode-hook))
               (should-not (string-search "Independent question" (buffer-string)))
               (should-not (string-search "Clone answer" (buffer-string)))))
         (when (buffer-live-p clone) (kill-buffer clone))))))

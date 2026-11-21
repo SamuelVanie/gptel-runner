@@ -100,6 +100,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
     ;; clone-buffer copies local values shallowly, including hook lists.
     (dolist (entry '((after-change-functions
                      gptel-runner-store--chat-changed gptel-runner-store--child-changed)
+                    (after-change-major-mode-hook gptel-runner-store--install-chat-hooks)
                     (kill-buffer-query-functions gptel-runner-store--allow-chat-kill-p)
                     (kill-buffer-hook gptel-runner-store--close-chat
                      gptel-runner-store--close-child gptel-runner-gptel--wake-chat-queue)))
