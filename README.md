@@ -38,6 +38,44 @@ Opinionated structured-review helpers are separate and optional:
 (require 'gptel-runner-review)
 ```
 
+### A more readable chat view
+
+The optional **Atelier** view works with ordinary gptel conversations in
+Org and Markdown, including runner and discussion chats:
+
+```elisp
+(require 'gptel-runner-chat)
+(gptel-runner-chat-global-mode 1)
+```
+
+It adds speaker labels, a comfortable reading width, section headings,
+code panels, clickable file references, and expandable discussion report
+metadata. Pipe tables use aligned fixed-pitch columns and become labeled
+rows when the pane is too narrow. Styling follows the current theme's
+text and accent faces, with separate light and dark code panels.
+
+| Action | Key or command |
+| --- | --- |
+| Open a file or web link | Click or `RET` on the reference |
+| Open or choose a link inside a table | `C-c C-o` |
+| Expand report details | Click or `RET` on its header |
+| Read or edit the original source | `C-c C-v` |
+| Next / previous conversation turn | `C-c C-n` / `C-c C-p` |
+| Preview locally, without a model request | `M-x gptel-runner-chat-demo` |
+| Enable in one buffer | `M-x gptel-runner-chat-mode` |
+
+File references support project-relative and absolute paths, Markdown and
+Org links, and line/column suffixes. Relative references resolve from the
+chat's working directory. Existing backtick-quoted filenames also become
+links. Tool approval controls and fenced source remain under gptel's control.
+Use the source view to edit rendered tables and inspect their original markup.
+
+The view changes overlays and buffer-local display settings only. It does
+not rewrite conversations or alter gptel's message roles, request behavior,
+saved sessions, or undo history. Disable the mode to restore the previous
+buffer presentation. Customize `gptel-runner-chat-width` (default 100) and
+the `gptel-runner-chat` face group to adjust the appearance.
+
 Register agents after defining their gptel presets:
 
 ```elisp
