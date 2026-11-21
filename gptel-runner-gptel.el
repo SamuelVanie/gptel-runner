@@ -27,6 +27,7 @@
 (autoload 'gptel-runner-call-chat-buffer "gptel-runner-store")
 (autoload 'gptel-runner-store-track-chat "gptel-runner-store")
 (autoload 'gptel-runner-store-track-child "gptel-runner-store")
+(declare-function gptel-runner-store--child-owner "gptel-runner-store")
 (declare-function gptel-request "gptel-request")
 (declare-function gptel-abort "gptel-request")
 (declare-function gptel-make-fsm "gptel-request")
@@ -1518,8 +1519,22 @@ node result and reconstructs the continuation from the workflow AST."
     (gptel-runner--complete-restored-call call result))
   call)
 
+(defun gptel-runner-gptel--guard-indirect-chat (buffer)
+  "Reject requests targeting an indirect view of runner-owned BUFFER text.
+BUFFER may be a buffer or its name."
+  (when-let* (((or (bufferp buffer) (stringp buffer)))
+              (target (get-buffer buffer))
+              (base (buffer-base-buffer target))
+              ((or (gptel-runner--buffer-call base)
+                   (and (fboundp 'gptel-runner-store--child-owner)
+                        (gptel-runner-store--child-owner base)))))
+    (user-error "Send from base chat %s; indirect views share its transcript"
+                (buffer-name base))))
+
 (defun gptel-runner-gptel--before-send (&optional arg)
   "Guard live node chats from duplicate sends, allowing menus and steering ARG."
+  (unless (member arg '(0 (4)))
+    (gptel-runner-gptel--guard-indirect-chat (current-buffer)))
   (when-let* (((not (member arg '(0 (4)))))
               (call (gptel-runner--buffer-call))
               ((memq (gptel-runner-call-state call)
@@ -1572,6 +1587,10 @@ node result and reconstructs the continuation from the workflow AST."
 
 (defun gptel-runner-gptel--track-send (original &optional prompt &rest args)
   "Track an ordinary send through ORIGINAL with PROMPT and ARGS in a node chat."
+  (dolist (target (list (current-buffer) (plist-get args :buffer)
+                        (when (markerp (plist-get args :position))
+                          (marker-buffer (plist-get args :position)))))
+    (gptel-runner-gptel--guard-indirect-chat target))
   (let* ((buffer (or (plist-get args :buffer) (current-buffer)))
          (fsm (plist-get args :fsm)))
     (if (not (and (gptel-runner--buffer-call buffer)

@@ -883,5 +883,114 @@
         (should-not (gptel-runner-find-run (gptel-runner-run-id run))))
       (should-not requests))))
 
+
+
+(ert-deftest gptel-runner-session-indirect-view-preserves-live-node ()
+  (gptel-runner-session-test--with-run
+    (gptel-runner-defworkflow indirect-node (:persist t :completion response)
+      (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect"))
+    (let* ((run (gptel-runner-start 'indirect-node))
+           (call (car (gptel-runner-run-calls run)))
+           (source (gptel-runner-call-buffer call))
+           (fsm (pop requests))
+           (submitted (buffer-local-value 'gptel-runner-gptel--submitted-end source))
+           (rendered (buffer-local-value 'gptel-runner-gptel--rendered-end source))
+           view)
+      (unwind-protect
+          (progn
+            (setq view (with-current-buffer source
+                         (clone-indirect-buffer " *runner-indirect*" nil)))
+            (gptel-runner-store-flush-run run)
+            (with-current-buffer view
+              (should buffer-read-only)
+              (should-not gptel-runner--call)
+              (should-not gptel--fsm-last)
+              (should-not gptel-runner-gptel--submitted-end)
+              (should-not gptel-runner-gptel--rendered-end)
+              (should-not gptel-agent-session-managed-externally)
+              (should-not (memq #'gptel-runner-store--close-chat kill-buffer-hook))
+              (should-not (memq #'gptel-runner-store--allow-chat-kill-p
+                                kill-buffer-query-functions))
+              (setq buffer-read-only nil)
+              (goto-char (point-max))
+              (insert "SHARED-DRAFT")
+              (should (eq (gptel-runner-store-save-status run) 'pending))
+              (should-error (gptel-request) :type 'user-error)
+              (should-error (gptel-request "Concurrent request") :type 'user-error)
+              (call-interactively #'gptel-abort))
+            (with-temp-buffer
+              (should-error (gptel-request "Concurrent response" :buffer view)
+                            :type 'user-error)
+              (should-error (gptel-request "Concurrent named response"
+                                          :buffer (buffer-name view))
+                            :type 'user-error)
+              (should-error (gptel-request nil :buffer (buffer-name view))
+                            :type 'user-error)
+              (should-error (gptel-request "Concurrent marker response"
+                                          :position (with-current-buffer view (point-marker)))
+                            :type 'user-error))
+            (should-not requests)
+            (should (eq (gptel-runner-call-state call) 'running))
+            (should (eq fsm (buffer-local-value 'gptel--fsm-last source)))
+            (should (gptel--fsm-live-p fsm))
+            (should (eq submitted (buffer-local-value 'gptel-runner-gptel--submitted-end source)))
+            (should (eq rendered (buffer-local-value 'gptel-runner-gptel--rendered-end source)))
+            (dolist (marker (list submitted rendered))
+              (when marker (should (eq source (marker-buffer marker)))))
+            (gptel-runner-store-flush-run run)
+            (with-current-buffer view
+              (fundamental-mode)
+              (goto-char (point-max))
+              (let ((inhibit-read-only t)) (insert " after mode change")))
+            (should (eq (gptel-runner-store-save-status run) 'pending))
+            (should (kill-buffer view))
+            (should (eq (gptel-runner-call-state call) 'running))
+            (gptel-runner-gptel-test--reply fsm "Source completed" "stop")
+            (should (eq (gptel-runner-run-state run) 'succeeded))
+            (with-current-buffer source
+              (should (string-search "SHARED-DRAFT" (buffer-string))))
+            (gptel-runner-store-flush-run run)
+            (let ((file (gptel-runner-run-snapshot-file run)))
+              (gptel-runner-forget-run run)
+              (setq run (gptel-runner-load-run file))
+              (with-current-buffer (gptel-runner-node-buffer run 'read)
+                (should (string-search "SHARED-DRAFT" (buffer-string))))))
+        (when (buffer-live-p view) (kill-buffer view))))))
+
+(ert-deftest gptel-runner-session-indirect-child-edits-checkpoint-base ()
+  (gptel-runner-session-test--with-run
+    (gptel-runner-defworkflow indirect-child (:persist t :completion response)
+      (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect"))
+    (let* ((run (gptel-runner-start 'indirect-child))
+           (source (gptel-runner-node-buffer run 'read))
+           (child (generate-new-buffer " *runner-indirect-child*"))
+           view)
+      (unwind-protect
+          (progn
+            (with-current-buffer child (insert "Child transcript"))
+            (gptel-runner-store-track-child source child 'agent)
+            (let* ((id (buffer-local-value 'gptel-runner-store--child-id child))
+                   (record (gethash id (gptel-runner-run-child-chats run))))
+              (setq view (with-current-buffer child
+                           (clone-indirect-buffer " *runner-child-view*" nil)))
+              (gptel-runner-store-flush-run run)
+              (with-current-buffer view
+                (should buffer-read-only)
+                (should-not gptel-runner-store--child-run)
+                (should-not gptel-runner-store--child-id)
+                (setq buffer-read-only nil)
+                (goto-char (point-max))
+                (insert " shared edit")
+                (should (eq (gptel-runner-store-save-status run) 'pending)))
+              (should (kill-buffer view))
+              (should (eq child (plist-get record :chat)))
+              (should (eq run (buffer-local-value 'gptel-runner-store--child-run child)))
+              (with-current-buffer child
+                (should (equal "Child transcript shared edit" (buffer-string)))))
+            (gptel-runner-gptel-test--reply (pop requests) "Source completed" "stop")
+            (should (eq (gptel-runner-run-state run) 'succeeded)))
+        (dolist (buffer (list view child))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
 (provide 'gptel-runner-session-test)
 ;;; gptel-runner-session-test.el ends here

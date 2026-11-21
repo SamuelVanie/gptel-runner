@@ -83,9 +83,29 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (dolist (symbol '(gptel-runner-store--child-run gptel-runner-store--child-id))
   (put symbol 'permanent-local t))
 
+(defun gptel-runner-store--indirect-chat-changed (&rest _)
+  "Checkpoint the base chat after an explicitly unlocked indirect view edit."
+  (when-let* ((base (buffer-base-buffer)) ((buffer-live-p base)))
+    (with-current-buffer base
+      (gptel-runner-store--chat-changed)
+      (gptel-runner-store--child-changed))))
+
+(put 'gptel-runner-store--indirect-chat-changed 'permanent-local-hook t)
+
+(defun gptel-runner-store--install-indirect-hooks ()
+  "Keep shared transcript edits connected to the base chat's persistence."
+  (when (buffer-base-buffer)
+    (add-hook 'after-change-functions
+              #'gptel-runner-store--indirect-chat-changed nil t)
+    (add-hook 'after-change-major-mode-hook
+              #'gptel-runner-store--install-indirect-hooks nil t)))
+
+(put 'gptel-runner-store--install-indirect-hooks 'permanent-local-hook t)
+
 (defun gptel-runner-store--clone-chat ()
   "Detach a cloned node or child chat from its source's live ownership."
-  (when (or gptel-runner--call gptel-runner-store--child-run)
+  (when (or gptel-runner--call gptel-runner-store--child-run
+            (memq #'gptel-runner-store--indirect-chat-changed after-change-functions))
     ;; Never cancel requests or move shared markers: they still belong to
     ;; the source buffer.  Permanent locals also need explicit detachment.
     (dolist (variable '(gptel-runner--call
@@ -99,19 +119,27 @@ terminal run transitions bypass it, but their writes are still asynchronous."
         (set variable nil)))
     ;; clone-buffer copies local values shallowly, including hook lists.
     (dolist (entry '((after-change-functions
-                     gptel-runner-store--chat-changed gptel-runner-store--child-changed)
-                    (after-change-major-mode-hook gptel-runner-store--install-chat-hooks)
+                     gptel-runner-store--chat-changed gptel-runner-store--child-changed
+                     gptel-runner-store--indirect-chat-changed)
+                    (after-change-major-mode-hook gptel-runner-store--install-chat-hooks
+                                                  gptel-runner-store--install-indirect-hooks)
                     (kill-buffer-query-functions gptel-runner-store--allow-chat-kill-p)
                     (kill-buffer-hook gptel-runner-store--close-chat
                      gptel-runner-store--close-child gptel-runner-gptel--wake-chat-queue)))
       (when (local-variable-p (car entry))
         (set (car entry) (copy-sequence (symbol-value (car entry))))
         (dolist (function (cdr entry))
-          (remove-hook (car entry) function t))))))
+          (remove-hook (car entry) function t))))
+    (when (buffer-base-buffer)
+      ;; A shared transcript has one runtime owner.  Allow deliberate edits
+      ;; after unlocking the view, while keeping persistence with that owner.
+      (setq buffer-read-only t)
+      (gptel-runner-store--install-indirect-hooks))))
 
 ;; Run after gptel-agent's request cleanup (-90), before its session hook (0)
 ;; decides whether this independent clone can be persisted as an ordinary chat.
 (add-hook 'clone-buffer-hook #'gptel-runner-store--clone-chat -80)
+(add-hook 'clone-indirect-buffer-hook #'gptel-runner-store--clone-chat -80)
 
 (defun gptel-runner-store--agent-sessions-p ()
   "Whether agent sessions support records under independent host ownership."
