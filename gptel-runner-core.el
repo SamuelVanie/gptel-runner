@@ -352,6 +352,16 @@ send, including tool continuations, and finish the call on exhaustion.")
   "Return non-nil when CALL is terminal."
   (gptel-runner--terminal-p (gptel-runner-call-state call)))
 
+(defun gptel-runner--buffer-call (&optional buffer)
+  "Return the call owned by BUFFER, defaulting to the current buffer.
+A copied buffer-local call is not proof of ownership."
+  (let ((buffer (or buffer (current-buffer))))
+    (when-let* (((buffer-live-p buffer))
+                (call (buffer-local-value 'gptel-runner--call buffer))
+                ((gptel-runner-call-p call))
+                ((eq buffer (gptel-runner-call-buffer call))))
+      call)))
+
 (defun gptel-runner--run-terminal-p (run)
   "Return non-nil when RUN is terminal."
   (gptel-runner--terminal-p (gptel-runner-run-state run)))
@@ -507,10 +517,9 @@ The entry is written to the blackboard, journaled, and checkpointed."
     (user-error "Decision source call belongs to a different run"))
   (let* ((source-call
           (or call
-              (and (boundp 'gptel-runner--call)
-                   (gptel-runner-call-p gptel-runner--call)
-                   (eq (gptel-runner-call-run gptel-runner--call) run)
-                   gptel-runner--call)))
+              (when-let* ((owner (gptel-runner--buffer-call))
+                          ((eq (gptel-runner-call-run owner) run)))
+                owner)))
          (node (and source-call (gptel-runner-call-node source-call)))
          (entry
           (list :id (gptel-runner--id "decision")
@@ -1350,7 +1359,7 @@ The associated worker buffer remains a normal gptel buffer.  After continuing
 the conversation, use `gptel-runner-complete-call-from-buffer' to return its
 latest response to the workflow."
   (interactive
-   (list (and (boundp 'gptel-runner--call) gptel-runner--call) 'user))
+   (list (gptel-runner--buffer-call) 'user))
   (unless (gptel-runner-call-p call)
     (user-error "No runner call is associated with this buffer"))
   (when (gptel-runner--elisp-call-p call)
@@ -1368,9 +1377,8 @@ Active provider work is stopped.  Completed nodes and blackboard values are
 preserved; unfinished nodes restart from their last safe checkpoint.  The
 snapshot is committed asynchronously after this function returns."
   (interactive
-   (list (and (boundp 'gptel-runner--call)
-              (gptel-runner-call-p gptel-runner--call)
-              (gptel-runner-call-run gptel-runner--call))
+   (list (when-let* ((call (gptel-runner--buffer-call)))
+           (gptel-runner-call-run call))
          'user))
   (unless (gptel-runner-run-p run)
     (user-error "Run this command from a runner worker or the dashboard"))

@@ -940,7 +940,7 @@
          (run (gptel-runner-run-create :id "run" :events nil))
          (node (gptel-runner-node-create :id 'work))
          (call (gptel-runner-call-create
-                :id "call" :run run :node node
+                :id "call" :run run :node node :buffer buffer
                 :state 'waiting-confirmation
                 :tool-names '("AskUserQuestion")))
          state-during-call)

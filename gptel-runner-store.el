@@ -81,6 +81,35 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (dolist (symbol '(gptel-runner-store--child-run gptel-runner-store--child-id))
   (put symbol 'permanent-local t))
 
+(defun gptel-runner-store--clone-chat ()
+  "Detach a cloned node or child chat from its source's live ownership."
+  (when (or gptel-runner--call gptel-runner-store--child-run)
+    ;; Never cancel requests or move shared markers: they still belong to
+    ;; the source buffer.  Permanent locals also need explicit detachment.
+    (dolist (variable '(gptel-runner--call
+                        gptel-runner-store--child-run gptel-runner-store--child-id
+                        gptel-runner-gptel--submitted-end
+                        gptel-runner-gptel--rendered-end
+                        gptel-runner-gptel--manual-requests
+                        gptel--fsm-last gptel-agent-session-managed-externally
+                        gptel-agent--child-chat-p))
+      (when (local-variable-p variable)
+        (set variable nil)))
+    ;; clone-buffer copies local values shallowly, including hook lists.
+    (dolist (entry '((after-change-functions
+                     gptel-runner-store--chat-changed gptel-runner-store--child-changed)
+                    (kill-buffer-query-functions gptel-runner-store--allow-chat-kill-p)
+                    (kill-buffer-hook gptel-runner-store--close-chat
+                     gptel-runner-store--close-child gptel-runner-gptel--wake-chat-queue)))
+      (when (local-variable-p (car entry))
+        (set (car entry) (copy-sequence (symbol-value (car entry))))
+        (dolist (function (cdr entry))
+          (remove-hook (car entry) function t))))))
+
+;; Run after gptel-agent's request cleanup (-90), before its session hook (0)
+;; decides whether this independent clone can be persisted as an ordinary chat.
+(add-hook 'clone-buffer-hook #'gptel-runner-store--clone-chat -80)
+
 (defun gptel-runner-store--agent-sessions-p ()
   "Whether agent sessions support records under independent host ownership."
   (and (featurep 'gptel-agent-session)
@@ -141,12 +170,12 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 
 (defun gptel-runner-store--chat-changed (&rest _)
   "Queue a checkpoint for the current chat when its run is persistent."
-  (when gptel-runner--call
-    (gptel-runner--checkpoint (gptel-runner-call-run gptel-runner--call))))
+  (when-let* ((call (gptel-runner-store--chat-owner)))
+    (gptel-runner--checkpoint (gptel-runner-call-run call))))
 
 (defun gptel-runner-store--chat-owner ()
   "Return the call whose run owns the current node chat, if any."
-  (when-let* ((call gptel-runner--call)
+  (when-let* ((call (gptel-runner--buffer-call))
               (run (gptel-runner-call-run call))
               (id (gptel-runner-node-id (gptel-runner-call-node call)))
               ((eq (current-buffer) (gethash id (gptel-runner-run-chats run)))))
@@ -241,21 +270,28 @@ and for nodes that execute without a gptel conversation."
             (widen)
             (cons 'transcript (buffer-substring-no-properties (point-min) (point-max)))))))))
 
+(defun gptel-runner-store--child-owner (&optional buffer)
+  "Return the child record owned by BUFFER, defaulting to the current buffer."
+  (let ((buffer (or buffer (current-buffer))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when-let* ((run gptel-runner-store--child-run)
+                    (record (gethash gptel-runner-store--child-id
+                                     (gptel-runner-run-child-chats run)))
+                    ((eq (plist-get record :chat) buffer)))
+          record)))))
+
 (defun gptel-runner-store--child-changed (&rest _)
   "Queue a runner checkpoint after the child transcript changes."
-  (when-let* ((run gptel-runner-store--child-run)
-              ((gethash gptel-runner-store--child-id (gptel-runner-run-child-chats run))))
-    (gptel-runner--checkpoint run)))
+  (when (gptel-runner-store--child-owner)
+    (gptel-runner--checkpoint gptel-runner-store--child-run)))
 
 (defun gptel-runner-store--close-child ()
   "Capture the complete child transcript before its buffer disappears."
-  (when-let* ((run gptel-runner-store--child-run)
-              (record (gethash gptel-runner-store--child-id
-                               (gptel-runner-run-child-chats run)))
-              ((eq (plist-get record :chat) (current-buffer))))
+  (when-let* ((record (gptel-runner-store--child-owner)))
     (setf (plist-get record :name) (buffer-name)
           (plist-get record :chat) (gptel-runner-store--child-archive record))
-    (gptel-runner--checkpoint run)))
+    (gptel-runner--checkpoint gptel-runner-store--child-run)))
 
 (dolist (function '(gptel-runner-store--child-changed gptel-runner-store--close-child))
   (put function 'permanent-local-hook t))
@@ -272,13 +308,13 @@ and for nodes that execute without a gptel conversation."
 
 (defun gptel-runner-store-track-child (parent child kind)
   "Register CHILD of PARENT as KIND in the parent's runner session, if any."
-  (let* ((call (buffer-local-value 'gptel-runner--call parent))
+  (let* ((call (gptel-runner--buffer-call parent))
+         (owner (gptel-runner-store--child-owner parent))
          (run (or (and call (gptel-runner-call-run call))
-                  (buffer-local-value 'gptel-runner-store--child-run parent))))
+                  (and owner (buffer-local-value 'gptel-runner-store--child-run parent)))))
     (when (and run (not (buffer-local-value 'gptel-runner-store--child-id child)))
       (let* ((children (gptel-runner-run-child-chats run))
              (parent-id (buffer-local-value 'gptel-runner-store--child-id parent))
-             (owner (gethash parent-id children))
              (id (gptel-runner--id "child"))
              (record (list :id id :kind kind :name (buffer-name child)
                            :node (if owner (plist-get owner :node)

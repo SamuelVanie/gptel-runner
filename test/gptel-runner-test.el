@@ -554,6 +554,7 @@
                   :id "call" :run run :node node :state 'running))
            (answers '("Prefer the smaller API" "It is easier to maintain")))
       (with-temp-buffer
+        (setf (gptel-runner-call-buffer call) (current-buffer))
         (setq-local gptel-runner--call call)
         (cl-letf (((symbol-function 'read-string)
                    (lambda (&rest _arguments) (pop answers)))

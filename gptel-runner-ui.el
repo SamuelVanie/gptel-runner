@@ -24,6 +24,7 @@
 (declare-function gptel-runner-child-buffer "gptel-runner-store")
 (defvar gptel-runner-store--child-run)
 (defvar gptel-runner-store--child-id)
+(declare-function gptel-runner-store--child-owner "gptel-runner-store" (&optional buffer))
 (declare-function gptel-runner-resume-run "gptel-runner-flow")
 (declare-function gptel-runner-continue "gptel-runner-flow")
 (declare-function gptel-runner-extend "gptel-runner-flow")
@@ -523,10 +524,10 @@ An elided value retains its complete unpropertized text as hover help."
 (defun gptel-runner-ui--run-context ()
   "Return (RUN . CALL) for the current node chat or dashboard row."
   (cond
-   ((and (boundp 'gptel-runner--call)
-         (gptel-runner-call-p gptel-runner--call))
+   ((gptel-runner--buffer-call)
     (cons (gptel-runner-call-run gptel-runner--call) gptel-runner--call))
-   ((bound-and-true-p gptel-runner-store--child-run)
+   ((and (bound-and-true-p gptel-runner-store--child-run)
+         (gptel-runner-store--child-owner))
     (let* ((run gptel-runner-store--child-run)
            (child (gethash gptel-runner-store--child-id (gptel-runner-run-child-chats run))))
       (cons run (cl-find (plist-get child :call) (gptel-runner-run-calls run)
