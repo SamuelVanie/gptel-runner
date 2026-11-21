@@ -1115,6 +1115,23 @@ RAW is gptel's internal flag for already formatted transcript content."
           (when (eq (gptel-fsm-state fsm) 'WAIT)
             (gptel--update-wait fsm)))))))
 
+(defun gptel-runner-gptel--post-insert (fsm terminal-handler)
+  "Run native post-insert for FSM, then its current TERMINAL-HANDLER.
+Complete even when post-processing signals, preserving the original condition.
+Skip completion when a hook has cancelled, paused or replaced the request."
+  (let* ((call (plist-get (gptel-fsm-info fsm) :context))
+         (generation (and (gptel-runner-call-p call)
+                          (gptel-runner-call-generation call))))
+    (unwind-protect
+        (gptel--handle-post-insert fsm)
+      ;; Hooks run before completion and can synchronously start another turn.
+      ;; The old terminal must never retire that turn or use its completion.
+      (when (and (eq (gptel-fsm-state fsm) 'DONE)
+                 (or (not (gptel-runner-call-p call))
+                     (and (= generation (gptel-runner-call-generation call))
+                          (eq fsm (gptel-runner-call-fsm call)))))
+        (funcall terminal-handler fsm)))))
+
 (defun gptel-runner-gptel--make-fsm (&optional terminal-handler)
   "Create a per-call FSM with runner terminals and gptel status handlers.
 When supplied, TERMINAL-HANDLER handles all three terminal states."
@@ -1151,8 +1168,9 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
                   (alist-get 'TOOL handlers)
                   (list #'gptel--update-tool-ask))
           (alist-get 'DONE handlers)
-          (list #'gptel--handle-post-insert
-                (or terminal-handler #'gptel-runner-gptel--done))
+          (list (lambda (fsm)
+                  (gptel-runner-gptel--post-insert
+                   fsm (or terminal-handler #'gptel-runner-gptel--done))))
           (alist-get 'ERRS handlers)
           (list (or terminal-handler #'gptel-runner-gptel--error))
           (alist-get 'ABRT handlers)

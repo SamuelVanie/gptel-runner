@@ -628,6 +628,249 @@
                                             nil))) :content)
                        "Reviewed evidence"))))))
 
+(ert-deftest gptel-runner-gptel-post-response-hooks-release-downstream ()
+  (dolist (condition '(nil error quit))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-sequence
+                    (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                             :save-as 'answer)
+                    (gptel-runner-agent-step :id 'next :agent 'reader :prompt "Continue"))
+                   :completion 'response :max-requests 2 :max-concurrency 1))
+             (call (car (gptel-runner-run-calls run)))
+             (fsm (pop requests))
+             (info (gptel-fsm-info fsm))
+             (callback (plist-get info :callback))
+             (posts 0)
+             (hooks 0))
+        (plist-put info :post
+                   (cons (lambda (_info) (cl-incf posts)) (plist-get info :post)))
+        (with-current-buffer (gptel-runner-call-buffer call)
+          (setq-local gptel-post-response-functions
+                      (list (lambda (_start _end)
+                              (cl-incf hooks)
+                              (should (= posts 1))
+                              (should (eq (gptel-runner-call-state call) 'running))
+                              (should-not (marker-insertion-type
+                                           (plist-get info :tracking-marker)))
+                              (should (string-suffix-p
+                                       (concat gptel-response-separator
+                                               (gptel-prompt-prefix-string))
+                                       (buffer-string)))
+                              (when condition
+                                (signal condition '("User post-response hook failed")))))))
+        (should
+         (equal (condition-case err
+                    (progn (gptel-runner-gptel-test--reply fsm "Answer" "stop") nil)
+                  ((error quit) err))
+                (and condition (list condition "User post-response hook failed"))))
+        (should (eq (gptel-runner-call-state call) 'succeeded))
+        (should (equal (gptel-runner-get run 'answer) "Answer"))
+        (should (equal (gptel-runner-gptel--last-response
+                        (gptel-runner-call-buffer call)) "Answer"))
+        (should (= (length requests) 1))
+        (should (= (gptel-runner-run-active-count run) 1))
+        (should (= (gptel-runner-budget-requests (gptel-runner-run-budget run)) 2))
+        (should-not (cl-some #'cdr (gptel-fsm-handlers fsm)))
+        (let ((transcript (with-current-buffer (gptel-runner-call-buffer call)
+                            (buffer-string))))
+          (funcall callback "Late response" info)
+          (gptel--fsm-transition fsm 'WAIT)
+          (gptel--fsm-transition fsm 'DONE)
+          (should (equal transcript (with-current-buffer (gptel-runner-call-buffer call)
+                                      (buffer-string)))))
+        (should (= posts 1))
+        (should (= hooks 1))
+        (gptel-runner-gptel-test--reply (pop requests) "Downstream answer" "stop")
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (should-not requests)))))
+
+(ert-deftest gptel-runner-gptel-post-response-hooks-preserve-discussion-handoff ()
+  (dolist (condition '(nil error quit))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                            :save-as 'answer)
+                   :max-requests 2))
+             (call (car (gptel-runner-run-calls run)))
+             (hooks 0))
+        (with-current-buffer (gptel-runner-call-buffer call)
+          (setq-local gptel-post-response-functions
+                      (list (lambda (_start _end)
+                              (cl-incf hooks)
+                              (when condition
+                                (signal condition '("Discussion hook failed")))))))
+        (should
+         (equal (condition-case err
+                    (progn (gptel-runner-gptel-test--reply
+                            (pop requests) "Which branch?" "stop") nil)
+                  ((error quit) err))
+                (and condition (list condition "Discussion hook failed"))))
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (should-not (gptel-runner-get run 'answer))
+        (should-not requests)
+        (gptel-runner-gptel-feedback call "Use main")
+        (should
+         (equal (condition-case err
+                    (progn (gptel-runner-gptel-test--handoff
+                            (pop requests) "The results" "I checked main.") nil)
+                  ((error quit) err))
+                (and condition (list condition "Discussion hook failed"))))
+        (should (= hooks 2))
+        (should (equal (gptel-runner-get run 'answer) "The results"))
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (should (= (gptel-runner-budget-requests (gptel-runner-run-budget run)) 2))
+        (should-not requests)))))
+
+(ert-deftest gptel-runner-gptel-post-response-hooks-keep-review-gate ()
+  (dolist (condition '(nil error quit))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                            :pause-after t :save-as 'answer)
+                   :completion 'response :max-requests 2))
+             (call (car (gptel-runner-run-calls run)))
+             (hooks 0))
+        (gptel-runner-gptel-test--reply (pop requests) "Initial answer" "stop")
+        (with-current-buffer (gptel-runner-call-buffer call)
+          (setq-local gptel-post-response-functions
+                      (list (lambda (_start _end)
+                              (cl-incf hooks)
+                              (should (plist-get (gptel-runner-call-driver-data call)
+                                                 :feedback-active))
+                              (when condition
+                                (signal condition '("Review hook failed")))))))
+        (gptel-runner-gptel-feedback call "Check again")
+        (let ((fsm (pop requests)))
+          (should
+           (equal (condition-case err
+                      (progn (gptel-runner-gptel-test--reply
+                              fsm "Corrected answer" "stop") nil)
+                    ((error quit) err))
+                  (and condition (list condition "Review hook failed"))))
+          (should-not (cl-some #'cdr (gptel-fsm-handlers fsm))))
+        (should (= hooks 1))
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (should-not (plist-get (gptel-runner-call-driver-data call) :feedback-active))
+        (should-not (gptel-runner-get run 'answer))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (should (= (gptel-runner-budget-requests (gptel-runner-run-budget run)) 2))
+        (should-not requests)
+        (gptel-runner-complete-call-from-buffer nil call)
+        (should (equal (gptel-runner-get run 'answer) "Corrected answer"))
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
+(ert-deftest gptel-runner-gptel-post-response-cleanup-error-completes ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'reader :preset nil)
+    (let* ((run (gptel-runner-start
+                 (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                          :save-as 'answer)
+                 :completion 'response))
+           (call (car (gptel-runner-run-calls run)))
+           (fsm (pop requests))
+           (info (gptel-fsm-info fsm))
+           (posts 0)
+           (hooks 0))
+      (plist-put info :post
+                 (append (plist-get info :post)
+                         (list (lambda (_info)
+                                 (cl-incf posts)
+                                 (error "Request cleanup failed")))))
+      (with-current-buffer (gptel-runner-call-buffer call)
+        (setq-local gptel-post-response-functions
+                    (list (lambda (_start _end) (cl-incf hooks)))))
+      (should (equal (should-error
+                      (gptel-runner-gptel-test--reply fsm "Answer" "stop"))
+                     '(error "Request cleanup failed")))
+      (should (= posts 1))
+      (should (zerop hooks))
+      (should (eq (gptel-runner-run-state run) 'succeeded))
+      (should (equal (gptel-runner-get run 'answer) "Answer"))
+      (should (zerop (gptel-runner-run-active-count run)))
+      (should-not requests))))
+
+(ert-deftest gptel-runner-gptel-post-response-hook-cancellation-stays-terminal ()
+  (gptel-runner-gptel-test--with-transport
+    (gptel-runner-register-agent 'reader :preset nil)
+    (let* ((run (gptel-runner-start
+                 (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                          :save-as 'answer)
+                 :completion 'response))
+           (call (car (gptel-runner-run-calls run)))
+           (hooks 0))
+      (with-current-buffer (gptel-runner-call-buffer call)
+        (setq-local gptel-post-response-functions
+                    (list (lambda (_start _end)
+                            (cl-incf hooks)
+                            (gptel-runner-abort-run run)
+                            (error "Hook cancelled the run")))))
+      (should (equal (should-error
+                      (gptel-runner-gptel-test--reply (pop requests) "Answer" "stop"))
+                     '(error "Hook cancelled the run")))
+      (should (= hooks 1))
+      (should (eq (gptel-runner-run-state run) 'cancelled))
+      (should (eq (gptel-runner-call-state call) 'cancelled))
+      (should-not (gptel-runner-get run 'answer))
+      (should (zerop (gptel-runner-run-active-count run)))
+      (should-not requests))))
+
+(ert-deftest gptel-runner-gptel-post-response-hook-preserves-replacement-feedback ()
+  (dolist (condition '(nil error quit))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'reader :preset nil)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read"
+                                            :save-as 'answer)
+                   :completion 'response :max-requests 2))
+             (call (car (gptel-runner-run-calls run)))
+             (fsm (pop requests))
+             (info (gptel-fsm-info fsm))
+             (callback (plist-get info :callback))
+             (hooks 0))
+        (with-current-buffer (gptel-runner-call-buffer call)
+          (setq-local gptel-post-response-functions
+                      (list (lambda (_start _end)
+                              (cl-incf hooks)
+                              (setq-local gptel-post-response-functions nil)
+                              (gptel-runner-pause-call call)
+                              (gptel-runner-gptel-feedback call "Please revise this")
+                              (when condition
+                                (signal condition '("Replacement hook failed")))))))
+        (should
+         (equal (condition-case err
+                    (progn (gptel-runner-gptel-test--reply fsm "Initial answer" "stop") nil)
+                  ((error quit) err))
+                (and condition (list condition "Replacement hook failed"))))
+        (should (= hooks 1))
+        (should (= (length requests) 1))
+        (should-not (eq fsm (gptel-runner-call-fsm call)))
+        (should (cl-some #'cdr (gptel-fsm-handlers (car requests))))
+        (should (plist-get (gptel-runner-call-driver-data call) :feedback-active))
+        (should (= (gptel-runner-run-active-count run) 1))
+        (should-not (gptel-runner-get run 'answer))
+        (let ((transcript (with-current-buffer (gptel-runner-call-buffer call)
+                            (buffer-string))))
+          (funcall callback "Late initial answer" info)
+          (gptel--fsm-transition fsm 'DONE)
+          (should (equal transcript (with-current-buffer (gptel-runner-call-buffer call)
+                                      (buffer-string)))))
+        (gptel-runner-gptel-test--reply (pop requests) "Revised answer" "stop")
+        (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+        (should-not (plist-get (gptel-runner-call-driver-data call) :feedback-active))
+        (should (zerop (gptel-runner-run-active-count run)))
+        (should (= (gptel-runner-budget-requests (gptel-runner-run-budget run)) 2))
+        (should-not requests)
+        (gptel-runner-complete-call-from-buffer nil call)
+        (should (equal (gptel-runner-get run 'answer) "Revised answer"))
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
 (ert-deftest gptel-runner-gptel-supported-api-shape ()
   (should (gptel-runner-gptel--check-api))
   (should (fboundp 'gptel--apply-preset))
@@ -645,8 +888,8 @@
                                  #'gptel--update-tool-call)
                            (alist-get 'TOOL gptel-request--handlers)
                            (list #'gptel--update-tool-ask))))
-    (should (equal (alist-get 'DONE handlers)
-                   (list #'gptel--handle-post-insert #'gptel-runner-gptel--done)))
+    ;; Native post-insert and completion share an exception-safe handler.
+    (should (= (length (alist-get 'DONE handlers)) 1))
     (should (equal (alist-get 'ERRS handlers)
                    (list #'gptel-runner-gptel--error)))
     (should (equal (alist-get 'ABRT handlers)
