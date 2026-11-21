@@ -60,6 +60,9 @@ deactivated, and to roll back a refused or failed admission attempt.")
 (defvar gptel-runner--runs (make-hash-table :test #'equal)
   "Session-local runs by string identifier.")
 
+(defvar gptel-runner--dispatch-deferred-runs nil
+  "Runs whose queue dispatch is dynamically deferred during teardown.")
+
 (defvar gptel-runner--next-id 0)
 
 (defvar gptel-runner--session-id
@@ -1086,9 +1089,24 @@ Roll back acquisitions if any admission function refuses or signals."
                  (gptel-runner-run-active-calls run))))
        (gptel-runner--admit-call call)))
 
+(defmacro gptel-runner--with-deferred-dispatch (run &rest body)
+  "Evaluate BODY without dispatching queued calls in RUN.
+Drain the queue on exit, after the outermost teardown for RUN finishes.
+Failure propagation to ancestor groups must remain inside BODY so their
+queued siblings cannot start before those groups cancel them."
+  (declare (indent 1) (debug (form body)))
+  (let ((run-var (make-symbol "run")))
+    `(let ((,run-var ,run))
+       (unwind-protect
+           (let ((gptel-runner--dispatch-deferred-runs
+                  (cons ,run-var gptel-runner--dispatch-deferred-runs)))
+             ,@body)
+         (gptel-runner--drain-queue ,run-var)))))
+
 (defun gptel-runner--drain-queue (run)
   "Process queued work in RUN as budgets and locks permit."
-  (when (eq (gptel-runner-run-state run) 'running)
+  (when (and (eq (gptel-runner-run-state run) 'running)
+             (not (memq run gptel-runner--dispatch-deferred-runs)))
     (let ((progress t))
       (while progress
         (setq progress nil)

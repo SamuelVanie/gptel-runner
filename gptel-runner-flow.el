@@ -617,15 +617,37 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
         (apply #'append (mapcar #'gptel-runner--subtree-ids
                                 (gptel-runner-node-children node)))))
 
-(defun gptel-runner--cancel-subtree-calls (run node reason)
-  "Cancel unfinished work in RUN below NODE for REASON."
-  (let ((ids (gptel-runner--subtree-ids node)))
-    (dolist (call (copy-sequence (gptel-runner-run-calls run)))
-      (when (and (member (or (gptel-runner-call-discussion-owner call)
-                             (gptel-runner-node-id (gptel-runner-call-node call)))
-                         ids)
-                 (not (gptel-runner--call-terminal-p call)))
-        (gptel-runner-abort-call call reason)))))
+(defun gptel-runner--cancel-subtree-calls (run nodes reason)
+  "Cancel unfinished work in RUN below NODES for REASON.
+NODES is one node or a list of sibling subtrees to cancel together.
+The caller must defer dispatch through cancellation and failure propagation."
+  (let* ((roots (if (gptel-runner-node-p nodes) (list nodes) nodes))
+         (descendants (apply #'append (mapcar #'gptel-runner-list-nodes roots)))
+         (ids (mapcar #'gptel-runner-node-id descendants))
+         (calls
+          (cl-remove-if-not
+           (lambda (call)
+             (and (member (or (gptel-runner-call-discussion-owner call)
+                              (gptel-runner-node-id (gptel-runner-call-node call)))
+                          ids)
+                  (not (gptel-runner--call-terminal-p call))))
+           (gptel-runner-run-calls run))))
+    ;; Invalidate the entire batch before cleanup or event hooks can deliver
+    ;; another sibling's result.  Detach continuations too: a nested collect
+    ;; group would otherwise succeed on cancellation and advance its sequence.
+    (dolist (call calls)
+      (cl-incf (gptel-runner-call-generation call))
+      (setf (gptel-runner-call-on-complete call) nil))
+    (setf (gptel-runner-run-queue run)
+          (cl-remove-if (lambda (call) (memq call calls))
+                        (gptel-runner-run-queue run)))
+    ;; Detached continuations cannot finish entered nodes.  Preserve terminal
+    ;; outcomes and leave unentered descendants for `gptel-runner--skip-subtree'.
+    (dolist (node descendants)
+      (when (eq (gptel-runner-node-state run (gptel-runner-node-id node)) 'running)
+        (gptel-runner--set-node-state run node 'cancelled reason)))
+    (dolist (call calls)
+      (gptel-runner-abort-call call reason))))
 
 (defun gptel-runner--prompt (run node)
   "Resolve NODE's prompt for RUN."
@@ -1030,9 +1052,9 @@ Return the new history entry, or nil when NODE does not collect history."
             (funcall done state value)))
          (cancel-others
           (except reason)
-          (dolist (child children)
-            (unless (eq child except)
-              (gptel-runner--cancel-subtree-calls run child reason)
+          (let ((others (remq except children)))
+            (gptel-runner--cancel-subtree-calls run others reason)
+            (dolist (child others)
               (gptel-runner--skip-subtree run child reason))))
          (joined
           (child state value)
@@ -1046,10 +1068,11 @@ Return the new history entry, or nil when NODE does not collect history."
               ('fail-fast
                (cond
                 ((not (eq state 'succeeded))
-                 (setq finalized t)
-                 (cancel-others child 'parallel-fail-fast)
-                 (gptel-runner--set-node-state run node state value)
-                 (funcall done state value))
+                 (gptel-runner--with-deferred-dispatch run
+                   (setq finalized t)
+                   (cancel-others child 'parallel-fail-fast)
+                   (gptel-runner--set-node-state run node state value)
+                   (funcall done state value)))
                 ((zerop remaining) (finish 'succeeded (nreverse results)))))
               ('collect
                (when (zerop remaining)
@@ -1059,14 +1082,15 @@ Return the new history entry, or nil when NODE does not collect history."
                 ((and (>= successes minimum) (zerop remaining))
                  (finish 'succeeded (nreverse results)))
                 ((< (+ successes remaining) minimum)
-                 (setq finalized t)
-                 (cancel-others child 'minimum-impossible)
-                 (let ((failure (list :type 'minimum-successes
-                                      :required minimum
-                                      :successes successes
-                                      :failures failures)))
-                   (gptel-runner--set-node-state run node 'failed failure)
-                   (funcall done 'failed failure)))))))))
+                 (gptel-runner--with-deferred-dispatch run
+                   (setq finalized t)
+                   (cancel-others child 'minimum-impossible)
+                   (let ((failure (list :type 'minimum-successes
+                                        :required minimum
+                                        :successes successes
+                                        :failures failures)))
+                     (gptel-runner--set-node-state run node 'failed failure)
+                     (funcall done 'failed failure))))))))))
       (gptel-runner--set-node-state run node 'running)
       (dolist (child children)
         (if finalized
