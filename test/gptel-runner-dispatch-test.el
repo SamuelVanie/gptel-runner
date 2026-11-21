@@ -384,6 +384,68 @@
         (should (= callbacks 1))
         (should (zerop (gptel-runner-run-active-count run)))))))
 
+(ert-deftest gptel-runner-dispatch-cancellation-invalidates-queued-node-completions ()
+  (gptel-runner-dispatch-test--isolated
+    (let ((callbacks 0) reject-a resolve-b resolve-c resolve-other advanced)
+      (let ((run
+             (gptel-runner-start
+              (gptel-runner-parallel
+               :id 'outer :policy 'collect
+               (gptel-runner-parallel
+                :id 'group :policy 'fail-fast
+                (gptel-runner-elisp-step
+                 :id 'a :async t
+                 :function (lambda (_run _node _resolve reject)
+                             (setq reject-a reject) nil))
+                (gptel-runner-sequence
+                 :id 'sibling
+                 (gptel-runner-parallel
+                  :id 'inner :policy 'collect
+                  (gptel-runner-elisp-step
+                   :id 'b :async t
+                   :function (lambda (_run _node resolve _reject)
+                               (setq resolve-b resolve) nil))
+                  (gptel-runner-elisp-step
+                   :id 'c :async t
+                   :function (lambda (_run _node resolve _reject)
+                               (setq resolve-c resolve) nil)))
+                 (gptel-runner-branch
+                  :id 'after :predicate (lambda (_run) (setq advanced t))
+                  :then (gptel-runner-sequence))))
+               (gptel-runner-elisp-step
+                :id 'independent :async t
+                :function (lambda (_run _node resolve _reject)
+                            (setq resolve-other resolve) nil)))
+              :max-concurrency 4
+              :callback (lambda (_run) (cl-incf callbacks)))))
+        (let ((gptel-runner-event-hook
+               (list (lambda (event)
+                       (when (and (eq (gptel-runner-event-type event) 'call-failed)
+                                  (eq (gptel-runner-event-node-id event) 'a))
+                         ;; Their calls succeed before A's failure reaches the
+                         ;; group.  Their node completions are still queued
+                         ;; when cancellation invalidates the sibling subtree.
+                         (funcall resolve-b 'done)
+                         (funcall resolve-c 'done))))))
+          (funcall reject-a 'failure))
+        (should-not advanced)
+        (should (eq (gptel-runner-run-state run) 'running))
+        (should (eq (gptel-runner-node-state run 'group) 'failed))
+        (dolist (id '(sibling inner))
+          (should (eq (gptel-runner-node-state run id) 'cancelled)))
+        (dolist (id '(b c))
+          (should (eq (gptel-runner-node-state run id) 'succeeded)))
+        (should (eq (gptel-runner-node-state run 'after) 'skipped))
+        (should (eq (gptel-runner-node-state run 'independent) 'running))
+        (should (zerop callbacks))
+        (funcall resolve-b 'stale)
+        (funcall resolve-c 'stale)
+        (funcall resolve-other 'unaffected)
+        (should-not advanced)
+        (should (eq (gptel-runner-run-state run) 'succeeded))
+        (should (= callbacks 1))
+        (should (zerop (gptel-runner-run-active-count run)))))))
+
 (ert-deftest gptel-runner-dispatch-unexpected-continuation-error-cleans-run ()
   (gptel-runner-dispatch-test--isolated
     (let ((callbacks 0) cleaned)

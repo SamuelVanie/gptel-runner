@@ -136,6 +136,7 @@ AGENT is nil for Elisp calls, which do not use a provider driver."
   (chats (make-hash-table :test #'equal))
   iterations repeat-limits active-calls calls events budget driver queue
   dispatching continuations
+  (continuation-epochs (make-hash-table :test #'equal))
   (active-count 0)
   (writer-active 0) started-at finished-at terminal-data
   extension-context finalization
@@ -970,7 +971,8 @@ are never attributed to this function."
          (complete (gptel-runner--continuation
                     run (lambda (state value)
                           (gptel-runner--elisp-result
-                           call generation state value))))
+                           call generation state value))
+                    node))
          (timeout (plist-get props :timeout))
          (starting t)
          outcome)
@@ -1040,7 +1042,9 @@ are never attributed to this function."
              (complete (gptel-runner--continuation
                         run (lambda (status &optional value metadata)
                               (gptel-runner--driver-result
-                               call generation status value metadata)))))
+                               call generation status value metadata))
+                        (or (gptel-runner-call-discussion-owner call)
+                            (gptel-runner-call-node call)))))
         (unless driver-counts
           (gptel-runner--emit
            run 'request-started (gptel-runner-call-node call) call
@@ -1121,20 +1125,35 @@ queued siblings cannot start before those groups cancel them."
              ,@body)
          (gptel-runner--drain-queue ,run-var)))))
 
-(defun gptel-runner--continuation (run function)
-  "Wrap FUNCTION as a stack-safe continuation for RUN's current generation.
+(defun gptel-runner--continuation-current-p (run generation owner)
+  "Check RUN's GENERATION and optional node/epoch OWNER for a continuation."
+  (and (= generation (gptel-runner-run-generation run))
+       (eq (gptel-runner-run-state run) 'running)
+       (or (null owner)
+           (= (cdr owner) (gethash (car owner)
+                                  (gptel-runner-run-continuation-epochs run) 0)))))
+
+(defun gptel-runner--continuation (run function &optional node)
+  "Wrap FUNCTION for RUN's current generation and optional owning NODE.
+NODE may be a node or its ID; discussion follow-ups use their downstream owner.
 Completions take priority over call dispatch.  The outermost scheduler drains
 them synchronously; recursive completions only enqueue work.  In particular,
-returning from `gptel-runner-start' still completes purely synchronous flows."
-  (let ((generation (gptel-runner-run-generation run)))
+returning from `gptel-runner-start' still completes purely synchronous flows.
+Subtree cancellation invalidates NODE's epoch even when its call has already
+completed and detached its callback into this queue."
+  (let* ((generation (gptel-runner-run-generation run))
+         (id (if (gptel-runner-node-p node) (gptel-runner-node-id node) node))
+         (owner (when id
+                  (cons id (gethash id
+                                    (gptel-runner-run-continuation-epochs run) 0)))))
     (lambda (&rest arguments)
-      (when (and (= generation (gptel-runner-run-generation run))
-                 (eq (gptel-runner-run-state run) 'running))
+      (when (gptel-runner--continuation-current-p run generation owner)
         (setf (gptel-runner-run-continuations run)
               (nconc (gptel-runner-run-continuations run)
                      (list (list generation function arguments
                                  (and (memq run gptel-runner--dispatch-deferred-runs)
-                                      t)))))
+                                      t)
+                                 owner))))
         (gptel-runner--drain-queue run)))))
 
 (defun gptel-runner--recovery-hook (hook)
@@ -1218,7 +1237,8 @@ These transient queues and guards are deliberately not persisted."
             (let ((generation (gptel-runner-run-generation run)))
               (condition-case err
                   (if-let* ((next (pop (gptel-runner-run-continuations run))))
-                      (when (= (car next) generation)
+                      (when (gptel-runner--continuation-current-p
+                             run (car next) (nth 4 next))
                         (let ((gptel-runner--dispatch-deferred-runs
                                (if (nth 3 next)
                                    (cons run gptel-runner--dispatch-deferred-runs)
@@ -1235,7 +1255,7 @@ These transient queues and guards are deliberately not persisted."
   "Queue a call for NODE in RUN, invoking DONE on terminalization.
 AGENT and PROMPT are nil for Elisp steps.  REPAIR-P marks an agent repair.
 OWNER identifies the downstream node whose question this call serves."
-  (setq done (gptel-runner--continuation run done))
+  (setq done (gptel-runner--continuation run done (or owner node)))
   (if (and (not (eq (gptel-runner-node-kind node) 'elisp))
            (not (gptel-runner--consume-call run)))
       (progn

@@ -639,6 +639,10 @@ The caller must defer dispatch through cancellation and failure propagation."
                           ids)
                   (not (gptel-runner--call-terminal-p call))))
            (gptel-runner-run-calls run))))
+    ;; Completed calls may already have queued their node continuations.
+    ;; Invalidate those too, including ancestors still awaiting a queued join.
+    (dolist (id ids)
+      (cl-incf (gethash id (gptel-runner-run-continuation-epochs run) 0)))
     ;; Invalidate the entire batch before cleanup or event hooks can deliver
     ;; another sibling's result.  Detach continuations too: a nested collect
     ;; group would otherwise succeed on cancellation and advance its sequence.
@@ -1326,7 +1330,7 @@ Return the new history entry, or nil when NODE does not collect history."
   (let ((generation (gptel-runner-run-generation run)))
     (condition-case err
         (gptel-runner--execute-node-1
-         run node (gptel-runner--continuation run done))
+         run node (gptel-runner--continuation run done node))
       ((error quit) (gptel-runner--execution-error run generation err)))))
 
 (defun gptel-runner--execute-node-1 (run node done)
