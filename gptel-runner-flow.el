@@ -595,8 +595,10 @@ CONTEXTS is an alist of labels and context sources inherited by every agent."
     t))
 
 (defun gptel-runner--reset-subtree (run node)
-  "Reset NODE and descendants to pending in RUN before a new iteration."
+  "Reset NODE and descendants for fresh execution in RUN.
+Repeat-local progress is cleared; collected histories and limits are kept."
   (remhash (gptel-runner-node-id node) (gptel-runner-run-discussions run))
+  (gptel-runner--clear-repeat-progress run node t)
   (when (eq (gptel-runner-node-kind node) 'branch)
     (remhash (list 'gptel-runner-branch (gptel-runner-node-id node))
              (gptel-runner-run-blackboard run)))
@@ -1000,17 +1002,7 @@ Return the new history entry, or nil when NODE does not collect history."
          (retry-slot (list 'gptel-runner-retry-repeat
                            (gptel-runner-node-id node)))
          (retry-body (gptel-runner-get run retry-slot))
-         (previous-key (gptel-runner-get run progress-slot))
-         (continue-current
-          (or retry-body (gptel-runner--subtree-state-p run body 'succeeded)
-              ;; An entered branch is progress even before its first async
-              ;; child succeeds.  Preserve its decision when resuming the body.
-              (cl-some (lambda (child)
-                         (and (eq (gptel-runner-node-kind child) 'branch)
-                              (gptel-runner-get
-                               run (list 'gptel-runner-branch
-                                         (gptel-runner-node-id child)))))
-                       (gptel-runner-list-nodes body)))))
+         (previous-key (gptel-runner-get run progress-slot)))
     (cl-labels
         ((finish (state value)
            (gptel-runner--set-node-state run node state value)
@@ -1056,7 +1048,10 @@ Return the new history entry, or nil when NODE does not collect history."
        (lambda (finished)
          (if finished
              (finish 'succeeded nil)
-           (iterate continue-current)))))))
+           ;; Entry uses fresh or prepared recovery states.  A nested repeat
+           ;; may have completed iterations even with no succeeded descendants
+           ;; left in its current body.  Only new iterations reset that body.
+           (iterate t)))))))
 
 (defun gptel-runner--execute-parallel (run node done)
   "Execute parallel NODE in RUN and invoke DONE according to its join policy."
@@ -2015,8 +2010,9 @@ use it for the retried run's next terminal transition."
                             gptel-runner-continuations-key))
       (remhash key (gptel-runner-run-blackboard run)))))
 
-(defun gptel-runner--clear-repeat-progress (run root)
-  "Reset repeat counters and internal progress below ROOT in RUN."
+(defun gptel-runner--clear-repeat-progress (run root &optional node-only)
+  "Reset repeat counters and internal progress at ROOT in RUN.
+Include descendants unless NODE-ONLY is non-nil.  Keep histories and limits."
   (cl-labels
       ((walk
         (node)
@@ -2028,7 +2024,8 @@ use it for the retried run's next terminal transition."
           (remhash (list 'gptel-runner-progress
                          (gptel-runner-node-id node))
                    (gptel-runner-run-blackboard run)))
-        (mapc #'walk (gptel-runner-node-children node))))
+        (unless node-only
+          (mapc #'walk (gptel-runner-node-children node)))))
     (walk root)))
 
 (cl-defun gptel-runner-continue
