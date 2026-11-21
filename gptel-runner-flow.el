@@ -908,14 +908,18 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
 (defun gptel-runner--evaluate-flow-function (run node function next done)
   "Evaluate FUNCTION on RUN for NODE, then invoke NEXT or DONE.
 NEXT receives a successful value.  Lisp errors and quits become terminal
-node outcomes passed to DONE.  Invoke continuations outside the error
-handler so errors in later nodes are not attributed to this function."
-  (let ((outcome
-         (condition-case err
-             (cons 'succeeded (funcall function run))
-           (error (cons 'failed (list :type 'flow-error :error err)))
-           (quit (cons 'cancelled (list :type 'flow-quit :error err))))))
-    (when (eq (gptel-runner-run-state run) 'running)
+node outcomes passed to DONE.  Discard outcomes if FUNCTION yields across
+a generation change or NODE's cancellation.  Invoke continuations outside
+the error handler so errors in later nodes are not attributed to this function."
+  (let* ((generation (gptel-runner-run-generation run))
+         (id (gptel-runner-node-id node))
+         (owner (cons id (gethash id (gptel-runner-run-continuation-epochs run) 0)))
+         (outcome
+          (condition-case err
+              (cons 'succeeded (funcall function run))
+            (error (cons 'failed (list :type 'flow-error :error err)))
+            (quit (cons 'cancelled (list :type 'flow-quit :error err))))))
+    (when (gptel-runner--continuation-current-p run generation owner)
       (if (eq (car outcome) 'succeeded)
           (funcall next (cdr outcome))
         (gptel-runner--set-node-state run node (car outcome) (cdr outcome))
@@ -1022,19 +1026,24 @@ Return the new history entry, or nil when NODE does not collect history."
              (gptel-runner--emit run 'iteration-completed node nil
                                  (list :iteration iteration :progress key))
              (evaluate
-              (lambda (run)
-                (cond ((and stop (funcall stop run)) 'blocked)
-                      ((and until (funcall until run)) 'succeeded)))
-              (lambda (decision)
-                (cond
-                 (decision (finish decision value))
-                 ((and key previous-key (equal key previous-key))
-                  (finish 'stalled (list :type 'stalled :progress-key key)))
-                 (t
-                  (setq previous-key key)
-                  (puthash progress-slot key (gptel-runner-run-blackboard run))
-                  (gptel-runner--checkpoint run)
-                  (iterate nil)))))))
+              (or stop #'ignore)
+              (lambda (stopped)
+                (if stopped
+                    (finish 'blocked value)
+                  ;; STOP may yield into a new execution phase.  Check its
+                  ;; ownership before invoking the next user predicate.
+                  (evaluate
+                   (or until #'ignore)
+                   (lambda (finished)
+                     (cond
+                      (finished (finish 'succeeded value))
+                      ((and key previous-key (equal key previous-key))
+                       (finish 'stalled (list :type 'stalled :progress-key key)))
+                      (t
+                       (setq previous-key key)
+                       (puthash progress-slot key (gptel-runner-run-blackboard run))
+                       (gptel-runner--checkpoint run)
+                       (iterate nil))))))))))
          (after-body (state value)
            (if (not (eq state 'succeeded))
                (finish state value)
