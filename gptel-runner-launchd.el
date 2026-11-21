@@ -23,6 +23,8 @@
 (declare-function gptel-runner-invocation-live-p "gptel-runner-jobs")
 (declare-function gptel-runner-invocation-get "gptel-runner-jobs")
 (declare-function gptel-runner-jobs--confirm-stopped "gptel-runner-jobs")
+(declare-function gptel-runner-jobs--abandoned-start-p "gptel-runner-jobs")
+(declare-function gptel-runner-jobs--read "gptel-runner-jobs")
 (defvar gptel-runner-job-directory)
 (defvar gptel-runner-jobs--package-directory)
 
@@ -359,7 +361,9 @@ The worker is independent of the editor or short-lived schedule trigger."
          (dictionary
           (append
            (gptel-runner-launchd--base
-            job label (gptel-runner-launchd--arguments job "worker" directory) directory)
+            job label (gptel-runner-launchd--arguments
+                       job "worker" directory "--epoch"
+                       (number-to-string (plist-get invocation :epoch))) directory)
            '(("RunAtLoad" . t)))))
     (gptel-runner-launchd--write file (gptel-runner-launchd--plist dictionary))
     (gptel-runner-launchd--checked "bootstrap" (gptel-runner-launchd--domain) file)
@@ -376,14 +380,53 @@ The worker is independent of the editor or short-lived schedule trigger."
        (signal (car err) (cdr err))))
     label))
 
+(defun gptel-runner-launchd--startup-managed-p (invocation label)
+  "Return non-nil if INVOCATION's startup is covered by service LABEL.
+Legacy records need current-generation launchd metadata; a custom launcher
+may have a detached child that probing launchd cannot account for."
+  (if (plist-member invocation :launcher)
+      (memq (plist-get invocation :launcher) '(launchd direct))
+    (let* ((directory (plist-get invocation :directory))
+           (registration (ignore-errors
+                           (gptel-runner-jobs--read
+                            (expand-file-name
+                             (format "worker-registration-%d.el"
+                                     (plist-get invocation :epoch)) directory)))))
+      (or (and (proper-list-p registration)
+               (equal (plist-get registration :label) label)
+               (equal (plist-get registration :epoch) (plist-get invocation :epoch)))
+          (ignore-errors
+            (with-temp-buffer
+              (insert-file-contents (expand-file-name "worker.plist" directory))
+              (search-forward (format "<key>Label</key><string>%s</string>" label) nil t)))))))
+
 (defun gptel-runner-launchd-reap ()
   "Unload completed invocation services, preserving their result history.
 Only exited, superseded, or confirmed dead workers are reaped; terminal
-pipeline state alone is insufficient while the worker may flush results."
+pipeline state alone is insufficient while the worker may flush results.
+Abandoned launch reservations close only after the exact service is absent."
   (when (eq system-type 'darwin)
     (require 'gptel-runner-jobs)
     (dolist (invocation (gptel-runner-invocation-list))
       (let ((directory (plist-get invocation :directory)))
+        ;; Bootstrap precedes the registration write.  Its absence alone is
+        ;; never proof that launchd cannot still start this generation.
+        (when (gptel-runner-jobs--abandoned-start-p invocation)
+          (condition-case err
+              (let* ((label (gptel-runner-launchd--label
+                             "worker" (plist-get invocation :id)
+                             (plist-get invocation :epoch)))
+                     (registration (expand-file-name
+                                    (format "worker-registration-%d.el"
+                                            (plist-get invocation :epoch)) directory)))
+                (when (and (gptel-runner-launchd--startup-managed-p invocation label)
+                           (eq 113 (plist-get
+                                   (gptel-runner-launchd--invoke
+                                    "print" (gptel-runner-launchd--target label)) :exit))
+                           (gptel-runner-jobs--confirm-stopped invocation))
+                  (when (file-exists-p registration) (delete-file registration))))
+            (error (message "Could not reconcile background startup: %s"
+                            (error-message-string err)))))
         (dolist (file (directory-files directory t
                                       "\\`worker-registration-[0-9]+\\.el\\'"))
           (condition-case err
@@ -391,26 +434,14 @@ pipeline state alone is insufficient while the worker may flush results."
                               (insert-file-contents file)
                               (goto-char (point-min))
                               (read (current-buffer)))))
-                (cond
-                 ((and (eq (plist-get invocation :worker-state) 'uncertain)
-                       (= (plist-get record :epoch) (plist-get invocation :epoch)))
-                  ;; A failed stop is not proof of death.  Only launchd's
-                  ;; explicit service-not-found response releases this claim.
-                  (when (and
-                         (eq 113 (plist-get
-                                  (gptel-runner-launchd--invoke
-                                   "print" (gptel-runner-launchd--target
-                                            (plist-get record :label))) :exit))
-                         (gptel-runner-jobs--confirm-stopped invocation))
-                    (delete-file file)))
-                 ((or (eq (plist-get invocation :worker-state) 'exited)
-                      ;; The controller advances epochs only after the
-                      ;; former owner has exited or relinquished ownership.
-                      (< (plist-get record :epoch) (plist-get invocation :epoch))
-                      (and (memq (plist-get invocation :phase) '(open closing))
-                           (not (gptel-runner-invocation-live-p invocation))))
+                (when (or (eq (plist-get invocation :worker-state) 'exited)
+                          ;; The controller advances epochs only after the
+                          ;; former owner has exited or relinquished ownership.
+                          (< (plist-get record :epoch) (plist-get invocation :epoch))
+                          (and (memq (plist-get invocation :phase) '(open closing))
+                               (not (gptel-runner-invocation-live-p invocation))))
                   (gptel-runner-launchd--unload (plist-get record :label))
-                  (delete-file file))))
+                  (delete-file file)))
             (error (message "Could not reap background worker: %s"
                             (error-message-string err)))))))))
 

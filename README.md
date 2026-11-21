@@ -1480,6 +1480,17 @@ the reservation is released.  If stopping cannot be confirmed, the invocation
 remains visibly uncertain and its reservation stays held until absence is
 confirmed; it is not silently retried.
 
+If the launcher exits before adoption, history shows the reservation as
+interrupted. On dashboard refresh, `gptel-runner-launchd-reap` closes it as
+`startup-error` only after confirming the exact worker service is absent and
+rechecking ownership under the adoption locks. It can then be forgotten even
+without a checkpoint. Launchd workers carry their launch epoch so a delayed
+child cannot adopt a newer generation. Loaded services, failed probes, and
+live or unknown owners stay protected. New reservations record their launcher;
+custom launchers and legacy records without current-generation launchd metadata
+remain protected because launchd cannot establish whether they have a pending
+detached worker.
+
 ### Schedule a registered job on macOS
 
 The package schedules recurring work through a LaunchAgent in the current
