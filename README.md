@@ -54,6 +54,12 @@ metadata. Pipe tables use aligned fixed-pitch columns and become labeled
 rows when the pane is too narrow. Styling follows the current theme's
 text and accent faces, with separate light and dark code panels.
 
+Each assistant turn has one speaker label across its tool calls and final
+answer. Tool results use compact activity headers with expandable INPUT and
+OUTPUT details; quotations use an italic text rail. Click a tool header or
+press `RET` to use gptel's native folding. Pending approval controls retain
+their existing shortcuts.
+
 | Action | Key or command |
 | --- | --- |
 | Open a file or web link | Click or `RET` on the reference |

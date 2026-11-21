@@ -16,6 +16,7 @@
 (require 'face-remap)
 (require 'gptel-runner-chat-links)
 (require 'gptel-runner-chat-tables)
+(require 'gptel-runner-chat-tools)
 
 (defgroup gptel-runner-chat nil
   "Readable conversations without changing their contents."
@@ -88,6 +89,8 @@
 (defvar-local gptel-runner-chat--indexed-ranges nil)
 (defvar-local gptel-runner-chat--range-index [])
 (defvar-local gptel-runner-chat--turns nil)
+(defvar-local gptel-runner-chat--tool-starts nil)
+(defvar-local gptel-runner-chat--tool-response-starts nil)
 (defvar-local gptel-runner-chat--highlight-was-on nil)
 
 (defun gptel-runner-chat--overlay (beg end &rest properties)
@@ -105,6 +108,8 @@
   (mapc #'delete-overlay gptel-runner-chat--overlays)
   (setq gptel-runner-chat--overlays nil
         gptel-runner-chat--turns nil
+        gptel-runner-chat--tool-starts nil
+        gptel-runner-chat--tool-response-starts nil
         gptel-runner-chat--excluded nil
         gptel-runner-chat--indexed-ranges nil
         gptel-runner-chat--range-index []))
@@ -136,7 +141,7 @@
       (gptel-runner-chat--excluded-p beg end)))
 
 (defun gptel-runner-chat--blocks ()
-  "Style code fences and reserve code/tool regions for their native UI."
+  "Give code, quotations and native tools distinct visual treatments."
   (goto-char (point-min))
   (let ((case-fold-search t))
     (while (re-search-forward
@@ -159,6 +164,30 @@
             (setq close-beg (line-beginning-position) end (line-end-position))
           (setq end (point-max)))
         (push (cons beg end) gptel-runner-chat--excluded)
+        (when tool
+          (let ((decorations (gptel-runner-chat-tools-render-block
+                              beg opening-end body-beg close-beg end info)))
+            (when decorations
+              (push beg gptel-runner-chat--tool-starts)
+              (setq gptel-runner-chat--overlays
+                    (nconc decorations gptel-runner-chat--overlays)))))
+        (when (equal (downcase (or kind "")) "quote")
+          (gptel-runner-chat--overlay
+           beg opening-end 'display (propertize "❝" 'face 'gptel-runner-chat-quote)
+           'face '(:inherit default :underline nil :overline nil :box nil)
+           'invisible (unless (eq buffer-invisibility-spec t) 'gptel-runner-chat-visible)
+           'priority 20 'gptel-runner-chat-block-opening t)
+          (when close-beg
+            (gptel-runner-chat--overlay
+             close-beg end 'display (propertize "❞" 'face 'gptel-runner-chat-muted)
+             'face '(:inherit default :underline nil :overline nil :box nil)
+             'priority 20))
+          (when (< body-beg (or close-beg end))
+            (let ((rail (propertize "  │  " 'face 'gptel-runner-chat-muted)))
+              (gptel-runner-chat--overlay
+               body-beg (or close-beg end) 'face 'gptel-runner-chat-quote
+               'line-prefix rail 'wrap-prefix rail 'priority 2
+               'gptel-runner-chat-quotation t))))
         (when (and (not tool) (or (null kind) (member (downcase kind) '("src" "example"))))
           (gptel-runner-chat--overlay beg end 'face 'gptel-runner-chat-code 'priority 1)
           (gptel-runner-chat--overlay
@@ -190,7 +219,8 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
     (if prefix
         (gptel-runner-chat--overlay beg end 'display caption 'priority 30)
       (if-let* ((opening (cl-find-if
-                          (lambda (ov) (overlay-get ov 'gptel-runner-chat-code-opening))
+                          (lambda (ov) (or (overlay-get ov 'gptel-runner-chat-code-opening)
+                                           (overlay-get ov 'gptel-runner-chat-block-opening)))
                           (overlays-at beg))))
           (overlay-put opening 'before-string (concat caption "\n\n"))
         (gptel-runner-chat--overlay
@@ -203,13 +233,15 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
     (and (boundp var) (alist-get major-mode (symbol-value var)))))
 
 (defun gptel-runner-chat--roles ()
-  "Add speaker labels from explicit prefixes and native response properties."
+  "Label each assistant turn once, including its tools and final response."
   (let* ((prompt (gptel-runner-chat--prefix nil))
          (response (gptel-runner-chat--prefix t))
          (name (if (and response (string-match "@[[:alnum:]_-]+" response))
                    (substring (match-string 0 response) 1)
                  gptel-runner-chat-assistant-name))
-         (pos (point-min)))
+         (pos (point-min)) events assistant-active tool-pending)
+    ;; Gather boundaries first, then read them in transcript order.  A tool
+    ;; result interrupts the response text property, not the speaker's turn.
     (dolist (spec (list (cons prompt nil) (cons response t)))
       (when (and (stringp (car spec)) (not (string-empty-p (car spec))))
         (goto-char (point-min))
@@ -219,11 +251,10 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
           (let ((beg (match-beginning 0)) (end (match-end 0)))
             (unless (or (gptel-runner-chat--skip-p beg end)
                         (and (not (cdr spec)) (eq (get-text-property beg 'gptel) 'response)))
-              (if (string-suffix-p "\n" (car spec))
-                  (gptel-runner-chat--speaker beg end (if (cdr spec) name "You") (cdr spec) t)
-                ;; Inline prompt prefixes need a newline before the user's text.
-                (gptel-runner-chat--speaker beg end (if (cdr spec) name "You") (cdr spec) t)
-                (overlay-put (car gptel-runner-chat--overlays) 'after-string "\n\n")))))))
+              (push (list beg end (if (cdr spec) 'assistant-prefix 'user-prefix)
+                          (string-suffix-p "\n" (car spec))) events))))))
+    (dolist (beg gptel-runner-chat--tool-starts)
+      (push (list beg beg 'tool) events))
     (while (< pos (point-max))
       (let ((next (next-single-property-change pos 'gptel nil (point-max))))
         (when (eq (get-text-property pos 'gptel) 'response)
@@ -231,14 +262,68 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
             (goto-char pos)
             (skip-chars-forward " \t\n" next)
             (let ((beg (point)))
-              (unless (or (>= beg next)
-                          (and response (not (string-empty-p response))
-                               (save-excursion
-                                 (goto-char pos)
-                                 (search-backward (string-trim-right response)
-                                                  (max (point-min) (- pos (length response) 3)) t))))
-                (gptel-runner-chat--speaker beg beg name t)))))
-        (setq pos next)))))
+              (when (< beg next)
+                (push (list beg beg 'assistant) events)))))
+        ;; Empty prompt prefixes are supported by gptel too.  In that case
+        ;; ordinary untagged prose is the only available user boundary.
+        (when (and (or (null prompt) (string-empty-p prompt))
+                   (null (get-text-property pos 'gptel)))
+          (save-excursion
+            (goto-char pos)
+            (skip-chars-forward " \t\n" next)
+            (when (and (< (point) next)
+                       (not (cl-some (lambda (event)
+                                       (and (eq (nth 2 event) 'assistant-prefix)
+                                            (= (car event) (point)))) events))
+                       (not (gptel-runner-chat--excluded-p (point) (1+ (point))))
+                       (not (cl-some (lambda (ov) (overlay-get ov 'gptel-tool))
+                                     (overlays-at (point)))))
+              (push (list (point) (point) 'user) events))))
+        (setq pos next)))
+    (setq events
+          (sort events (lambda (a b)
+                         (if (= (car a) (car b))
+                             (and (memq (nth 2 a) '(user-prefix assistant-prefix))
+                                  (not (memq (nth 2 b) '(user-prefix assistant-prefix))))
+                           (< (car a) (car b))))))
+    (dolist (event events)
+      (pcase-let ((`(,beg ,end ,kind . ,rest) event))
+        (cond
+         ((memq kind '(user-prefix user))
+          (setq assistant-active nil tool-pending nil)
+          (gptel-runner-chat--speaker beg end "You" nil (eq kind 'user-prefix))
+          (when (and (eq kind 'user-prefix) (not (car rest)))
+            (overlay-put (car gptel-runner-chat--overlays) 'after-string "\n\n")))
+         (assistant-active
+          ;; A literal repeated prefix is presentation noise as well.  Hide
+          ;; only that prefix; keep every byte and role property in the buffer.
+          (when (eq kind 'assistant-prefix)
+            (gptel-runner-chat--overlay
+             beg (if (and (car rest) (< end (point-max))) (1+ end) end)
+             'display "" 'priority 30 'gptel-runner-chat-continuation t)))
+         (t
+          (setq assistant-active t)
+          (gptel-runner-chat--speaker beg end name t (eq kind 'assistant-prefix))
+          (when (and (eq kind 'assistant-prefix) (not (car rest)))
+            (overlay-put (car gptel-runner-chat--overlays) 'after-string "\n\n"))))
+        (when (and (eq kind 'assistant) tool-pending)
+          (push beg gptel-runner-chat--tool-response-starts)
+          (setq tool-pending nil))
+        (when (eq kind 'tool) (setq tool-pending t))))))
+
+(defun gptel-runner-chat--tool-response-spacing ()
+  "Add two display-only blank lines before prose following tool activity."
+  (dolist (beg gptel-runner-chat--tool-response-starts)
+    ;; Attach to an existing replacement when the answer starts with a
+    ;; heading, table, link or code block, so the gap stays visible too.
+    (let ((ov (or (cl-find-if
+                   (lambda (item) (and (= (overlay-start item) beg)
+                                       (overlay-get item 'display)))
+                   gptel-runner-chat--overlays)
+                  (gptel-runner-chat--overlay beg (min (point-max) (1+ beg))
+                                              'priority 30))))
+      (overlay-put ov 'before-string (concat "\n\n" (overlay-get ov 'before-string)))
+      (overlay-put ov 'gptel-runner-chat-tool-gap t))))
 
 (defun gptel-runner-chat--headings ()
   "Style headings, list bullets, quotations, and inline emphasis."
@@ -376,6 +461,7 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
                 (nconc (gptel-runner-chat-links-render
                         (point-min) (point-max) #'gptel-runner-chat--skip-p)
                        gptel-runner-chat--overlays))
+          (gptel-runner-chat--tool-response-spacing)
           (setq gptel-runner-chat--turns (sort (delete-dups gptel-runner-chat--turns) #'<)))))))
 
 (defun gptel-runner-chat--schedule (&rest _)
