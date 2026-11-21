@@ -197,6 +197,23 @@
                              (gptel-runner-background-open))))
   "Header link from a local chat copy to the worker that produced it.")
 
+(defun gptel-runner-jobs-ui--chat-header ()
+  "Keep worker controls in this local chat copy's header.
+Leave native gptel's status slot and the installed header list intact.
+Optional conversation views can replace or restore the header when toggled."
+  (when (and gptel-runner-jobs-ui--chat-revision
+             (not (memq gptel-runner-jobs-ui--controls-link
+                        (flatten-tree header-line-format))))
+    (let ((label (list " Local chat copy · "
+                       gptel-runner-jobs-ui--controls-link "    ")))
+      (if (and (bound-and-true-p gptel-mode)
+               (bound-and-true-p gptel-use-header-line)
+               (consp header-line-format))
+          ;; gptel updates slot 1 in place.  Atelier also uses list identity
+          ;; to carry that status back to its saved header on disable.
+          (setcar header-line-format (list (car header-line-format) label))
+        (setq-local header-line-format (list label header-line-format))))))
+
 (defun gptel-runner-background-transcript (&optional selection)
   "Visit the selected background call's most recently saved chat.
 Edits and ordinary gptel sends belong to this local conversation.  Use
@@ -219,10 +236,13 @@ at point."
                (with-current-buffer
                    (gptel-runner-store-open-chat path (plist-get call :chat-format))
                  (setq-local gptel-runner-background--target target
-                             gptel-runner-jobs-ui--chat-revision revision
-                             header-line-format
-                             (list " Local chat copy · " gptel-runner-jobs-ui--controls-link
-                                   "    " header-line-format))
+                             gptel-runner-jobs-ui--chat-revision revision)
+                 (add-hook 'gptel-mode-hook
+                           #'gptel-runner-jobs-ui--chat-header nil t)
+                 ;; Register locally without loading the optional view.
+                 (add-hook 'gptel-ui-mode-hook
+                           #'gptel-runner-jobs-ui--chat-header nil t)
+                 (gptel-runner-jobs-ui--chat-header)
                  (current-buffer)))))
       (let ((path (gptel-runner-jobs-ui--artifact-path
                    run (or (plist-get call :transcript)
