@@ -575,9 +575,10 @@ The result is one of `clean', `pending', `writing', or `error'."
   (when-let* ((coordinator
               (gethash run gptel-runner-store--coordinators)))
     (gptel-runner-store--cancel-timer coordinator)
-    (gptel-runner-store--delete-temporary
-     (gptel-runner-store--coordinator-writer coordinator))
-    (remhash run gptel-runner-store--coordinators)
+    (unwind-protect
+        (gptel-runner-store--delete-temporary
+         (gptel-runner-store--coordinator-writer coordinator))
+      (remhash run gptel-runner-store--coordinators))
     t))
 
 (defun gptel-runner-store--fail (coordinator err)
@@ -757,10 +758,15 @@ The command returns before serialization or disk I/O completes.  Completion
 is reported through a `snapshot-saved' event; failures use `snapshot-error'."
   (gptel-runner-store--queue run file t t))
 
+(defun gptel-runner-store--unsaved-p (coordinator)
+  "Return non-nil if COORDINATOR still has uncommitted snapshot work."
+  (or (not (eq (gptel-runner-store--coordinator-state coordinator) 'clean))
+      (< (gptel-runner-store--coordinator-committed-revision coordinator)
+         (gptel-runner-store--coordinator-revision coordinator))))
+
 (defun gptel-runner-store--flush-coordinator (coordinator)
   "Synchronously commit COORDINATOR's latest queued revision."
-  (when (memq (gptel-runner-store--coordinator-state coordinator)
-              '(pending writing))
+  (when (gptel-runner-store--unsaved-p coordinator)
     (gptel-runner-store--cancel-timer coordinator)
     (gptel-runner-store--delete-temporary
      (gptel-runner-store--coordinator-writer coordinator))
@@ -772,12 +778,39 @@ is reported through a `snapshot-saved' event; failures use `snapshot-error'."
       (gptel-runner-store--write-slice coordinator t))))
 
 (defun gptel-runner-store-flush-pending ()
-  "Synchronously finish all queued snapshots.
-This is used during normal Emacs shutdown; interactive saves remain
-asynchronous."
+  "Synchronously attempt all uncommitted snapshots, including failed saves.
+Each coordinator is attempted once.  Failures remain available through
+`gptel-runner-store-save-status'.  This is also used as a best-effort flush
+during forced or batch Emacs shutdown; interactive saves remain asynchronous."
   (maphash (lambda (_run coordinator)
              (gptel-runner-store--flush-coordinator coordinator))
            gptel-runner-store--coordinators))
+
+(defun gptel-runner-store--allow-emacs-kill-p ()
+  "Flush snapshots and veto normal interactive exit if any remain unsaved.
+Used on `kill-emacs-query-functions', which direct `kill-emacs' bypasses.
+Noninteractive shutdown relies on the best-effort `kill-emacs-hook' flush."
+  (or noninteractive
+      (progn
+        (gptel-runner-store-flush-pending)
+        (let (unsaved)
+          (maphash
+           (lambda (_run coordinator)
+             (when (gptel-runner-store--unsaved-p coordinator)
+               (push (format "%s: %s"
+                             (gptel-runner-store--coordinator-file coordinator)
+                             (if-let* ((err (gptel-runner-store--coordinator-error
+                                             coordinator)))
+                                 (error-message-string err)
+                               "new changes queued during shutdown"))
+                     unsaved)))
+           gptel-runner-store--coordinators)
+          (if unsaved
+              (progn
+                (message "Exit canceled: unsaved runner snapshots (%s). Resolve the save problem and try exiting again."
+                         (mapconcat #'identity (nreverse unsaved) "; "))
+                nil)
+            t)))))
 
 (defun gptel-runner-store-flush-run (run)
   "Finish saving RUN before releasing its live session."
@@ -981,6 +1014,7 @@ open on demand.  A version 2 checkpoint restores execution state only."
                          (file-attribute-modification-time
                           (file-attributes a)))))))
 
+(add-hook 'kill-emacs-query-functions #'gptel-runner-store--allow-emacs-kill-p 90)
 (add-hook 'kill-emacs-hook #'gptel-runner-store-flush-pending)
 
 (provide 'gptel-runner-store)
