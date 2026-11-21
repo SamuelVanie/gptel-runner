@@ -151,6 +151,71 @@
       (should (cl-find "bootout" commands :key #'car :test #'equal))
       (should-not (file-exists-p (expand-file-name "worker-registration-1.el" worker-directory))))))
 
+(ert-deftest gptel-runner-launchd-reap-requires-confirmed-dead-owner ()
+  (let* ((owner (list :pid 4242 :start '(100 0 0 0) :host (system-name)))
+         (live-attributes '((start 100 0 0 0) (state . "R")))
+         (original-attributes (symbol-function 'process-attributes))
+         (original-processes (symbol-function 'list-system-processes))
+         (cases
+          `((live ,owner ,live-attributes (4242) live)
+            (unavailable-attributes ,owner nil (4242) unknown)
+            (missing-observed-start ,owner ((state . "R")) (4242) unknown)
+            (inspection-error ,owner error (4242) unknown)
+            (enumeration-error ,owner nil error unknown)
+            (missing-saved-start ,(plist-put (copy-sequence owner) :start nil)
+                                 ,live-attributes (4242) unknown)
+            (missing-owner nil ,live-attributes (4242) unknown)
+            (foreign-owner ,(plist-put (copy-sequence owner) :host
+                                      (concat (system-name) "-foreign"))
+                           ,live-attributes (4242) unknown)
+            (uncertain-owner ,(plist-put (copy-sequence owner) :uncertain t)
+                             ,live-attributes (4242) unknown)
+            (absent-pid ,owner nil nil dead)
+            (reused-pid ,owner ((start 200 0 0 0) (state . "R")) (4242) dead)
+            (zombie ,owner ((start 100 0 0 0) (state . "Z")) (4242) dead))))
+    (dolist (phase '(open closing))
+      (pcase-dolist (`(,name ,identity ,attributes ,pids ,state) cases)
+        (ert-info ((format "Phase %S, owner case %S" phase name))
+          (gptel-runner-launchd-test--fixture
+            (let* ((worker-directory (expand-file-name "runs/inv-test/"
+                                                       gptel-runner-job-directory))
+                   (invocation (list :format 'runner-invocation
+                                     :version gptel-runner-jobs--version
+                                     :id "inv-test" :epoch 1 :job job
+                                     :job-id (plist-get job :id)
+                                     :root gptel-runner-job-directory
+                                     :directory worker-directory :phase phase
+                                     :worker-state 'running :worker identity))
+                   (label (gptel-runner-launchd-start-worker invocation))
+                   (registration (expand-file-name "worker-registration-1.el"
+                                                   worker-directory))
+                   (record (gptel-runner-jobs--read registration)))
+              (gptel-runner-jobs--write
+               (gptel-runner-jobs--manifest-file invocation) invocation)
+              (setq commands nil invocations (list invocation) loaded t)
+              (cl-letf (((symbol-function 'process-attributes)
+                         (lambda (pid)
+                           (if (= pid 4242)
+                               (if (eq attributes 'error)
+                                   (error "Cannot inspect process")
+                                 attributes)
+                             (funcall original-attributes pid))))
+                        ((symbol-function 'list-system-processes)
+                         (lambda ()
+                           (if (eq pids 'error)
+                               (error "Cannot enumerate processes")
+                             (append pids (remq 4242 (funcall original-processes)))))))
+                (should (eq (gptel-runner-jobs--lock-owner-state identity) state))
+                (gptel-runner-launchd-reap))
+              (if (eq state 'dead)
+                  (progn
+                    (should (equal (reverse commands)
+                                   (list (list "print" (gptel-runner-launchd--target label))
+                                         (list "bootout" (gptel-runner-launchd--target label)))))
+                    (should-not (file-exists-p registration)))
+                (should-not commands)
+                (should (equal (gptel-runner-jobs--read registration) record))))))))))
+
 (ert-deftest gptel-runner-launchd-refuses-unrelated-service-and-non-macos ()
   (should-error (gptel-runner-launchd--target "com.other.service"))
   (let ((system-type 'gnu/linux))

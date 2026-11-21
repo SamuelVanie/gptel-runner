@@ -439,7 +439,8 @@ Abandoned launch reservations close only after the exact service is absent."
                           ;; former owner has exited or relinquished ownership.
                           (< (plist-get record :epoch) (plist-get invocation :epoch))
                           (and (memq (plist-get invocation :phase) '(open closing))
-                               (not (gptel-runner-invocation-live-p invocation))))
+                               (eq (gptel-runner-jobs--lock-owner-state
+                                    (plist-get invocation :worker)) 'dead)))
                   (gptel-runner-launchd--unload (plist-get record :label))
                   (delete-file file)))
             (error (message "Could not reap background worker: %s"
