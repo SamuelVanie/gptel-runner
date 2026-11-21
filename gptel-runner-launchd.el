@@ -27,6 +27,7 @@
 (declare-function gptel-runner-jobs--read "gptel-runner-jobs")
 (declare-function gptel-runner-jobs--manifest-file "gptel-runner-jobs")
 (declare-function gptel-runner-jobs--with-control-lock "gptel-runner-jobs")
+(declare-function gptel-runner-jobs--lock-owner-state "gptel-runner-jobs")
 (defvar gptel-runner-job-directory)
 (defvar gptel-runner-jobs--package-directory)
 
@@ -425,7 +426,8 @@ may have a detached child that probing launchd cannot account for."
                    (and (= epoch (plist-get fresh :epoch))
                         (or (eq (plist-get fresh :worker-state) 'exited)
                             (and (memq (plist-get fresh :phase) '(open closing))
-                                 (not (gptel-runner-invocation-live-p fresh)))))))
+                                 (eq (gptel-runner-jobs--lock-owner-state
+                                      (plist-get fresh :worker)) 'dead))))))
          (gptel-runner-launchd--unload (plist-get record :label))
          (delete-file file))))))
 
