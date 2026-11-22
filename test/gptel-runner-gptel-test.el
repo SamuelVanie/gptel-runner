@@ -206,6 +206,45 @@
         (should (search-forward "Continue" nil t))
         (should (search-forward "My draft" nil t))))))
 
+(ert-deftest gptel-runner-gptel-ordinary-send-renders-outside-user-narrowing ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-default-mode 'text-mode)
+          (transient-mark-mode t))
+      (gptel-runner-register-agent 'reader)
+      (let* ((run (gptel-runner-start
+                   (gptel-runner-agent-step :id 'review :agent 'reader :prompt "Inspect"
+                                            :pause-after t :save-as 'answer)
+                   :completion 'response))
+             (chat (gptel-runner-call-buffer (car (gptel-runner-run-calls run)))))
+        (gptel-runner-gptel-test--reply (pop requests) "Original" "stop")
+        (with-current-buffer chat
+          (goto-char (point-max))
+          (insert "Private preface. ")
+          (let ((begin (point)))
+            (insert "Please revise")
+            (push-mark begin t t)
+            (call-interactively #'gptel-send))
+          (deactivate-mark)
+          (narrow-to-region (- (point) 4) (- (point) 2)))
+        (let* ((fsm (pop requests))
+               (info (gptel-fsm-info fsm))
+               (messages (append (plist-get (plist-get info :data) :messages) nil)))
+          (should (equal (plist-get (car (last messages)) :content) "Please revise"))
+          ;; The mocked transport supplies the same default callback as curl.
+          (setf (plist-get (gptel-fsm-info fsm) :callback) #'gptel--insert-response)
+          (gptel-runner-gptel-test--reply fsm "Revised answer" "stop")
+          (gptel-runner-gptel--release-send chat fsm)
+          (with-current-buffer chat
+            (should (equal (buffer-string) "vi"))
+            (save-restriction
+              (widen)
+              (goto-char (point-min))
+              (should (search-forward "Private preface. Please revise" nil t))
+              (should (search-forward "Revised answer" nil t))
+              (should (= (point) (gptel-runner-gptel-rendered-end chat))))
+            (call-interactively #'gptel-runner-complete-call-from-buffer)
+            (should (equal (gptel-runner-get run 'answer) "Revised answer"))))))))
+
 (ert-deftest gptel-runner-gptel-reviewed-handoff-accepts-payload-or-later-reply ()
   (dolist (manual '(nil t))
     (gptel-runner-gptel-test--with-transport
@@ -315,6 +354,104 @@
       (let ((text (gptel-curl--parse-stream (plist-get info :backend) info)))
         (unless (string-empty-p text)
           (funcall (plist-get info :callback) text info))))))
+
+(ert-deftest gptel-runner-gptel-narrowed-chat-renders-at-request-markers ()
+  (dolist (mode '(nonstreaming streaming streaming-from-draft))
+    (gptel-runner-gptel-test--with-transport
+      (let ((gptel-default-mode 'text-mode)
+            (gptel-stream (not (eq mode 'nonstreaming)))
+            (initial-view (if (eq mode 'streaming-from-draft) "draft" "Inspect")))
+        (gptel-runner-register-agent 'reader)
+        (let* ((run (gptel-runner-start
+                     (gptel-runner-agent-step :id 'read :agent 'reader
+                                              :prompt "Inspect this file" :save-as 'answer)
+                     :completion 'response))
+               (fsm (pop requests))
+               (info (gptel-fsm-info fsm))
+               (chat (plist-get info :buffer))
+               (submitted (marker-position (plist-get info :position)))
+               pre-position post-text)
+          (with-current-buffer chat
+            (goto-char (point-max))
+            (insert "Private draft")
+            (goto-char (point-min))
+            (search-forward initial-view)
+            (narrow-to-region (match-beginning 0) (point))
+            (setq-local gptel-pre-response-hook (list (lambda () (setq pre-position (point))))
+                        gptel-post-response-functions
+                        (list (lambda (beg end)
+                                (setq post-text (buffer-substring-no-properties beg end))))))
+          (if gptel-stream
+              (progn
+                (plist-put info :http-status "200")
+                (gptel--fsm-transition fsm)
+                (gptel-runner-gptel-test--stream-chunk fsm '(:content "The "))
+                ;; Inspect the draft while more chunks arrive before it.
+                (with-current-buffer chat
+                  (should (equal (buffer-string) initial-view))
+                  (should (eq gptel-runner-gptel--rendered-end (plist-get info :tracking-marker)))
+                  (widen)
+                  (goto-char (point-max))
+                  (search-backward "draft")
+                  (narrow-to-region (point) (match-end 0)))
+                (gptel-runner-gptel-test--stream-chunk fsm '(:content "answer") "stop")
+                (funcall (plist-get info :callback) t info)
+                (gptel--fsm-transition fsm))
+            (gptel-runner-gptel-test--reply fsm "The answer" "stop"))
+          (should (equal (gptel-runner-get run 'answer) "The answer"))
+          (should (equal pre-position submitted))
+          (should (equal post-text "The answer"))
+          (with-current-buffer chat
+            (should (equal (buffer-string) (if gptel-stream "draft" "Inspect")))
+            (save-restriction
+              (widen)
+              (goto-char (point-min))
+              (search-forward "Inspect this file")
+              (should (= (point) submitted gptel-runner-gptel--submitted-end))
+              (search-forward "The answer")
+              (should (= (match-beginning 0) (plist-get info :position)))
+              (should (= (point) (plist-get info :tracking-marker)
+                         gptel-runner-gptel--rendered-end))
+              (should (eq 'response (get-text-property (match-beginning 0) 'gptel)))
+              (should (equal (buffer-substring-no-properties (point) (point-max))
+                             (concat gptel-response-separator (gptel-prompt-prefix-string)
+                                     "Private draft"))))))))))
+
+(ert-deftest gptel-runner-gptel-narrowed-chat-accepts-revision-or-region ()
+  (dolist (region '(nil t))
+    (gptel-runner-gptel-test--with-transport
+      (let ((gptel-default-mode 'text-mode))
+        (gptel-runner-register-agent 'reader)
+        (let* ((run (gptel-runner-start
+                     (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect this file"
+                                              :pause-after t :save-as 'answer)
+                     :completion 'response))
+               (call (car (gptel-runner-run-calls run)))
+               (chat (gptel-runner-call-buffer call)))
+          (gptel-runner-gptel-test--reply (pop requests) "Original report" "stop")
+          (with-current-buffer chat
+            (goto-char (point-min))
+            (search-forward "Inspect")
+            (narrow-to-region (match-beginning 0) (point)))
+          (gptel-runner-gptel-feedback call "Please revise")
+          (let* ((fsm (pop requests))
+                 (messages (plist-get (plist-get (gptel-fsm-info fsm) :data) :messages)))
+            (should (equal (plist-get (aref messages (1- (length messages))) :content)
+                           "Please revise"))
+            (gptel-runner-gptel-test--reply fsm "Entire revised answer" "stop"))
+          (with-current-buffer chat
+            (should (equal (buffer-string) "Inspect"))
+            (widen)
+            (search-forward "revised answer")
+            (narrow-to-region (match-beginning 0) (point))
+            (let ((transient-mark-mode t))
+              (goto-char (point-min))
+              (if region (push-mark (+ (point) (length "revised")) t t)
+                (deactivate-mark))
+              (call-interactively #'gptel-runner-complete-call-from-buffer))
+            (should (equal (buffer-string) "revised answer")))
+          (should (equal (gptel-runner-get run 'answer)
+                         (if region "revised" "Entire revised answer"))))))))
 
 (ert-deftest gptel-runner-gptel-honors-stream-setting-and-backend-support ()
   (dolist (settings '((t nil t t) (nil nil t nil)
