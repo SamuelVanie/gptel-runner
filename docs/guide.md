@@ -1525,7 +1525,14 @@ rules are allowed; `:weekday 1` is Monday, while `0` or `7` is Sunday.  Supporte
 fields are `:minute`, `:hour`, `:day`, `:weekday`, and `:month`; omitted fields
 are wildcards.  Rules follow launchd's semantics, including matching either
 day-of-month or weekday when both are supplied.  Calendar times use the Mac's
-local timezone.  Future one-off scheduling is not provided.
+local timezone.
+
+For a one-time run, set a timer in Emacs and keep that session open until
+it launches the job. This example starts the registered job in two hours.
+
+```elisp
+(run-at-time "2 hours" nil #'gptel-runner-job-run "parallel-example")
+```
 
 Scheduled triggers exit after dispatching a separate invocation service.  This
 lets schedule disabling and worker cancellation remain independent operations.

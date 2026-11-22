@@ -5,6 +5,11 @@ to decide which agents work in parallel, what they pass to the next stage,
 and where the pipeline pauses for your input. Follow the whole run from one
 dashboard.
 
+You can also save a pipeline as a background job which will run at the time you decides. On macOS (only for now, I don't have a linux machine), it uses a timer in
+an open Emacs session to start it once at a time you choose, or uses launchd
+to run it regularly, such as every hour or every Monday at 9 a.m. I use it for example at work to review the dozen of pull requests that we've got every working day at 3pm. 
+[Set up a background job](docs/guide.md#background-jobs-and-macos-schedules)
+
 ![Emacs dashboard running a 12-agent pipeline, from parallel research to the finished v2.0 release brief.](docs/media/workflow-demo.gif)
 
 In this twelve-agent pipeline, six agents research the v2.0 changes in
