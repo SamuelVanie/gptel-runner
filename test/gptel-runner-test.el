@@ -105,9 +105,10 @@
       (should (equal (gptel-runner-parse-review
                       (list :verdict "Revise" :summary "review" :issues issues))
                      expected))))
-  (let ((missing '(:verdict pass :summary "ok")))
-    (should-not (gptel-runner-valid-review-p missing))
-    (should-error (gptel-runner-parse-review missing))))
+  (dolist (incomplete '((:verdict pass :summary "ok")
+                        (:verdict pass :summary "ok" :issues)))
+    (should-not (gptel-runner-valid-review-p incomplete))
+    (should-error (gptel-runner-parse-review incomplete))))
 
 (ert-deftest gptel-runner-registry-and-blackboard ()
   (gptel-runner-test--isolated

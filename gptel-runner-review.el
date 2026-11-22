@@ -43,7 +43,7 @@
   (and (listp review)
        (memq (plist-get review :verdict) '(pass revise blocked))
        (stringp (plist-get review :summary))
-       (plist-member review :issues)
+       (consp (cdr (plist-member review :issues)))
        (proper-list-p (plist-get review :issues))
        (cl-every
         (lambda (issue)
