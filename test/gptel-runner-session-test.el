@@ -689,6 +689,9 @@
             (let* ((approval (make-overlay (point-min) (point-max)))
                    (gptel-ui--approval-cache (list approval))
                    (gptel-ui--approval-cache-dirty nil))
+              (overlay-put approval 'info (list :position (point-marker)))
+              (overlay-put approval 'gptel-tool '(pending))
+              (overlay-put approval 'keymap gptel-tool-call-actions-map)
               (unwind-protect
                   (let ((indicator (gptel-ui--header)))
                     (should (string-match-p "1 approval" indicator))

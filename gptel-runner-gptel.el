@@ -1490,6 +1490,26 @@ At a human approval gate the new response awaits explicit acceptance using
       (when (and (buffer-live-p prompt) (not (eq prompt (plist-get info :buffer))))
         (kill-buffer prompt)))))
 
+(defun gptel-runner-gptel--undo-feedback (changes original-tick)
+  "Undo failed feedback CHANGES and update mode caches after ORIGINAL-TICK."
+  (save-restriction
+    (widen)
+    (let ((inhibit-read-only t)
+          (inhibit-modification-hooks t)
+          (changed (/= original-tick (buffer-modified-tick)))
+          (old-size (buffer-size)))
+      ;; Notify modes of one replacement.  Hooks can edit anywhere during
+      ;; setup, and a failing hook must never interrupt the undo itself.
+      (cl-flet ((notify (function &rest args)
+                  (ignore-error (error quit) (apply function args))
+                  nil))
+        (when changed
+          (run-hook-wrapped 'before-change-functions #'notify (point-min) (point-max)))
+        (unwind-protect (cancel-change-group changes)
+          (when changed
+            (run-hook-wrapped 'after-change-functions #'notify
+                              (point-min) (point-max) old-size)))))))
+
 (defun gptel-runner-gptel--review-feedback (call text)
   "Send TEXT to CALL while keeping its explicit human review gate open."
   (with-current-buffer (gptel-runner-call-buffer call)
@@ -1519,6 +1539,7 @@ At a human approval gate the new response awaits explicit acceptance using
            (previous-last gptel--fsm-last)
            (writer (gptel-runner--writer-p call))
            (changes (prepare-change-group))
+           (original-tick (buffer-modified-tick))
            (undo-outer-limit nil)
            (undo-limit most-positive-fixnum)
            (undo-strong-limit most-positive-fixnum)
@@ -1560,11 +1581,8 @@ At a human approval gate the new response awaits explicit acceptance using
           (ignore-error (error quit) (gptel-runner-gptel--retire-request call))
           (ignore-error (error quit) (gptel-runner-gptel--stop-supervision call))
           (when (buffer-live-p buffer)
-            (let ((inhibit-read-only t)
-                  (inhibit-modification-hooks t))
-              (save-restriction
-                (widen)
-                (ignore-error (error quit) (cancel-change-group changes))))
+            (ignore-error (error quit)
+              (gptel-runner-gptel--undo-feedback changes original-tick))
             (setq gptel-runner-gptel--submitted-end submitted
                   gptel-runner-gptel--rendered-end rendered)
             (when (eq gptel--fsm-last fsm) (setq gptel--fsm-last previous-last)))
