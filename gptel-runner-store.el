@@ -157,10 +157,12 @@ terminal run transitions bypass it, but their writes are still asynchronous."
   "Capture BUFFER in its native chat format."
   (if (gptel-runner-store--agent-sessions-p)
       (with-current-buffer buffer
-        ;; A major-mode change disables gptel-mode, but an owned node remains
-        ;; a chat.  Permit native record capture without enabling UI hooks.
+        ;; A major-mode change disables gptel-mode, but an owned node or
+        ;; discussion remains a chat.  Capture without enabling UI hooks.
         (let ((gptel-mode (or (bound-and-true-p gptel-mode)
-                              (and (gptel-runner-store--chat-owner) t))))
+                              (and (gptel-runner-store--chat-owner) t)
+                              (eq (plist-get (gptel-runner-store--child-owner) :kind)
+                                  'discussion))))
           (cons 'gptel-agent
                 (if-let* ((fsm (gptel-runner-gptel-protected-request buffer)))
                     (gptel-agent-session-buffer-record buffer fsm)
@@ -313,8 +315,7 @@ and for nodes that execute without a gptel conversation."
   (let ((chat (plist-get record :chat)))
     (if (not (buffer-live-p chat)) chat
       (with-current-buffer chat
-        (if (and (eq (plist-get record :kind) 'discussion)
-                 (bound-and-true-p gptel-mode))
+        (if (eq (plist-get record :kind) 'discussion)
             (gptel-runner-store--archive chat)
           (save-restriction
             (widen)
