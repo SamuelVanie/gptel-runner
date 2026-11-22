@@ -924,10 +924,19 @@ the error handler so errors in later nodes are not attributed to this function."
             (error (cons 'failed (list :type 'flow-error :error err)))
             (quit (cons 'cancelled (list :type 'flow-quit :error err))))))
     (when (gptel-runner--continuation-current-p run generation owner)
-      (if (eq (car outcome) 'succeeded)
-          (funcall next (cdr outcome))
+      ;; CPU-bound functions cannot service timers.  Check elapsed time before
+      ;; accepting an outcome, while retaining the generation/owner guard above.
+      (cond
+       ((and (gptel-runner-run-duration-remaining run)
+             (gptel-runner-run-active-started-at run)
+             (>= (- (float-time) (gptel-runner-run-active-started-at run))
+                 (gptel-runner-run-duration-remaining run)))
+        (gptel-runner--duration-expired run generation))
+       ((eq (car outcome) 'succeeded)
+        (funcall next (cdr outcome)))
+       (t
         (gptel-runner--set-node-state run node (car outcome) (cdr outcome))
-        (funcall done (car outcome) (cdr outcome))))))
+        (funcall done (car outcome) (cdr outcome)))))))
 
 (defun gptel-runner--execute-branch (run node done)
   "Execute branch NODE in RUN and invoke DONE."
