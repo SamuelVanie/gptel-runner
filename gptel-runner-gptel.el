@@ -57,6 +57,7 @@
 
 (defvar gptel-request--transitions)
 (defvar gptel-request--handlers)
+(defvar gptel--request-alist)
 (defvar gptel-send--transitions)
 (defvar gptel-send--handlers)
 (defvar gptel-confirm-tool-calls)
@@ -1440,63 +1441,115 @@ At a human approval gate the new response awaits explicit acceptance using
     (gptel-runner--drain-queue run)
     call))
 
+(defun gptel-runner-gptel--discard-feedback-request (fsm)
+  "Cancel abandoned FSM's transport and release its request resources."
+  (let* ((info (gptel-fsm-info fsm))
+         (prompt (plist-get info :data))
+         (request (cl-find fsm gptel--request-alist :key #'cadr)))
+    ;; A post-request hook may signal after transport registration.  Abort
+    ;; exactly this FSM, even if another request now uses the same buffer.
+    (when request
+      (setq gptel--request-alist (delq request gptel--request-alist))
+      (ignore-error (error quit) (funcall (cddr request))))
+    (unwind-protect
+        (when (and info (not (plist-get info :runner-feedback-posted)))
+          (plist-put info :runner-feedback-posted t)
+          (gptel--handle-post fsm))
+      ;; Before prompt transforms finish, :data is gptel's temporary buffer.
+      ;; A signalled transform bypasses its disposal in gptel--realize-query.
+      (when (and (buffer-live-p prompt) (not (eq prompt (plist-get info :buffer))))
+        (kill-buffer prompt)))))
+
 (defun gptel-runner-gptel--review-feedback (call text)
   "Send TEXT to CALL while keeping its explicit human review gate open."
-  (unless (gptel-runner--can-start-p (gptel-runner-call-run call) call)
-    (user-error "Feedback cannot start while its workspace or concurrency slot is busy"))
-  (push call (gptel-runner-run-active-calls (gptel-runner-call-run call)))
-  (cl-incf (gptel-runner-run-active-count (gptel-runner-call-run call)))
-  (when (gptel-runner--writer-p call)
-    (cl-incf (gptel-runner-run-writer-active (gptel-runner-call-run call))))
-  (let* ((generation (cl-incf (gptel-runner-call-generation call)))
-         (fsm (gptel-runner-gptel--make-fsm
-               (lambda (finished-fsm)
-                 (gptel-runner-gptel--feedback-finished
-                  call generation
-                  (pcase (gptel-fsm-state finished-fsm)
-                    ('DONE 'succeeded) ('ABRT 'cancelled) (_ 'failed))
-                  finished-fsm))))
-         (observe (lambda (type &optional data)
-                    (gptel-runner--call-observe call generation type data))))
-    ;; Use the ordinary request machinery and transcript parser, but never
-    ;; release the workflow continuation until the user accepts the response.
-    (setf (gptel-runner-call-fsm call) fsm
-          (gptel-runner-call-state call) 'running
-          (gptel-runner-call-driver-data call)
-          (plist-put (plist-put (gptel-runner-call-driver-data call)
-                                :observe observe)
-                     :feedback-active t))
-    (with-current-buffer (gptel-runner-call-buffer call)
-      (gptel-runner-gptel--insert-turn text)
-      (gptel-runner--emit (gptel-runner-call-run call) 'feedback-started
-                          (gptel-runner-call-node call) call
-                          (list :text text))
-      (condition-case err
-          (let ((mark-active nil))
-            (gptel-runner-gptel--start-supervision call)
-            (goto-char gptel-runner-gptel--submitted-end)
-            (gptel-request nil
-              :buffer (current-buffer) :stream gptel-stream
-              :context call :fsm fsm
-              :transforms gptel-prompt-transform-functions
-              :callback
-              (lambda (response info &optional raw)
-                (when (and (= generation (gptel-runner-call-generation call))
-                           (plist-get (gptel-runner-call-driver-data call) :feedback-active)
-                           (not (gptel-runner--call-terminal-p call)))
-                  (gptel-runner-gptel--callback call observe response info raw)))))
-        (error
-         ;; A send-time budget failure may have already terminalized the
-         ;; call, even when a request cleanup hook subsequently signals.
-         (unless (gptel-runner--call-terminal-p call)
-           (gptel-runner-gptel--stop-supervision call)
-           (setf (gptel-runner-call-state call) 'waiting-feedback)
-           (gptel-runner--deactivate-call call)
-           (setf (gptel-runner-call-driver-data call)
-                 (plist-put (gptel-runner-call-driver-data call)
-                            :feedback-active nil)))
-         (signal (car err) (cdr err)))))
-    call))
+  (with-current-buffer (gptel-runner-call-buffer call)
+    (let* ((run (gptel-runner-call-run call))
+           (buffer (current-buffer))
+           (generation (1+ (gptel-runner-call-generation call)))
+           (fsm (gptel-runner-gptel--make-fsm
+                 (lambda (finished-fsm)
+                   (gptel-runner-gptel--feedback-finished
+                    call generation
+                    (pcase (gptel-fsm-state finished-fsm)
+                      ('DONE 'succeeded) ('ABRT 'cancelled) (_ 'failed))
+                    finished-fsm))))
+           (observe (lambda (type &optional data)
+                      (gptel-runner--call-observe call generation type data)))
+           (current-request-p
+            (lambda ()
+              (and (= generation (gptel-runner-call-generation call))
+                   (eq fsm (gptel-runner-call-fsm call))
+                   (plist-get (gptel-runner-call-driver-data call) :feedback-active)
+                   (not (gptel-runner--call-terminal-p call)))))
+           (previous-state (gptel-runner-call-state call))
+           (previous-fsm (gptel-runner-call-fsm call))
+           (previous-data (gptel-runner-call-driver-data call))
+           (submitted gptel-runner-gptel--submitted-end)
+           (rendered gptel-runner-gptel--rendered-end)
+           (previous-last gptel--fsm-last)
+           (writer (gptel-runner--writer-p call))
+           (changes (prepare-change-group))
+           (undo-outer-limit nil)
+           (undo-limit most-positive-fixnum)
+           (undo-strong-limit most-positive-fixnum)
+           started)
+      (save-restriction
+        (widen)
+        (unwind-protect
+            (progn
+              (activate-change-group changes)
+              ;; Admission hooks can acquire an external workspace lock.
+              ;; Acquire it only once the FSM and rollback data are ready.
+              (let ((inhibit-quit t))
+                (unless (gptel-runner--can-start-p run call)
+                  (user-error "Feedback cannot start while its workspace or concurrency slot is busy"))
+                (push call (gptel-runner-run-active-calls run))
+                (cl-incf (gptel-runner-run-active-count run))
+                (when writer (cl-incf (gptel-runner-run-writer-active run)))
+                (setf (gptel-runner-call-generation call) generation
+                      (gptel-runner-call-fsm call) fsm
+                      (gptel-runner-call-state call) 'running
+                      (gptel-runner-call-driver-data call)
+                      (plist-put (plist-put (copy-sequence previous-data) :observe observe)
+                                 :feedback-active t)))
+              (gptel-runner-gptel--insert-turn text)
+              (gptel-runner--emit run 'feedback-started
+                                  (gptel-runner-call-node call) call (list :text text))
+              (when (funcall current-request-p)
+                (gptel-runner-gptel--start-supervision call)
+                (goto-char gptel-runner-gptel--submitted-end)
+                (let ((mark-active nil))
+                  (gptel-request nil
+                    :buffer (current-buffer) :stream gptel-stream
+                    :context call :fsm fsm :transforms gptel-prompt-transform-functions
+                    :callback (lambda (response info &optional raw)
+                                (when (funcall current-request-p)
+                                  (gptel-runner-gptel--callback
+                                   call observe response info raw))))))
+              (setq started t))
+          ;; A hook may have completed, cancelled or replaced this turn.
+          ;; Only the owner can roll back its prompt and release the slot.
+          (if (or started (not (funcall current-request-p)))
+              (when (buffer-live-p buffer) (accept-change-group changes))
+            (cl-incf (gptel-runner-call-generation call))
+            ;; Preserve the setup error or quit even if cleanup hooks fail.
+            (ignore-error (error quit) (gptel-runner-gptel--retire-request call))
+            (ignore-error (error quit) (gptel-runner-gptel--stop-supervision call))
+            (when (buffer-live-p buffer)
+              (let ((inhibit-read-only t)
+                    (inhibit-modification-hooks t))
+                (ignore-error (error quit) (cancel-change-group changes)))
+              (setq gptel-runner-gptel--submitted-end submitted
+                    gptel-runner-gptel--rendered-end rendered)
+              (when (eq gptel--fsm-last fsm) (setq gptel--fsm-last previous-last)))
+            (setf (gptel-runner-call-fsm call) previous-fsm
+                  (gptel-runner-call-state call) previous-state
+                  (gptel-runner-call-driver-data call) previous-data)
+            (ignore-error (error quit) (gptel-runner--deactivate-call call))
+            (ignore-error (error quit) (gptel-runner-gptel--discard-feedback-request fsm))
+            (gptel-runner--checkpoint run t)
+            (gptel-runner--drain-queue run))))))
+  call)
 
 (defun gptel-runner-complete-call-from-buffer (&optional result call)
   "Complete paused CALL with RESULT from its gptel worker buffer.
