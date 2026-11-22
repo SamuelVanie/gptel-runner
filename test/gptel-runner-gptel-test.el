@@ -1172,7 +1172,10 @@
              (let ((kill-buffer-query-functions nil)) (kill-buffer chat)))))
         ;; The next dispatch runs after the terminal handlers or kill hooks.
         (should-not requests)
-        (accept-process-output nil 0.02)
+        ;; Unrelated process output can end a wait before the deferred wakeup.
+        (let ((deadline (+ (float-time) 2)))
+          (while (and (not requests) (< (float-time) deadline))
+            (accept-process-output nil 0.01)))
         (should (= 1 (length requests)))
         (let ((next (pop requests)))
           (when (eq end 'reply)
