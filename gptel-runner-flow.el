@@ -582,7 +582,8 @@ or directories to remain available.  New execution checks its own inputs."
                        (user-error "Parallel node %S has invalid minimum" id)))))
                (let ((seen (make-hash-table :test #'equal)))
                  (dolist (child (gptel-runner-node-children node))
-                   (dolist (key (gptel-runner--node-save-keys child))
+                   ;; A child may reuse keys in sequential or alternative paths.
+                   (dolist (key (delete-dups (gptel-runner--node-save-keys child)))
                      (when (gethash key seen)
                        (user-error
                         "Parallel children of %S both write blackboard key %S"
