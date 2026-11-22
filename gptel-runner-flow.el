@@ -1461,8 +1461,9 @@ alist or hash table copied into the run blackboard before any node starts.
 DRIVER defaults to
 `gptel-runner-default-driver'; Elisp-only workflows need no driver.
 MAX-REQUESTS, MAX-CALLS, MAX-CONCURRENCY, and
-MAX-DURATION override workflow defaults.  ALLOW-WRITES must be explicitly
-non-nil for any workflow containing a write step.
+MAX-DURATION override workflow defaults.  MAX-DURATION is a positive finite
+number of seconds or nil for unlimited duration.  ALLOW-WRITES must be
+explicitly non-nil for any workflow containing a write step.
 Non-nil ALLOW-UNCONFIRMED-TOOLS skips gptel tool confirmations, including
 approval for reads outside the working directory.  It defaults to the
 workflow's setting.  Pass nil to restore the usual policy for this run.
@@ -1526,6 +1527,9 @@ CALLBACK runs exactly once with the terminal run."
     (unless (and (integerp (plist-get options :max-concurrency))
                  (> (plist-get options :max-concurrency) 0))
       (user-error ":max-concurrency must be positive"))
+    (when-let* ((duration (plist-get options :max-duration)))
+      (unless (and (numberp duration) (> duration 0) (< duration 1.0e+INF))
+        (user-error ":max-duration must be positive and finite")))
     (gptel-runner--validate-workflow
      root allow-writes directory
      (list (cons "workflow" (plist-get defaults :context))
@@ -1551,9 +1555,6 @@ CALLBACK runs exactly once with the terminal run."
       (puthash (gptel-runner-run-id run) run gptel-runner--runs)
       (gptel-runner--emit run 'run-started nil nil
                           (list :goal goal :workspace directory))
-      (when-let* ((duration (gptel-runner-budget-max-duration budget)))
-        (unless (and (numberp duration) (> duration 0))
-          (user-error ":max-duration must be positive")))
       (gptel-runner--start-duration-clock run)
       (gptel-runner--execute-node
        run root

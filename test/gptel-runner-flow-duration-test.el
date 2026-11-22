@@ -2,6 +2,25 @@
 
 (require 'gptel-runner-dispatch-test)
 
+(ert-deftest gptel-runner-flow-duration-rejects-invalid-limits-before-start ()
+  (gptel-runner-dispatch-test--isolated
+    (let* ((workflow (gptel-runner-workflow-create
+                      :options '(:max-duration -1)
+                      :root (gptel-runner-sequence)))
+           (events nil)
+           (gptel-runner-event-hook
+            (list (lambda (event) (push (gptel-runner-event-type event) events)))))
+      (dolist (overrides '(nil (:max-duration 0) (:max-duration "1")
+                           (:max-duration 1.0e+INF) (:max-duration 0.0e+NaN)))
+        (ert-info ((format "Starting with overrides %S" overrides))
+          (should-error (apply #'gptel-runner-start workflow overrides)
+                        :type 'user-error)
+          (should-not events)
+          (should-not (gptel-runner-list-runs))))
+      (should (eq (gptel-runner-run-state
+                   (gptel-runner-start workflow :max-duration nil))
+                  'succeeded)))))
+
 (defun gptel-runner-flow-duration-test--return (outcome)
   "Return OUTCOME, or signal it when it is error or quit."
   (pcase outcome
