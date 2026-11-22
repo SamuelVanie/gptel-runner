@@ -116,18 +116,23 @@
 
 (ert-deftest gptel-runner-startup-reconciles-uncertain-without-registration-only-if-absent ()
   (gptel-runner-startup-test--isolated
-    (let ((invocation (gptel-runner-jobs--new-invocation job 'test)))
+    (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+           (receipt (gptel-runner-job-command invocation 'pause))
+           (id (plist-get receipt :id)))
       (gptel-runner-jobs--launch-failed
        invocation '(gptel-runner-launchd-cleanup-error "Unconfirmed"))
       (setq invocation (gptel-runner-invocation-get (plist-get invocation :id)))
       (dolist (result '(0 5 error))
         (setq probe-exit result)
         (gptel-runner-launchd-reap)
-        (should (equal invocation (gptel-runner-invocation-get (plist-get invocation :id)))))
+        (should (equal invocation (gptel-runner-invocation-get (plist-get invocation :id))))
+        (should (equal receipt (gptel-runner-job-command-status invocation id))))
       (setq probe-exit 113)
       (gptel-runner-launchd-reap)
       (should (eq (plist-get (gptel-runner-invocation-get
-                             (plist-get invocation :id)) :phase) 'closed)))))
+                             (plist-get invocation :id)) :phase) 'closed))
+      (should (eq (plist-get (gptel-runner-job-command-status invocation id) :status)
+                  'rejected)))))
 
 (ert-deftest gptel-runner-startup-rechecks-handoff-after-service-probe ()
   (dolist (change '(adopt epoch token))
@@ -235,6 +240,8 @@
         (gptel-runner-job-command invocation 'resume))
       (setq invocation (gptel-runner-invocation-get (plist-get invocation :id)))
       (should (= (plist-get invocation :epoch) 2))
+      (should (eq (plist-get invocation :state) 'starting))
+      (should-not (plist-get invocation :error))
       ;; Simulate a second launcher dying before its custom worker adopts.
       (setq invocation
             (gptel-runner-startup-test--save
@@ -268,6 +275,100 @@
                       (expand-file-name "owner.el"
                                         (gptel-runner-jobs--job-lock
                                          (plist-get invocation :job-id)))))))))
+
+(ert-deftest gptel-runner-startup-delayed-launch-error-after-successful-rerun ()
+  (gptel-runner-startup-test--isolated
+    (let* ((init (expand-file-name "workflow.el" gptel-runner-job-directory))
+           (gptel-runner-job-preload-features nil)
+           completed receipt
+           (gptel-runner-job-launch-function
+            (lambda (invocation)
+              (let ((epoch (plist-get invocation :epoch)))
+                (should (zerop
+                         (call-process
+                          gptel-runner-job-emacs-program nil nil nil
+                          "-Q" "--batch" "-L" gptel-runner-jobs--package-directory
+                          "-l" "gptel-runner-jobs" "-f" "gptel-runner-jobs-batch-main"
+                          "--" "worker" (plist-get invocation :directory)
+                          "--epoch" (number-to-string epoch))))
+                (when (= epoch 1)
+                  (setq receipt (gptel-runner-job-command invocation 'rerun)
+                        completed (gptel-runner-invocation-get (plist-get invocation :id)))
+                  (error "Delayed launch failure"))))))
+      (with-temp-file init
+        (prin1 '(gptel-runner-defworkflow example ()
+                  (gptel-runner-elisp-step :id 'work :function #'ignore))
+               (current-buffer)))
+      (let ((job (gptel-runner-register-job
+                  "example" :workflow 'example :init-file init
+                  :base-directory gptel-runner-job-directory)))
+        (should (equal (should-error (gptel-runner-job-run job))
+                       '(error "Delayed launch failure"))))
+      (should (= (plist-get completed :epoch) 2))
+      (should (eq (plist-get completed :phase) 'closed))
+      (should (eq (plist-get completed :state) 'succeeded))
+      (should (equal completed (gptel-runner-invocation-get (plist-get completed :id))))
+      (should (eq (plist-get (gptel-runner-job-command-status completed (plist-get receipt :id))
+                             :status)
+                  'applied)))))
+
+(ert-deftest gptel-runner-startup-delayed-launch-error-rechecks-epoch-and-token ()
+  (dolist (change '(epoch token))
+    (dolist (failure '((error "Launch failed") (gptel-runner-launchd-cleanup-error "Unconfirmed")))
+      (gptel-runner-startup-test--isolated
+        (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+               (successor (copy-tree invocation))
+               (owner-file (expand-file-name
+                            "owner.el" (gptel-runner-jobs--job-lock (plist-get job :id))))
+               (control (symbol-function 'gptel-runner-jobs--with-control-lock)))
+          (if (eq change 'epoch)
+              (setq successor (plist-put successor :epoch 2))
+            (setf (plist-get (plist-get successor :worker) :token) "replacement"))
+          ;; A controller wins the lock after failure notification but before
+          ;; the old launcher can record the outcome.
+          (cl-letf (((symbol-function 'gptel-runner-jobs--with-control-lock)
+                     (lambda (record function)
+                       (funcall control record
+                                (lambda () (gptel-runner-startup-test--save successor)))
+                       (funcall control record function))))
+            (gptel-runner-jobs--launch-failed invocation failure))
+          (should (equal successor (gptel-runner-invocation-get (plist-get invocation :id))))
+          (should (equal (plist-get successor :worker) (gptel-runner-jobs--read owner-file))))))))
+
+(ert-deftest gptel-runner-startup-matching-launch-error-preserves-manifest-metadata ()
+  (gptel-runner-startup-test--isolated
+    (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+           (fresh (gptel-runner-invocation-get (plist-get invocation :id))))
+      (gptel-runner-startup-test--save (plist-put fresh :outputs '(report)))
+      (gptel-runner-jobs--launch-failed invocation '(error "Launch failed"))
+      (setq fresh (gptel-runner-invocation-get (plist-get invocation :id)))
+      (should (eq (plist-get fresh :state) 'startup-error))
+      (should (equal (plist-get fresh :error) "Launch failed"))
+      (should (equal (plist-get fresh :outputs) '(report))))))
+
+(ert-deftest gptel-runner-startup-failure-continues-after-receipt-io-error ()
+  (gptel-runner-startup-test--isolated
+    (let* ((invocation (gptel-runner-jobs--new-invocation job 'test))
+           (receipt (gptel-runner-job-command invocation 'pause))
+           (id (plist-get receipt :id))
+           (file (gptel-runner-jobs--receipt-file invocation id))
+           (write (symbol-function 'gptel-runner-jobs--write))
+           interrupted)
+      (with-temp-file (gptel-runner-jobs--receipt-file invocation "broken")
+        (insert "("))
+      (cl-letf (((symbol-function 'gptel-runner-jobs--write)
+                 (lambda (path data)
+                   (when (and (equal path file) (not interrupted))
+                     (setq interrupted t)
+                     (signal 'file-error '("Temporary receipt error")))
+                   (funcall write path data))))
+        (gptel-runner-jobs--launch-failed invocation '(error "Launch failed")))
+      (should interrupted)
+      (should (eq (plist-get (gptel-runner-job-command-status invocation id) :status)
+                  'rejected))
+      (let ((fresh (gptel-runner-invocation-get (plist-get invocation :id))))
+        (should (eq (plist-get fresh :phase) 'closed))
+        (should (string-match-p "broken\\.el" (plist-get fresh :error)))))))
 
 (provide 'gptel-runner-startup-reconciliation-test)
 ;;; gptel-runner-startup-reconciliation-test.el ends here

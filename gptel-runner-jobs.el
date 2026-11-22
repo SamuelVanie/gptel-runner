@@ -746,50 +746,93 @@ LAUNCHER defaults to the configured detached launcher; the CLI uses `direct'."
                       (gptel-runner-jobs--job-lock (plist-get job :id)) token))
        (signal (car err) (cdr err))))))
 
+(defun gptel-runner-jobs--owned-manifest (invocation)
+  "Return the durable manifest matching INVOCATION's epoch and token.
+Call under the invocation control lock, and retain it while writing."
+  (let ((fresh (gptel-runner-jobs--record
+                (gptel-runner-jobs--manifest-file invocation) 'runner-invocation))
+        (token (plist-get (plist-get invocation :worker) :token)))
+    (and (natnump (plist-get fresh :epoch))
+         (stringp token)
+         (equal token (plist-get (plist-get fresh :worker) :token))
+         (equal (plist-get invocation :epoch) (plist-get fresh :epoch))
+         fresh)))
+
+(defun gptel-runner-jobs--fail-receipt (file invocation reason)
+  "Finalize pending receipt FILE if it belongs to INVOCATION, using REASON."
+  (let ((receipt (gptel-runner-jobs--read file)))
+    (when (and (equal (plist-get receipt :epoch) (plist-get invocation :epoch))
+               (or (not (plist-member receipt :invocation))
+                   (equal (plist-get receipt :invocation) (plist-get invocation :id)))
+               (memq (plist-get receipt :status) '(queued processing)))
+      ;; A processing receipt was committed before attempting the operation.
+      ;; Its effects may already be visible even if its acknowledgment is not.
+      (let ((status (if (eq (plist-get receipt :status) 'processing)
+                        'indeterminate 'rejected)))
+        (setq receipt (plist-put receipt :status status)
+              receipt (plist-put receipt :error reason)
+              receipt (plist-put receipt :finished-at (float-time)))
+        (gptel-runner-jobs--write file receipt)))))
+
+(defun gptel-runner-jobs--close-failed (invocation state reason)
+  "Resolve INVOCATION's pending commands and publish failure STATE and REASON.
+The caller must hold the control lock and have verified current ownership."
+  (let ((directory (expand-file-name "receipts" (plist-get invocation :directory)))
+        retry errors)
+    (condition-case err
+        (when (file-directory-p directory)
+          (dolist (file (directory-files directory t "\\.el\\'"))
+            (condition-case nil
+                (gptel-runner-jobs--fail-receipt file invocation reason)
+              (error (push file retry)))))
+      (file-error (push (error-message-string err) errors)))
+    ;; Retry individual I/O failures.  An unreadable historical receipt must
+    ;; not strand the worker or the other commands in this generation.
+    (dolist (file retry)
+      (condition-case err
+          (gptel-runner-jobs--fail-receipt file invocation reason)
+        (error (push (format "%s (%s)" (file-name-nondirectory file)
+                             (error-message-string err)) errors))))
+    (when errors
+      (setq reason (format "%s\nCould not finalize command receipts: %s"
+                           reason (string-join errors ", ")))))
+  (setq invocation (plist-put invocation :state state)
+        invocation (plist-put invocation :error reason)
+        invocation (plist-put invocation :phase 'closed)
+        invocation (plist-put invocation :worker-state 'exited))
+  (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file invocation) invocation))
+
 (defun gptel-runner-jobs--launch-failed (invocation err)
   "Record INVOCATION launch failure ERR without abandoning a live worker."
   (gptel-runner-jobs--with-control-lock
    invocation
    (lambda ()
-     (let* ((fresh (ignore-errors (gptel-runner-jobs--read
-				   (gptel-runner-jobs--manifest-file invocation))))
-            (same (equal (plist-get fresh :epoch) (plist-get invocation :epoch)))
-            (lock (gptel-runner-jobs--job-lock (plist-get invocation :job-id)))
-            (token (plist-get (plist-get invocation :worker) :token)))
-       (cond
-	;; Another process already produced the authoritative outcome, or adopted
-	;; the reservation.  Do not replace its history with the launcher's copy.
-	((and same (or (eq (plist-get fresh :phase) 'closed)
-                       (and (eq (plist-get fresh :phase) 'open)
-                            (gptel-runner-invocation-live-p fresh)))) nil)
-	((eq (car err) 'gptel-runner-launchd-cleanup-error)
-	 ;; An unconfirmed launchd cancellation can still start a worker later.
-	 ;; Keep the token adoptable, but never reclaim it based on a dead trigger.
-	 (when same (setq invocation fresh))
-	 (let ((owner (plist-put (copy-sequence (plist-get invocation :worker)) :uncertain t)))
-           (unless
-               (gptel-runner-jobs--with-lock-guard
-		lock
-		(lambda ()
-		  (unless (equal token (plist-get (gptel-runner-jobs--read
-                                                   (expand-file-name "owner.el" lock)) :token))
-                    (error "Launch reservation changed during failure handling"))
-		  (gptel-runner-jobs--write (expand-file-name "owner.el" lock) owner)
-		  t))
-             (error "Could not retain uncertain launch reservation"))
-           (setq invocation (plist-put invocation :worker owner)
-		 invocation (plist-put invocation :state 'launch-uncertain)
-		 invocation (plist-put invocation :worker-state 'uncertain)
-		 invocation (plist-put invocation :error (error-message-string err)))
-           (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file invocation) invocation)))
-	(t
-	 (setq invocation (plist-put invocation :state 'startup-error)
-               invocation (plist-put invocation :error (error-message-string err))
-               invocation (plist-put invocation :phase 'closed)
-               invocation (plist-put invocation :worker-state 'exited))
-	 (unwind-protect
-             (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file invocation) invocation)
-           (gptel-runner-jobs--unlock lock token))))))))
+     (when-let* ((fresh (gptel-runner-jobs--owned-manifest invocation))
+                 (owner (plist-get fresh :worker))
+                 (token (plist-get owner :token))
+                 (lock (gptel-runner-jobs--job-lock (plist-get fresh :job-id))))
+       (let ((uncertain (eq (car err) 'gptel-runner-launchd-cleanup-error)))
+         (when (or (eq (plist-get fresh :phase) 'starting)
+                   (and (not uncertain) (memq (plist-get fresh :phase) '(open closing))
+                        (eq (gptel-runner-jobs--lock-owner-state owner) 'dead)))
+           (if uncertain
+               ;; The service could still adopt this generation and run its commands.
+               (let ((file (expand-file-name "owner.el" lock)))
+                 (setq owner (plist-put owner :uncertain t))
+                 (unless (gptel-runner-jobs--with-lock-guard
+                          lock
+                          (lambda ()
+                            (unless (equal token (plist-get (gptel-runner-jobs--read file) :token))
+                              (error "Launch reservation changed during failure handling"))
+                            (gptel-runner-jobs--write file owner)))
+                   (error "Could not retain uncertain launch reservation"))
+                 (setq fresh (plist-put fresh :worker owner)
+                       fresh (plist-put fresh :state 'launch-uncertain)
+                       fresh (plist-put fresh :worker-state 'uncertain)
+                       fresh (plist-put fresh :error (error-message-string err)))
+                 (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file fresh) fresh))
+             (gptel-runner-jobs--unlock lock token)
+             (gptel-runner-jobs--close-failed fresh 'startup-error (error-message-string err)))))))))
 
 (defun gptel-runner-jobs--abandoned-start-p (invocation)
   "Return non-nil if INVOCATION needs its startup reconciled.
@@ -809,43 +852,37 @@ adoption writes the job lock before publishing the new manifest owner."
     (gptel-runner-jobs--with-control-lock
      invocation
      (lambda ()
-       (let* ((fresh (gptel-runner-invocation-get (plist-get invocation :id)))
-              (owner (plist-get fresh :worker))
-              (token (plist-get owner :token))
-              (lock (gptel-runner-jobs--job-lock (plist-get fresh :job-id))))
-         (when (and (gptel-runner-jobs--abandoned-start-p fresh)
-                    (equal (plist-get fresh :epoch) (plist-get invocation :epoch))
-                    (equal owner (plist-get invocation :worker))
-                    (stringp token))
-           (gptel-runner-jobs--with-lock-guard
-            lock
-            (lambda ()
-              (let* ((exists (file-exists-p lock))
-                     (reservation (and exists
-                                       (ignore-errors
-                                         (gptel-runner-jobs--read
-                                          (expand-file-name "owner.el" lock)))))
-                     (reserved-token (and (proper-list-p reservation)
-                                          (plist-get reservation :token))))
-                (when (and
-                       (not (file-symlink-p lock))
-                       (or (not exists)
-                           (and (stringp reserved-token)
-                                (or (not (equal token reserved-token))
-                                    (eq (gptel-runner-jobs--lock-owner-state reservation) 'dead)
-                                    (and (eq (plist-get fresh :worker-state) 'uncertain)
-                                         (equal reservation owner))))))
-                  ;; Revoke admission before publishing closed.  A late child
-                  ;; must pass this guard and the control lock to adopt.
-                  (when (equal token reserved-token) (delete-directory lock t))
-                  (setq fresh (plist-put fresh :state 'startup-error)
-                        fresh (plist-put fresh :phase 'closed)
-                        fresh (plist-put fresh :worker-state 'exited)
-                        fresh (plist-put fresh :error
-                                         (or (plist-get fresh :error)
-                                             "Launcher exited before worker adoption; service is absent")))
-                  (gptel-runner-jobs--write
-                   (gptel-runner-jobs--manifest-file fresh) fresh)))))))))))
+       (when-let* ((fresh (gptel-runner-jobs--owned-manifest invocation))
+                   ((gptel-runner-jobs--abandoned-start-p fresh))
+                   (owner (plist-get fresh :worker))
+                   ((equal owner (plist-get invocation :worker)))
+                   (token (plist-get owner :token))
+                   (lock (gptel-runner-jobs--job-lock (plist-get fresh :job-id))))
+         (gptel-runner-jobs--with-lock-guard
+          lock
+          (lambda ()
+            (let* ((exists (file-exists-p lock))
+                   (reservation (and exists
+                                     (ignore-errors
+                                       (gptel-runner-jobs--read
+                                        (expand-file-name "owner.el" lock)))))
+                   (reserved-token (and (proper-list-p reservation)
+                                        (plist-get reservation :token))))
+              (when (and
+                     (not (file-symlink-p lock))
+                     (or (not exists)
+                         (and (stringp reserved-token)
+                              (or (not (equal token reserved-token))
+                                  (eq (gptel-runner-jobs--lock-owner-state reservation) 'dead)
+                                  (and (eq (plist-get fresh :worker-state) 'uncertain)
+                                       (equal reservation owner))))))
+                ;; Revoke admission before publishing closed.  A late child
+                ;; must pass this guard and the control lock to adopt.
+                (when (equal token reserved-token) (delete-directory lock t))
+                (gptel-runner-jobs--close-failed
+                 fresh 'startup-error
+                 (or (plist-get fresh :error)
+                     "Launcher exited before worker adoption; service is absent")))))))))))
 
 (defun gptel-runner-job-run (job &optional trigger)
   "Launch JOB in an isolated worker and return its invocation record.
@@ -965,17 +1002,25 @@ inside a newly launched worker, never inside the caller's Emacs."
                                                       (plist-get invocation :directory)))
                (error "Invocation has no recoverable checkpoint"))
              (let* ((token (gptel-runner-jobs--id))
-                    (owner (gptel-runner-jobs--owner token (plist-get invocation :id))))
-               (unless (gptel-runner-jobs--lock
-			(gptel-runner-jobs--job-lock (plist-get invocation :job-id)) owner)
-		 (error "Another invocation of this job is active"))
+                    (owner (gptel-runner-jobs--owner token (plist-get invocation :id)))
+                    (lock (gptel-runner-jobs--job-lock (plist-get invocation :job-id))))
+               (unless (gptel-runner-jobs--lock lock owner)
+                 (error "Another invocation of this job is active"))
                (setq invocation (plist-put invocation :worker owner)
                      invocation (plist-put invocation :epoch (1+ (plist-get invocation :epoch)))
+                     invocation (plist-put invocation :state 'starting)
                      invocation (plist-put invocation :phase 'starting)
                      invocation (plist-put invocation :worker-state 'starting)
                      invocation (plist-put invocation :launcher (gptel-runner-jobs--launcher))
-                     invocation (plist-put invocation :restore t)
-                     restart t)))
+                     invocation (plist-put invocation :restore t))
+               (cl-remf invocation :error)
+               ;; Publish ownership before creating any receipt for this epoch.
+               ;; Until publication succeeds, only the new reservation is ours.
+               (unwind-protect
+                   (progn
+                     (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file invocation) invocation)
+                     (setq restart t))
+                 (unless restart (gptel-runner-jobs--unlock lock token)))))
 	   (let* ((sequence-file (expand-file-name "command-sequence.el"
 						   (plist-get invocation :directory)))
 		  (sequence (1+ (if (file-exists-p sequence-file)
@@ -993,9 +1038,7 @@ inside a newly launched worker, never inside the caller's Emacs."
              (gptel-runner-jobs--write (gptel-runner-jobs--receipt-file invocation id) receipt)
              (gptel-runner-jobs--write
               (expand-file-name (concat "commands/" id ".el")
-				(plist-get invocation :directory)) command)
-             (when restart
-               (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file invocation) invocation)))))
+				(plist-get invocation :directory)) command))))
       (error
        (when restart (gptel-runner-jobs--launch-failed invocation err))
        (signal (car err) (cdr err))))
@@ -1387,6 +1430,32 @@ Opaque runtime objects and circular references are represented by type."
                       ":load-path if necessary")
               feature (error-message-string err))))))
 
+(defun gptel-runner-jobs--worker-failed (err lock token may-flush)
+  "Close this worker after ERR if it still owns the persisted generation.
+Release job LOCK with TOKEN.  MAY-FLUSH allows saving the checkpoint
+only if the worker has not already attempted to relinquish it."
+  (gptel-runner-jobs--with-control-lock
+   gptel-runner-jobs--invocation
+   (lambda ()
+     (when-let* ((fresh (gptel-runner-jobs--owned-manifest gptel-runner-jobs--invocation))
+                 ((not (eq (plist-get fresh :phase) 'closed))))
+       (setq gptel-runner-jobs--invocation fresh)
+       (when (and may-flush gptel-runner-jobs--run)
+         (ignore-errors (gptel-runner-abort-run gptel-runner-jobs--run 'worker-error))
+         (ignore-errors (gptel-runner-jobs--flush)))
+       (gptel-runner-jobs--cancel-snapshot)
+       (maphash (lambda (call _lock) (gptel-runner-jobs--release call))
+                gptel-runner-jobs--writer-locks)
+       (gptel-runner-jobs--unlock lock token)
+       (gptel-runner-jobs--close-failed
+        gptel-runner-jobs--invocation
+        (cond ((null gptel-runner-jobs--run) 'startup-error)
+              ((or (eq (car err) 'gptel-runner-job-storage-error)
+                   (memq 'file-error (get (car err) 'error-conditions)))
+               'storage-error)
+              (t 'worker-error))
+        (error-message-string err))))))
+
 (defun gptel-runner-jobs-worker (directory &optional epoch)
   "Execute or restore the invocation in DIRECTORY and return its exit code.
 When EPOCH is non-nil, refuse admission to any other worker generation.
@@ -1441,12 +1510,10 @@ initialization or persistence error.  This function does not call `kill-emacs'."
     (gptel-runner-jobs--with-control-lock
      gptel-runner-jobs--invocation
      (lambda ()
-       (let ((fresh (gptel-runner-jobs--read (gptel-runner-jobs--manifest-file gptel-runner-jobs--invocation))))
-         (unless (and (eq (plist-get fresh :phase) 'starting)
-                      (equal (plist-get fresh :epoch)
-                             (plist-get gptel-runner-jobs--invocation :epoch))
-                      (equal (plist-get (plist-get fresh :worker) :token) token))
-           (error "Invocation ownership changed before worker adoption")))
+       (let ((fresh (gptel-runner-jobs--owned-manifest gptel-runner-jobs--invocation)))
+         (unless (eq (plist-get fresh :phase) 'starting)
+           (error "Invocation ownership changed before worker adoption"))
+         (setq gptel-runner-jobs--invocation fresh))
        (gptel-runner-jobs--adopt lock owner)
        (setq gptel-runner-jobs--invocation (plist-put gptel-runner-jobs--invocation :worker owner)
              gptel-runner-jobs--invocation (plist-put gptel-runner-jobs--invocation :phase 'open)
@@ -1468,7 +1535,6 @@ initialization or persistence error.  This function does not call `kill-emacs'."
               (when (memq 'gptel-agent preloads)
                 (gptel-agent-update))
               (load (plist-get job :init-file) nil t)
-              (gptel-runner-jobs--abandoned-receipts)
               (setq gptel-runner-jobs--run
                     (if (plist-get gptel-runner-jobs--invocation :restore)
                         (gptel-runner-load-run (expand-file-name "checkpoint.el" directory))
@@ -1480,6 +1546,7 @@ initialization or persistence error.  This function does not call `kill-emacs'."
               (setf (gptel-runner-run-snapshot-file gptel-runner-jobs--run)
                     (expand-file-name "checkpoint.el" directory))
               (gptel-runner-jobs--flush)
+              (gptel-runner-jobs--abandoned-receipts)
               (while (not finished)
                 (gptel-runner-jobs--commands)
                 (gptel-runner--drain-queue gptel-runner-jobs--run)
@@ -1515,34 +1582,13 @@ initialization or persistence error.  This function does not call `kill-emacs'."
                 (unless finished (accept-process-output nil gptel-runner-job-poll-interval))))
           (error
            (setq exit-code 2)
-           ;; A final manifest write can fail after releasing ownership.
-           ;; At that point the checkpoint belongs to a possible successor.
-           (when (and gptel-runner-jobs--run (not ownership-released))
-             (ignore-errors (gptel-runner-abort-run gptel-runner-jobs--run 'worker-error))
-             (ignore-errors (gptel-runner-jobs--flush)))
-           (gptel-runner-jobs--cancel-snapshot)
-           (setq ownership-released t)
-           ;; Closed/exited is a public handoff boundary on failures too:
-           ;; relinquish every resource before publishing that boundary.
-           (maphash (lambda (call _lock) (gptel-runner-jobs--release call))
-                    gptel-runner-jobs--writer-locks)
-           (gptel-runner-jobs--unlock lock token)
-           (setq gptel-runner-jobs--invocation
-                 (plist-put gptel-runner-jobs--invocation :state
-                            (cond ((null gptel-runner-jobs--run) 'startup-error)
-                                  ((or (eq (car err) 'gptel-runner-job-storage-error)
-                                       (memq 'file-error (get (car err) 'error-conditions)))
-                                   'storage-error)
-                                  (t 'worker-error)))
-                 gptel-runner-jobs--invocation
-                 (plist-put gptel-runner-jobs--invocation :error (error-message-string err))
-                 gptel-runner-jobs--invocation
-                 (plist-put gptel-runner-jobs--invocation :phase 'closed)
-                 gptel-runner-jobs--invocation
-                 (plist-put gptel-runner-jobs--invocation :worker-state 'exited))
-           (ignore-errors
-             (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file gptel-runner-jobs--invocation)
-                                       gptel-runner-jobs--invocation))
+           (let ((may-flush (not ownership-released)))
+             ;; Even if revalidation fails, unwind cleanup must not flush.
+             (setq ownership-released t)
+             (condition-case cleanup-error
+                 (gptel-runner-jobs--worker-failed err lock token may-flush)
+               (error (message "Could not record background worker failure: %s"
+                               (error-message-string cleanup-error)))))
            (message "Background worker failed: %s" (error-message-string err))))
       (unwind-protect
           ;; Preserve queued progress on quit or another nonlocal exit while
@@ -1553,7 +1599,13 @@ initialization or persistence error.  This function does not call `kill-emacs'."
         (setq ownership-released t)
         (maphash (lambda (call _lock) (gptel-runner-jobs--release call))
                  gptel-runner-jobs--writer-locks)
-        (gptel-runner-jobs--unlock lock token)))
+        ;; Cleanup can run after a different generation has taken ownership.
+        (when (file-exists-p lock)
+          (gptel-runner-jobs--with-control-lock
+           gptel-runner-jobs--invocation
+           (lambda ()
+             (when (gptel-runner-jobs--owned-manifest gptel-runner-jobs--invocation)
+               (gptel-runner-jobs--unlock lock token)))))))
     exit-code))
 
 (defun gptel-runner-jobs-batch-main ()

@@ -80,6 +80,47 @@
       (should-not (gptel-runner-jobs--unlock lock "dead-owner"))
       (should (equal (gptel-runner-jobs--read file) next)))))
 
+(ert-deftest gptel-runner-jobs-lock-worker-close-error-preserves-successor ()
+  (gptel-runner-jobs-lock-test--directory
+    (let* ((gptel-runner-job-directory root)
+           (gptel-runner-job-launch-function #'ignore)
+           (gptel-runner--workflows (make-hash-table :test #'eq))
+           (gptel-runner--runs (make-hash-table :test #'equal))
+           (init (make-temp-file (expand-file-name "init-" root) nil ".el"))
+           (job (gptel-runner-register-job
+                 "handoff" :workflow 'handoff :init-file init
+                 :arguments (list :workspace root) :preload-features nil))
+           (invocation (gptel-runner-job-run job))
+           (id (plist-get invocation :id))
+           (directory (plist-get invocation :directory))
+           (control (expand-file-name "control.lock" directory))
+           (checkpoint (expand-file-name "checkpoint.el" directory))
+           (unlock (symbol-function 'gptel-runner-jobs--unlock))
+           successor receipt)
+      (gptel-runner-defworkflow handoff ()
+        (gptel-runner-elisp-step :id 'work :function #'ignore))
+      (cl-letf (((symbol-function 'gptel-runner-jobs--unlock)
+                 (lambda (path token)
+                   (prog1 (funcall unlock path token)
+                     (when (and (not receipt) (equal path control)
+                                (eq (plist-get (gptel-runner-invocation-get id) :phase)
+                                    'closed))
+                       ;; The restart can acquire control as soon as the first
+                       ;; worker releases it, before that worker sees the error.
+                       (setq receipt (gptel-runner-job-command id 'rerun)
+                             successor (gptel-runner-invocation-get id))
+                       (gptel-runner-jobs--write checkpoint 'successor-checkpoint)
+                       (signal 'file-error '("Control lock cleanup failed")))))))
+        (should (= 2 (gptel-runner-jobs-worker directory 1))))
+      (should (= (plist-get successor :epoch) 2))
+      (should (equal successor (gptel-runner-invocation-get id)))
+      (should (equal (plist-get successor :worker)
+                     (gptel-runner-jobs--read
+                      (expand-file-name "owner.el" (gptel-runner-jobs--job-lock "handoff")))))
+      (should (eq (plist-get receipt :status) 'queued))
+      (should (equal receipt (gptel-runner-job-command-status id (plist-get receipt :id))))
+      (should (eq (gptel-runner-jobs--read checkpoint) 'successor-checkpoint)))))
+
 (ert-deftest gptel-runner-jobs-lock-incomplete-owner-stays-busy ()
   (gptel-runner-jobs-lock-test--directory
     (let ((owner (gptel-runner-jobs--owner "new" nil))
