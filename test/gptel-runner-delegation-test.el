@@ -222,11 +222,11 @@
                    (nested (gptel-runner-delegation-test--discussion (gptel-agent--run-fsm worker)))
                    (copy (gptel-agent-session-buffer-from-record
                           (gptel-agent-session-buffer-record parent) t))
-                   (detached (gptel-runner-gptel-chat-from-text
-                              (gptel-runner-gptel-chat-text parent)))
+                   (owned-native (gptel-runner-gptel-chat-from-text
+                                  (gptel-runner-gptel-chat-text parent) t))
                    (owned (list parent (gptel-agent--run-child-buffer worker)
                                 (gptel-agent-discussion--chat-buffer chat)
-                                (gptel-agent-discussion--chat-buffer nested) copy detached)))
+                                (gptel-agent-discussion--chat-buffer nested) copy owned-native)))
               ;; Cover the enable-time discovery scan as well as immediate hooks.
               (gptel-agent-session-mode -1)
               (gptel-agent-session-mode 1)

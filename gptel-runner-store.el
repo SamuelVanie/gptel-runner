@@ -197,8 +197,9 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (defun gptel-runner-store-open-chat (file format)
   "Open FILE in FORMAT as a fresh, independently editable chat."
   (pcase format
-    ('gptel-agent (gptel-runner-store--import-agent-chat
-                   #'gptel-agent-session-import-buffer file))
+    ('gptel-agent
+     (gptel-runner-store--require-agent-sessions)
+     (gptel-agent-session-import-buffer file))
     ('transcript (with-temp-buffer
                    (insert-file-contents file)
                    (gptel-runner-store--text-buffer
@@ -297,7 +298,7 @@ and for nodes that execute without a gptel conversation."
            (let ((data (gptel-runner-call-driver-data call)))
              (gptel-runner-gptel-restore-submitted-end
               buffer (plist-get data :submitted-end) (plist-get data :rendered-end))))
-          ('gptel (setq buffer (gptel-runner-gptel-chat-from-text (cdr chat))))
+          ('gptel (setq buffer (gptel-runner-gptel-chat-from-text (cdr chat) t)))
           (_ (user-error "Unknown saved chat format %S" (car chat))))
         (with-current-buffer buffer
           (setq-local default-directory (gptel-runner-call-workspace call)))
@@ -388,7 +389,7 @@ and for nodes that execute without a gptel conversation."
         (pcase chat
           (`(gptel-agent . ,data) (gptel-runner-store--import-agent-chat
                                    #'gptel-agent-session-buffer-from-record data))
-          (`(gptel . ,text) (gptel-runner-gptel-chat-from-text text))
+          (`(gptel . ,text) (gptel-runner-gptel-chat-from-text text t))
           (`(transcript . ,text) (gptel-runner-store--text-buffer text (plist-get record :name)))
           (_ (user-error "Unknown child transcript format"))))))))
 

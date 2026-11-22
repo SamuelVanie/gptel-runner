@@ -53,6 +53,7 @@
 (declare-function gptel--cleanup-tool-call-overlay "gptel")
 (declare-function gptel-runner--complete-restored-call "gptel-runner-flow")
 (declare-function gptel-runner--resume-discussions "gptel-runner-flow")
+(declare-function gptel-agent-session--track "gptel-agent-session")
 
 (defvar gptel-request--transitions)
 (defvar gptel-request--handlers)
@@ -638,8 +639,9 @@ created by these tools are never included.  Every execution rechecks liveness."
                 (gptel--save-state))))
           (buffer-substring-no-properties (point-min) (point-max)))))))
 
-(defun gptel-runner-gptel-chat-from-text (text)
-  "Open native chat TEXT in an independent, editable gptel buffer."
+(defun gptel-runner-gptel-chat-from-text (text &optional external)
+  "Open native chat TEXT in an independent, editable gptel buffer.
+When EXTERNAL is non-nil, the caller owns the restored chat's persistence."
   (gptel-runner-gptel--check-api)
   (let (settings body)
     (with-temp-buffer
@@ -668,6 +670,9 @@ created by these tools are never included.  Every execution rechecks liveness."
               ('org 'org-mode)
               ('markdown (if (fboundp 'markdown-mode) 'markdown-mode 'text-mode))
               (_ 'text-mode)))
+           ;; Keep even independent imports externally owned while restoring:
+           ;; mode hooks and failed-import cleanup must not autosave partial
+           ;; settings or a transcript whose tool policy was rejected.
            (buffer (gptel-runner-gptel--new-chat "*gptel-runner chat*" body)))
       (condition-case err
           (with-current-buffer buffer
@@ -698,8 +703,19 @@ created by these tools are never included.  Every execution rechecks liveness."
              buffer (alist-get 'gptel-runner-submitted-end settings)
              (alist-get 'gptel-runner-rendered-end settings))
             (goto-char (point-max))
+            (unless external
+              (setq-local gptel-agent-session-managed-externally nil)
+              ;; Match the agent's standalone importer without rerunning
+              ;; user mode hooks.  Late-loaded session mode discovers it too.
+              (when (fboundp 'gptel-agent-session--track)
+                (gptel-agent-session--track buffer)))
             buffer)
-        (error (kill-buffer buffer) (signal (car err) (cdr err)))))))
+        ((error quit)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (setq-local gptel-agent-session-managed-externally t)
+             (kill-buffer buffer)))
+         (signal (car err) (cdr err)))))))
 
 (defun gptel-runner-gptel-save-chat (source file)
   "Atomically save a native gptel chat from SOURCE to FILE.

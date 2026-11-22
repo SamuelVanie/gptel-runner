@@ -401,6 +401,198 @@
               (should-not requests)))
         (when (buffer-live-p opened) (kill-buffer opened))))))
 
+(defun gptel-runner-session-test--background-copy-persists (format)
+  "Check ordinary persistence of background copies in native FORMAT."
+  (dolist (enable-first '(t nil))
+    (let ((gptel-agent-session-directory (make-temp-file "runner-copy-session-" t))
+          (gptel-agent-session-mode nil)
+          (gptel-agent-session-auto-title nil)
+          (gptel-agent-session--buffers (make-hash-table :test #'equal))
+          (gptel-agent-session--dirty (make-hash-table :test #'eq))
+          (gptel-agent-session--queue nil)
+          (gptel-agent-session--queue-tail nil)
+          opened)
+      (unwind-protect
+          (gptel-runner-session-test--with-run
+            (when enable-first (gptel-agent-session-mode 1))
+            (let* ((gptel-runner-jobs--run
+                    (gptel-runner-start
+                     (gptel-runner-agent-step :id 'check :agent 'reader :prompt "Check"
+                                              :completion 'response)))
+                   (source (gptel-runner-node-buffer gptel-runner-jobs--run 'check))
+                   (gptel-runner-jobs--invocation
+                    (list :id "copy-session" :epoch 1
+                          :directory gptel-runner-snapshot-directory))
+                   (gptel-runner-jobs--exports (make-hash-table :test #'equal)))
+              (gptel-runner-gptel-test--reply (pop requests) "Checked" "stop")
+              (cl-letf (((symbol-function 'gptel-runner-store--agent-sessions-p)
+                         (lambda () (eq format 'gptel-agent))))
+                (gptel-runner-jobs--publish))
+              (save-window-excursion
+                (let* ((call (car (plist-get gptel-runner-jobs--invocation :calls)))
+                       (target (list 'background-call "copy-session" 1 (plist-get call :id)))
+                       (file (gptel-runner-jobs-ui--artifact-path
+                              gptel-runner-jobs--invocation (plist-get call :chat)))
+                       (archive (with-temp-buffer
+                                  (insert-file-contents file) (buffer-string))))
+                  (should (eq format (plist-get call :chat-format)))
+                  (let* ((initialized 0)
+                         (gptel-mode-hook
+                          (cons (lambda () (cl-incf initialized)) gptel-mode-hook)))
+                    (gptel-runner-background-transcript
+                     (list gptel-runner-jobs--invocation call target))
+                    (should (= 1 initialized)))
+                  (setq opened (current-buffer))
+                  (unless enable-first (gptel-agent-session-mode 1))
+                  (should-not (eq opened source))
+                  (should-not (gptel-runner-store--chat-owner))
+                  (should-not (gptel-runner-store--child-owner))
+                  (should (gptel-agent-session--eligible-p opened))
+                  (goto-char (point-max))
+                  (insert "Independent follow-up draft")
+                  (let ((id gptel-agent-session--id))
+                    (should (stringp id))
+                    (should (eq opened (gethash id gptel-agent-session--buffers)))
+                    (gptel-agent-session-save t)
+                    ;; Ordinary close-time saving must retain later edits too.
+                    (goto-char (point-max))
+                    (insert " saved on close")
+                    (should (kill-buffer opened))
+                    ;; Rebuild the live session registry before restoring.
+                    (gptel-agent-session-mode -1)
+                    (gptel-agent-session-mode 1)
+                    (setq opened (gptel-agent-session-restore id))
+                    (with-current-buffer opened
+                      (should (string-search "Independent follow-up draft saved on close"
+                                             (buffer-string)))
+                      (should-not gptel-agent-session-managed-externally))
+                    (should (cl-find id (gptel-agent-session--catalog)
+                                     :key (lambda (record) (plist-get record :id))
+                                     :test #'equal)))
+                  (should-not (buffer-local-value 'gptel-agent-session--id source))
+                  (should-not (gethash source gptel-agent-session--dirty))
+                  (should (equal archive (with-temp-buffer
+                                           (insert-file-contents file) (buffer-string))))
+                  (should-not (with-current-buffer source
+                                (string-search "Independent follow-up draft" (buffer-string))))
+                  (should-not requests)))))
+        (gptel-agent-session-mode -1)
+        (when (buffer-live-p opened) (kill-buffer opened))
+        (delete-directory gptel-agent-session-directory t)))))
+
+(ert-deftest gptel-runner-session-background-agent-copy-persists ()
+  (skip-unless (and (require 'gptel-agent nil t)
+                    (gptel-runner-store--agent-sessions-p)))
+  (gptel-runner-session-test--background-copy-persists 'gptel-agent))
+
+(ert-deftest gptel-runner-session-background-plain-copy-persists ()
+  (skip-unless (and (require 'gptel-agent nil t)
+                    (gptel-runner-store--agent-sessions-p)))
+  (gptel-runner-session-test--background-copy-persists 'gptel))
+
+(ert-deftest gptel-runner-session-owned-restores-stay-out-of-agent-store ()
+  (skip-unless (and (require 'gptel-agent nil t)
+                    (gptel-runner-store--agent-sessions-p)))
+  (dolist (format '(gptel-agent gptel))
+    (let ((gptel-agent-session-directory (make-temp-file "runner-owned-session-" t))
+          (gptel-agent-session-mode nil)
+          (gptel-agent-session-auto-title nil)
+          (gptel-agent-session--buffers (make-hash-table :test #'equal))
+          (gptel-agent-session--dirty (make-hash-table :test #'eq))
+          (gptel-agent-session--queue nil)
+          (gptel-agent-session--queue-tail nil)
+          child)
+      (unwind-protect
+          (gptel-runner-session-test--with-run
+            (gptel-agent-session-mode 1)
+            (let* ((run (gptel-runner-start
+                         (gptel-runner-agent-step :id 'check :agent 'reader :prompt "Check"
+                                                  :completion 'response)))
+                   (source (gptel-runner-node-buffer run 'check)))
+              (gptel-runner-gptel-test--reply (pop requests) "Checked" "stop")
+              (cl-letf (((symbol-function 'gptel-runner-store--agent-sessions-p)
+                         (lambda () (eq format 'gptel-agent))))
+                (should (kill-buffer source)))
+              (let ((archive (gethash 'check (gptel-runner-run-chats run)))
+                    (initialized 0)
+                    restored)
+                (should (eq format (car archive)))
+                (puthash "discussion"
+                         (list :id "discussion" :kind 'discussion :chat archive)
+                         (gptel-runner-run-child-chats run))
+                (let ((gptel-mode-hook
+                       (cons (lambda ()
+                               ;; Ownership must precede even the first session hook.
+                               (should gptel-agent-session-managed-externally)
+                               (cl-incf initialized))
+                             gptel-mode-hook)))
+                  (setq restored (gptel-runner-node-buffer run 'check)
+                        child (gptel-runner-child-buffer run "discussion")))
+                (should (= 2 initialized))
+                (should (with-current-buffer restored (gptel-runner-store--chat-owner)))
+                (should (gptel-runner-store--child-owner child))
+                ;; Check immediate registration and a later discovery scan.
+                (dotimes (_ 2)
+                  (gptel-agent-session-save)
+                  (dolist (buffer (list restored child))
+                    (with-current-buffer buffer
+                      (should gptel-agent-session-managed-externally)
+                      (should-not gptel-agent-session--id)
+                      (should-not (gethash buffer gptel-agent-session--dirty))
+                      (should-not (memq buffer (hash-table-values gptel-agent-session--buffers)))
+                      (should-not (cl-find (buffer-name) (gptel-agent-session--catalog)
+                                           :key (lambda (record) (plist-get record :name))
+                                           :test #'equal))
+                      (should-error (gptel-agent-session-save t) :type 'user-error)))
+                  (gptel-agent-session-mode -1)
+                  (gptel-agent-session-mode 1))
+                (should-not requests))))
+        (gptel-agent-session-mode -1)
+        (when (buffer-live-p child) (kill-buffer child))
+        (delete-directory gptel-agent-session-directory t)))))
+
+(ert-deftest gptel-runner-session-failed-native-import-never-persists ()
+  (skip-unless (and (require 'gptel-agent nil t)
+                    (gptel-runner-store--agent-sessions-p)))
+  (let ((gptel-agent-session-directory (make-temp-file "runner-failed-import-" t))
+        (gptel-agent-session-auto-title nil)
+        (initial-buffers (buffer-list)))
+    (unwind-protect
+        (gptel-runner-session-test--with-run
+          (gptel-agent-session-mode 1)
+          (gptel-agent-session-save)
+          (let ((catalog-size (length (gptel-agent-session--catalog)))
+                (tracked (hash-table-count gptel-agent-session--buffers))
+                (inherit (symbol-function 'gptel-agent-policy-inherit))
+                (text (concat "Draft body\n;; Local Variables:\n;; mode: text\n"
+                              ";; gptel-model: runner-test\n"
+                              ";; gptel--backend-name: \"runner-test\"\n"
+                              ";; gptel-runner-tool-policy-ceiling: (42)\n;; End:\n")))
+            (dolist (failure '(error quit))
+              (let (caught)
+                (cl-letf (((symbol-function 'gptel-agent-policy-inherit)
+                           (if (eq failure 'error) inherit
+                             (lambda (_) (signal 'quit nil)))))
+                  (condition-case err
+                      (gptel-runner-gptel-chat-from-text text)
+                    ((error quit) (setq caught err))))
+                (should (eq failure (car caught)))
+                (when (eq failure 'error)
+                  (should (equal "Invalid inherited tool policy" (cadr caught)))))
+              (should-not (cl-find-if
+                           (lambda (buffer) (buffer-local-value 'gptel-mode buffer))
+                           (cl-set-difference (buffer-list) initial-buffers)))
+              (should (= tracked (hash-table-count gptel-agent-session--buffers)))
+              (should (= catalog-size (length (gptel-agent-session--catalog))))
+              (should (zerop (hash-table-count gptel-agent-session--dirty)))
+              (should-not gptel-agent-session--queue)
+              (should (zerop (hash-table-count gptel-agent-session--queued)))
+              (should (zerop (hash-table-count gptel-agent-session--transactions))))))
+      (gptel-agent-session-mode -1)
+      (dolist (buffer (cl-set-difference (buffer-list) initial-buffers))
+        (kill-buffer buffer))
+      (delete-directory gptel-agent-session-directory t))))
+
 (defvar gptel-ui-mode-hook)
 (defvar gptel-ui-header-details)
 (defvar gptel-ui--installed-header)
