@@ -43,7 +43,8 @@
   (and (listp review)
        (memq (plist-get review :verdict) '(pass revise blocked))
        (stringp (plist-get review :summary))
-       (listp (plist-get review :issues))
+       (plist-member review :issues)
+       (proper-list-p (plist-get review :issues))
        (cl-every
         (lambda (issue)
           (and (listp issue)
@@ -53,15 +54,39 @@
                  (or (null line) (and (integerp line) (> line 0))))))
         (plist-get review :issues))))
 
+(defun gptel-runner--review-json-value (value)
+  "Convert arrays and nulls in decoded JSON VALUE to the public Lisp form."
+  (cond ((or (vectorp value) (consp value))
+         (mapcar #'gptel-runner--review-json-value value))
+        ((eq value 'null) nil)
+        (t value)))
+
+(defun gptel-runner--parse-review-json (text)
+  "Parse review TEXT, checking JSON types before normalizing arrays and nulls."
+  (let* ((object (json-parse-string text :object-type 'plist :array-type 'array
+                                    :null-object 'null :false-object :false))
+         (issues (and (listp object) (plist-get object :issues))))
+    (unless (vectorp issues)
+      (error "Review JSON requires an issues array"))
+    (cl-loop for issue across issues do
+             (unless (consp issue)
+               (error "Expected a review issue object with severity and message"))
+             (dolist (key '(:file :line :suggested_fix))
+               (when-let* ((field (plist-member issue key)))
+                 (let ((value (cadr field)))
+                   (unless (or (eq value 'null)
+                               (if (eq key :line) (integerp value) (stringp value)))
+                     (error "Invalid review issue %s: %S" key value))))))
+    (gptel-runner--review-json-value object)))
+
 (defun gptel-runner-parse-review (value)
   "Parse VALUE into a validated review plist.
-Malformed data, missing approval, or an unknown verdict signals an error;
-therefore it can never be interpreted as `pass'."
+JSON must contain an issues array.  A Lisp plist supplies its issues
+as a list, with nil representing an empty array.
+Signal an error for malformed data or an unknown verdict."
   (let* ((parsed
           (cond
-           ((stringp value)
-            (json-parse-string value :object-type 'plist :array-type 'list
-                               :null-object nil :false-object :false))
+           ((stringp value) (gptel-runner--parse-review-json value))
            ((listp value) value)
            (t (error "Review result is neither JSON nor a plist"))))
          (review (gptel-runner--plist-symbolize-verdict parsed)))

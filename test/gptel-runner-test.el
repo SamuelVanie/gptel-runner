@@ -69,6 +69,46 @@
                :message (:type "string")
                :suggested_fix (:type ["string" "null"]))))))
 
+(ert-deftest gptel-runner-review-requires-json-issues-array ()
+  (dolist (field '("" ",\"issues\":null" ",\"issues\":{}" ",\"issues\":false"
+                   ",\"issues\":\"\"" ",\"issues\":1" ",\"issues\":[null]"
+                   ",\"issues\":[{}]" ",\"issues\":[[]]"))
+    (ert-info ((format "JSON issues field %S" field))
+      (should-error
+       (gptel-runner-parse-review
+        (concat "{\"verdict\":\"pass\",\"summary\":\"ok\"" field "}")))))
+  (should (equal (gptel-runner-parse-review
+                  "{\"verdict\":\"pass\",\"summary\":\"ok\",\"issues\":[]}")
+                 '(:verdict pass :summary "ok" :issues nil))))
+
+(ert-deftest gptel-runner-review-checks-json-issue-field-types ()
+  (let ((prefix (concat "{\"verdict\":\"revise\",\"summary\":\"check\",\"issues\":["
+                        "{\"severity\":\"error\",\"message\":\"fix\"")))
+    (dolist (field '("\"line\":{}" "\"line\":[]" "\"line\":0"
+                     "\"file\":{}" "\"suggested_fix\":false"))
+      (ert-info (field)
+        (should-error (gptel-runner-parse-review (concat prefix "," field "}]}")))))
+    (should (equal
+             (plist-get (gptel-runner-parse-review
+                         (concat prefix
+                                 ",\"file\":null,\"line\":null,\"suggested_fix\":null,"
+                                 "\"extra\":{\"null\":[null,1]}}]}"))
+                        :issues)
+             '((:severity "error" :message "fix" :file nil :line nil
+                :suggested_fix nil :extra (:null (nil 1))))))))
+
+(ert-deftest gptel-runner-review-preserves-lisp-issues ()
+  (dolist (issues '(nil ((:severity "error" :message "fix" :line 3))))
+    (let ((expected (list :verdict 'revise :summary "review" :issues issues)))
+      (should (gptel-runner-valid-review-p expected))
+      (should (equal (gptel-runner-parse-review expected) expected))
+      (should (equal (gptel-runner-parse-review
+                      (list :verdict "Revise" :summary "review" :issues issues))
+                     expected))))
+  (let ((missing '(:verdict pass :summary "ok")))
+    (should-not (gptel-runner-valid-review-p missing))
+    (should-error (gptel-runner-parse-review missing))))
+
 (ert-deftest gptel-runner-registry-and-blackboard ()
   (gptel-runner-test--isolated
     (let ((agent (gptel-runner-register-agent 'reader :preset 'p)))

@@ -271,6 +271,37 @@
         (should (equal answer (gptel-runner-call-result call)))
         (should-not requests)))))
 
+(ert-deftest gptel-runner-gptel-implement-review-validates-before-passing ()
+  (gptel-runner-gptel-test--with-transport
+    (let ((gptel-runner--workflows (make-hash-table :test #'eq))
+          (gptel--known-presets nil)
+          (gptel-default-mode 'text-mode)
+          (malformed "{\"verdict\":\"pass\",\"summary\":\"ok\",\"issues\":{}}")
+          (valid "{\"verdict\":\"pass\",\"summary\":\"fixed\",\"issues\":[]}"))
+      (dolist (preset '(runner-implementer runner-reviewer))
+        (gptel-make-preset preset :model 'runner-test))
+      (load "examples/implement-review" nil t)
+      (dolist (repair (list valid malformed))
+        (let ((run (gptel-runner-start 'implement-review :goal "Review the change"
+                                       :allow-writes t :allow-unconfirmed-tools t)))
+          (gptel-runner-gptel-test--handoff (pop requests) "Implementation report")
+          (gptel-runner-gptel-test--reply (pop requests) malformed "stop")
+          (should (eq (gptel-runner-run-state run) 'running))
+          (should-not (gptel-runner-get run 'review))
+          (gptel-runner-gptel-test--reply (pop requests) repair "stop")
+          (should (= 1 (cl-count 'output-repair-started (gptel-runner-run-events run)
+                                 :key #'gptel-runner-event-type)))
+          (if (equal repair valid)
+              (progn
+                (should (eq (gptel-runner-run-state run) 'succeeded))
+                (should (equal (gptel-runner-get run 'review)
+                               '(:verdict pass :summary "fixed" :issues nil))))
+            (should (eq (gptel-runner-run-state run) 'failed))
+            (should (eq (plist-get (gptel-runner-run-terminal-data run) :type)
+                        'invalid-output))
+            (should-not (gptel-runner-get run 'review)))
+          (should-not requests))))))
+
 (ert-deftest gptel-runner-gptel-prompt-preset-keeps-communication-after-async-transform ()
   (gptel-runner-gptel-test--with-transport
     (let ((gptel--known-presets nil) resume)
