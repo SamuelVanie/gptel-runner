@@ -1654,6 +1654,11 @@ BUFFER may be a buffer or its name."
                      '(ready running retry-wait waiting-tool waiting-confirmation))))
     (user-error "This node is running; pause it to send feedback")))
 
+(defun gptel-runner-gptel--before-inline-send ()
+  "Check the backing node before the inline prompt appends its reference."
+  (when-let* ((base (buffer-base-buffer)))
+    (with-current-buffer base (gptel-runner-gptel--before-send))))
+
 (defun gptel-runner-gptel--around-send (original &optional arg)
   "Resume open node discussions on a normal send through ORIGINAL with ARG."
   (gptel-runner-gptel--before-send arg)
@@ -1707,7 +1712,11 @@ BUFFER may be a buffer or its name."
   (let* ((buffer (or (plist-get args :buffer) (current-buffer)))
          (fsm (plist-get args :fsm)))
     (if (not (and (gptel-runner--buffer-call buffer)
-                  fsm (eq (gptel-fsm-handlers fsm) gptel-send--handlers)
+                  fsm
+                  (let ((handlers (gptel-fsm-handlers fsm)))
+                    (or (eq handlers gptel-send--handlers)
+                        (and handlers
+                             (eq handlers (bound-and-true-p gptel-inline--handlers)))))
                   (not (plist-get args :dry-run))))
         (apply original prompt args)
       (with-current-buffer buffer
@@ -1805,6 +1814,9 @@ RESPONSE and OVERLAY are the arguments accepted by
 
 (with-eval-after-load 'gptel
   (gptel-runner-gptel-install-abort-advice))
+
+(with-eval-after-load 'gptel-inline
+  (advice-add 'gptel-inline-send :before #'gptel-runner-gptel--before-inline-send))
 
 (with-eval-after-load 'gptel-agent-tools
   (add-hook 'gptel-agent-child-buffer-functions #'gptel-runner-store-track-child))
