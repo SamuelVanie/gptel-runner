@@ -1152,6 +1152,29 @@
                 (should (string-search "SHARED-DRAFT" (buffer-string))))))
         (when (buffer-live-p view) (kill-buffer view))))))
 
+(ert-deftest gptel-runner-session-inline-prompt-edits-checkpoint-base ()
+  (skip-unless (require 'gptel-inline nil t))
+  (gptel-runner-session-test--with-run
+    (gptel-runner-defworkflow inline-node (:persist t :completion response)
+      (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Inspect"))
+    (let* ((gptel-use-header-line t)
+           (run (gptel-runner-start 'inline-node))
+           (source (gptel-runner-node-buffer run 'read)))
+      (should (buffer-live-p source))
+      (save-window-excursion
+        (switch-to-buffer source)
+        (let ((prompt (gptel-inline nil (buffer-name source))))
+          (gptel-runner-store-flush-run run)
+          (with-current-buffer prompt
+            (should-not gptel-runner--call)
+            (insert "Inline draft")
+            (should (eq (gptel-runner-store-save-status run) 'pending))
+            (should-error (gptel-request) :type 'user-error)
+            (gptel-inline-append))
+          (should-not (buffer-live-p prompt)))
+        (gptel-runner-gptel-test--reply (pop requests) "Done" "stop")
+        (should (eq (gptel-runner-run-state run) 'succeeded))))))
+
 (ert-deftest gptel-runner-session-indirect-child-edits-checkpoint-base ()
   (gptel-runner-session-test--with-run
     (gptel-runner-defworkflow indirect-child (:persist t :completion response)

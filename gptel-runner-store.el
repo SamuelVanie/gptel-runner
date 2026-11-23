@@ -104,6 +104,8 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 
 (defun gptel-runner-store--clone-chat ()
   "Detach a cloned node or child chat from its source's live ownership."
+  (when (eq buffer-read-only 'gptel-runner-store-view)
+    (setq buffer-read-only t)) ; An inherited lock belongs to the source.
   (when (or gptel-runner--call gptel-runner-store--child-run
             (memq #'gptel-runner-store--indirect-chat-changed after-change-functions))
     ;; Never cancel requests or move shared markers: they still belong to
@@ -133,13 +135,25 @@ terminal run transitions bypass it, but their writes are still asynchronous."
     (when (buffer-base-buffer)
       ;; A shared transcript has one runtime owner.  Allow deliberate edits
       ;; after unlocking the view, while keeping persistence with that owner.
-      (setq buffer-read-only t)
+      (unless buffer-read-only (setq buffer-read-only 'gptel-runner-store-view))
       (gptel-runner-store--install-indirect-hooks))))
 
 ;; Run after gptel-agent's request cleanup (-90), before its session hook (0)
 ;; decides whether this independent clone can be persisted as an ordinary chat.
 (add-hook 'clone-buffer-hook #'gptel-runner-store--clone-chat -80)
 (add-hook 'clone-indirect-buffer-hook #'gptel-runner-store--clone-chat -80)
+
+(defun gptel-runner-store--inline-prompt (prompt)
+  "Release the runner's view lock on the completed inline PROMPT."
+  (when (and (buffer-live-p prompt)
+             (eq (buffer-local-value 'buffer-read-only prompt) 'gptel-runner-store-view))
+    (with-current-buffer prompt (setq buffer-read-only nil)))
+  prompt)
+
+;; gptel-inline identifies its prompt after the clone hook has detached
+;; ownership.  Editing here still checkpoints the owning base chat.
+(with-eval-after-load 'gptel-inline
+  (advice-add 'gptel-inline :filter-return #'gptel-runner-store--inline-prompt))
 
 (defun gptel-runner-store--agent-sessions-p ()
   "Whether agent sessions support records under independent host ownership."
