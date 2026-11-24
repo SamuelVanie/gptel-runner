@@ -1394,8 +1394,10 @@ The programmatic control interface is:
 Commands are data records with durable receipts.  The worker validates the
 operation, target generation, and current state before applying a command.
 If a receipt was saved and the command fails to reach the worker's inbox,
-the receipt records `rejected` and the submission error. On startup and before
-exit, the worker also rejects queued receipts left without a command file.
+the receipt records `rejected` and the submission error. Once the command is
+published, submission returns its receipt even if lock cleanup reports an
+error. On startup and before exit, the worker also rejects queued receipts
+left without a command file.
 A receipt marked `indeterminate` means processing began and the command
 may already have taken effect. Check the run before retrying it.
 One-time approvals authorize only the exact request IDs displayed in the

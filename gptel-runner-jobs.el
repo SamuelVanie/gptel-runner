@@ -711,7 +711,13 @@ contention signals a file error instead of silently abandoning the lock."
       (sleep-for 0.02))
     (unless acquired (error "Invocation control is busy; retry shortly"))
     (unwind-protect (funcall function)
-      (gptel-runner-jobs--unlock directory token))))
+      (condition-case err
+          (gptel-runner-jobs--unlock directory token)
+        (error
+         ;; A failed release may still own the lock.  The exact token makes
+         ;; a second attempt safe even if a successor already acquired it.
+         (ignore-errors (gptel-runner-jobs--unlock directory token))
+         (signal (car err) (cdr err)))))))
 
 (defun gptel-runner-jobs--launch (invocation)
   "Start INVOCATION independently of the dashboard on macOS."
@@ -994,7 +1000,7 @@ invocation is recorded as skipped without starting another worker."
         (error "%s requires %S" operation key)))))
 
 (defun gptel-runner-jobs--submit-command (invocation command receipt)
-  "Publish COMMAND and its RECEIPT under INVOCATION's control lock."
+  "Publish COMMAND under INVOCATION's control lock and return its RECEIPT."
   (let* ((id (plist-get command :id))
          (receipt-file (gptel-runner-jobs--receipt-file invocation id))
          (command-file (gptel-runner-jobs--command-file invocation id)))
@@ -1011,7 +1017,8 @@ invocation is recorded as skipped without starting another worker."
            (gptel-runner-jobs--fail-receipt
             receipt-file invocation
             (format "Command submission failed: %s" (error-message-string err))))
-         (signal (car err) (cdr err)))))))
+         (signal (car err) (cdr err))))))
+  receipt)
 
 (defun gptel-runner-job-command (invocation operation &optional arguments)
   "Send typed OPERATION with ARGUMENTS to INVOCATION or its ID.
@@ -1066,15 +1073,19 @@ inside a newly launched worker, never inside the caller's Emacs."
 				 :sequence sequence
 				 :operation operation :arguments arguments
 				 :created-at (float-time))))
-             (setq receipt (list :id id :status 'queued :operation operation
-				 :sequence sequence
-				 :invocation (plist-get invocation :id)
-				 :epoch (plist-get invocation :epoch)))
              (gptel-runner-jobs--write sequence-file sequence)
-             (gptel-runner-jobs--submit-command invocation command receipt))))
+             (setq receipt
+                   (gptel-runner-jobs--submit-command
+                    invocation command
+                    (list :id id :status 'queued :operation operation
+                          :sequence sequence :invocation (plist-get invocation :id)
+                          :epoch (plist-get invocation :epoch)))))))
       (error
-       (when restart (gptel-runner-jobs--launch-failed invocation err))
-       (signal (car err) (cdr err))))
+       (if receipt
+           (message "Submitted command %s. Control lock cleanup reported %s"
+                    id (error-message-string err))
+         (when restart (gptel-runner-jobs--launch-failed invocation err))
+         (signal (car err) (cdr err)))))
     (when restart
       (condition-case err
           (funcall gptel-runner-job-launch-function invocation)

@@ -615,6 +615,34 @@
           (should (= (plist-get retry :epoch) 2))))
       (should (eq (plist-get (gptel-runner-jobs-test--finished first) :state) 'succeeded)))))
 
+(ert-deftest gptel-runner-jobs-published-command-survives-control-unlock-error ()
+  (gptel-runner-jobs-test--isolated
+    (let* ((invocation (gptel-runner-jobs-test--input
+                        (gptel-runner-job-run
+                         (gptel-runner-jobs-test--job 'background-example-feedback))))
+           (control (expand-file-name "control.lock" (plist-get invocation :directory)))
+           (unlock (symbol-function 'gptel-runner-jobs--unlock)))
+      (dolist (operation '(cancel rerun))
+        (let (injected)
+          (cl-letf (((symbol-function 'gptel-runner-jobs--unlock)
+                     (lambda (directory token)
+                       (if (or injected (not (equal control directory)))
+                           (funcall unlock directory token)
+                         ;; Fail after releasing for the live worker, and
+                         ;; before releasing the reservation's control lock.
+                         (setq injected t)
+                         (when (eq operation 'cancel)
+                           (funcall unlock directory token))
+                         (signal 'file-error '("Injected control unlock error"))))))
+            (gptel-runner-jobs-test--command invocation operation))
+          (should injected))
+        (when (eq operation 'cancel)
+          (should (eq (plist-get (gptel-runner-jobs-test--finished invocation) :state)
+                      'cancelled))))
+      (should (= 2 (plist-get (gptel-runner-jobs-test--input invocation) :epoch)))
+      (gptel-runner-jobs-test--command invocation 'cancel)
+      (gptel-runner-jobs-test--finished invocation))))
+
 (ert-deftest gptel-runner-jobs-restart-write-failure-releases-reservation ()
   (dolist (failure '(manifest receipt command))
     (gptel-runner-jobs-test--isolated
