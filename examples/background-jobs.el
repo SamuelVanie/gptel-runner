@@ -8,9 +8,10 @@
 ;; retain their individual results, and publish a report file.
 ;; Save the job with :preload-features nil to run without gptel packages.
 ;;
-;; Real jobs preload gptel and gptel-agent automatically.  Their initialization
-;; file configures backends, registers runner agents and workflows, and selects
-;; a gptel-runner-gptel-driver.  The job and scheduling APIs do not change.
+;; New jobs preload gptel.  Jobs using gptel-agent can request
+;; :preload-features '(gptel gptel-agent) to discover its presets before init.
+;; For live runs, the init file configures backends, registers runner agents
+;; and workflows, and selects a gptel-runner-gptel-driver.
 
 ;;; Code:
 

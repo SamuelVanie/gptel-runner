@@ -1022,6 +1022,32 @@
                    (buffer-string))
                  "partial findings"))))))
 
+(ert-deftest gptel-runner-jobs-bootstrap-default-needs-only-gptel ()
+  (gptel-runner-jobs-test--isolated
+    (let* ((gptel-runner-job-preload-features
+            (eval (car (get 'gptel-runner-job-preload-features 'standard-value)) t))
+           (libraries (expand-file-name "libraries" gptel-runner-job-directory))
+           (init (expand-file-name "init.el" gptel-runner-job-directory)))
+      (gptel-runner-jobs--write (expand-file-name "gptel.el" libraries)
+                                '(provide 'gptel))
+      (gptel-runner-jobs--write
+       init
+       '(gptel-runner-defworkflow plain-job ()
+          (gptel-runner-elisp-step
+           :id 'inspect :function (lambda (_run _node) (featurep 'gptel))
+           :save-as 'loaded)))
+      (let* ((job (gptel-runner-register-job
+                   "plain-job" :workflow 'plain-job :init-file init
+                   :load-path (list libraries) :base-directory gptel-runner-job-directory))
+             (run (gptel-runner-jobs-test--finished (gptel-runner-job-run job))))
+        (should (eq (plist-get run :state) 'succeeded))
+        (should (eq (gptel-runner-get run 'loaded) t)))
+      ;; An explicitly requested companion stays mandatory on the next launch.
+      (gptel-runner-register-job "plain-job" :preload-features '(gptel gptel-agent))
+      (let ((run (gptel-runner-jobs-test--finished (gptel-runner-job-run "plain-job"))))
+        (should (eq (plist-get run :state) 'startup-error))
+        (should (string-match-p "Could not preload gptel-agent" (plist-get run :error)))))))
+
 (ert-deftest gptel-runner-jobs-bootstrap-captures-and-preserves-library-paths ()
   (gptel-runner-jobs-test--isolated
    (let* ((default-directory (file-name-as-directory gptel-runner-job-directory))

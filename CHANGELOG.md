@@ -55,9 +55,9 @@
 - Add native asynchronous Elisp steps with completion/rejection callbacks,
   once-only cleanup on completion, cancellation, pause, and timeout, per-attempt
   timeouts, and protection against duplicate or late results.
-- Preload gptel and gptel-agent in background workers before each job init,
-  capture external library paths for fresh processes, and initialize agent
-  definitions, with an opt-out for standalone jobs.
+- New background jobs preload gptel and capture external library paths for
+  fresh workers. Include gptel-agent in `:preload-features` to discover its
+  definitions before job init. Existing jobs keep their saved preloads.
 - Add generic isolated background jobs, durable invocation/agent history,
   published file artifacts, command receipts, and remote lifecycle controls.
 - Add start-time `:inputs` and workflow-level default workspaces.

@@ -45,7 +45,7 @@
   "Absolute Emacs executable used for background jobs."
   :type 'file)
 
-(defcustom gptel-runner-job-preload-features '(gptel gptel-agent)
+(defcustom gptel-runner-job-preload-features '(gptel)
   "Packages loaded in new job workers before their initialization file.
 Saving a job captures this value as :preload-features.  An explicit job
 value overrides it, including nil for fake-driver or other standalone jobs.

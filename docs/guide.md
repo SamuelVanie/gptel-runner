@@ -1231,10 +1231,11 @@ Cleanup uses the job ID, so jobs that share a workflow can be cleared
 independently. Saved results and chats stay on disk. Use `C-u C` to delete
 the cleared runs' recovery checkpoints as well.
 
-Workers automatically load `gptel` and `gptel-agent` **before** the job's
-`:init-file`, then call `gptel-agent-update` to discover agent definitions
-and refresh the package's standard presets.  Your init file runs afterward
-and has final authority over configuration and preset overrides.  If it
+New jobs preload `gptel` **before** the job's `:init-file`. For jobs that
+use gptel-agent, register the job with `:preload-features '(gptel gptel-agent)`.
+The worker then calls `gptel-agent-update` to discover agent definitions
+and refresh the package's standard presets. Your init file runs afterward
+and has final authority over configuration and preset overrides. If it
 changes `gptel-agent-dirs`, call `gptel-agent-update` there to discover those
 additional definitions.  This bootstrap runs on every worker start,
 including checkpoint recovery.  Other agent files still need explicit
@@ -1251,9 +1252,10 @@ configure this once before saving jobs:
 ```
 
 The captured paths and `gptel-runner-job-preload-features` (default
-`'(gptel gptel-agent)`) are stored as `:load-path` and `:preload-features`.
-Existing values survive job updates and schedule changes.  Supply either
-key explicitly to replace it; `:preload-features nil` disables automatic
+`'(gptel)`) are stored as `:load-path` and `:preload-features`.
+Existing values survive job updates and schedule changes. Supply either key
+explicitly to replace it. To remove gptel-agent from a saved job, register it again with
+`:preload-features '(gptel)`. Set `:preload-features nil` to disable automatic
 package loading and agent discovery for fake-driver or standalone jobs.
 Jobs created before this bootstrap was added must be re-saved once from
 your configured Emacs to capture the new fields for future invocations.
