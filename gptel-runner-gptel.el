@@ -536,19 +536,26 @@ created by these tools are never included.  Every execution rechecks liveness."
          (id (gptel-runner-node-id (gptel-runner-call-node call))))
     (format "*gptel:%s%s*" (if name (format "%s/" name) "") id)))
 
-(defun gptel-runner-gptel--new-chat (name &optional text)
-  "Create a workflow-owned gptel chat with base NAME and initial TEXT."
+(defun gptel-runner-gptel--new-chat (name &optional text call)
+  "Create a workflow-owned gptel chat with base NAME and initial TEXT.
+When CALL is given, apply its agent preset in its workspace before returning."
   (when (and (featurep 'gptel-agent-session)
              (not (default-boundp 'gptel-agent-session-managed-externally)))
     (user-error "Update gptel-agent to keep runner chats in their pipeline session"))
-  (let ((buffer (generate-new-buffer name)))
-    (condition-case err
+  (let ((buffer (generate-new-buffer name)) initialized)
+    (unwind-protect
         (with-current-buffer buffer
           (setq-local gptel-agent-session-managed-externally t)
-          (gptel (buffer-name buffer) nil text))
-      ((error quit)
-       (kill-buffer buffer)
-       (signal (car err) (cdr err))))))
+          (gptel (buffer-name buffer) nil text)
+          (when call
+            (setq-local default-directory (gptel-runner-call-workspace call))
+            (gptel-runner-gptel--apply-preset-locally
+             (gptel-runner-agent-preset (gptel-runner-call-agent call))))
+          (setq initialized buffer))
+      (when (and (not initialized) (buffer-live-p buffer))
+        (with-current-buffer buffer
+          (let ((kill-buffer-query-functions nil))
+            (kill-buffer buffer)))))))
 
 (defun gptel-runner-gptel--worker-buffer (call)
   "Prepare CALL's turn in its node's ordinary gptel chat."
@@ -561,12 +568,10 @@ created by these tools are never included.  Every execution rechecks liveness."
                             (gptel-runner-node-buffer run node)))
              (buffer (or existing
                          (gptel-runner-gptel--new-chat
-                          (gptel-runner-gptel--node-chat-name call)))))
+                          (gptel-runner-gptel--node-chat-name call) nil call))))
         (with-current-buffer buffer
-          (setq-local default-directory (gptel-runner-call-workspace call))
-          (unless existing
-            (gptel-runner-gptel--apply-preset-locally
-             (gptel-runner-agent-preset (gptel-runner-call-agent call))))
+          (when existing
+            (setq-local default-directory (gptel-runner-call-workspace call)))
           (gptel-runner-store-track-chat call buffer)
           (gptel-runner-gptel--insert-turn (gptel-runner-call-prompt call))
           (setf (gptel-runner-call-driver-data call)
@@ -576,14 +581,9 @@ created by these tools are never included.  Every execution rechecks liveness."
 (defun gptel-runner-gptel-restore-worker-buffer (call transcript)
   "Open legacy plain-text TRANSCRIPT as CALL's gptel chat."
   (gptel-runner-gptel--check-api)
-  (let ((buffer (gptel-runner-gptel--new-chat
-                 (gptel-runner-gptel--node-chat-name call) transcript)))
-    (with-current-buffer buffer
-      (setq-local default-directory (gptel-runner-call-workspace call))
-      (gptel-runner-gptel--apply-preset-locally
-       (gptel-runner-agent-preset (gptel-runner-call-agent call)))
-      (gptel-runner-store-track-chat call buffer))
-    buffer))
+  (gptel-runner-store-track-chat
+   call (gptel-runner-gptel--new-chat
+         (gptel-runner-gptel--node-chat-name call) transcript call)))
 
 (defun gptel-runner-gptel-protected-request (buffer)
   "Return the protected workflow request owned by BUFFER, if any."
