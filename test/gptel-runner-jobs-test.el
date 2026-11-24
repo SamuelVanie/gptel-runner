@@ -944,6 +944,43 @@
                        "PARALLEL PROCESSES"))
         (should (= (length (plist-get invocation :artifacts)) 1))))))
 
+(ert-deftest gptel-runner-jobs-safe-value-preserves-list-and-reference-shapes ()
+  (let ((cycle (list 1 2))
+        (shared (cons 'left 'right))
+        (recursive-vector (vector nil))
+        (callback '(lambda () t)))
+    (setcdr (cdr cycle) cycle)
+    (aset recursive-vector 0 recursive-vector)
+    (should (equal (gptel-runner-jobs--safe-value cycle)
+                   '(1 2 :unavailable circular-reference)))
+    (should (equal (gptel-runner-jobs--safe-value recursive-vector)
+                   [(:unavailable circular-reference)]))
+    (should (equal (gptel-runner-jobs--safe-value (cons (vector shared) shared))
+                   '([(left . right)] :unavailable circular-reference)))
+    (should (equal (gptel-runner-jobs--safe-value (cons 'callback callback))
+                   (list 'callback :unavailable (type-of callback))))))
+
+(ert-deftest gptel-runner-jobs-worker-records-long-list-result ()
+  (gptel-runner-jobs-test--isolated
+    (let ((init (expand-file-name "long-result.el" gptel-runner-job-directory)))
+      (gptel-runner-jobs--write
+       init
+       '(progn
+          (require 'gptel-runner)
+          (gptel-runner-defworkflow job-long-result ()
+            (gptel-runner-elisp-step
+             :id 'collect :save-as 'numbers
+             :function (lambda (_run _node) (number-sequence 1 4000))))))
+      (let* ((job (gptel-runner-jobs-test--job 'job-long-result "Long result" init))
+             (invocation (gptel-runner-jobs-test--finished (gptel-runner-job-run job)))
+             (call (car (plist-get invocation :calls)))
+             (expected (number-sequence 1 4000)))
+        (should (eq (plist-get invocation :state) 'succeeded))
+        (should (equal (plist-get (gptel-runner-invocation-call invocation call) :result)
+                       expected))
+        (should (equal (alist-get 'numbers (gptel-runner-invocation-outputs invocation))
+                       expected))))))
+
 (ert-deftest gptel-runner-jobs-finalizer-publishes-after-duration-exhaustion ()
   (gptel-runner-jobs-test--isolated
     (let ((init (expand-file-name "finalize-init.el" gptel-runner-job-directory)))

@@ -1062,8 +1062,15 @@ Opaque runtime objects and circular references are represented by type."
             ((or (functionp item) (recordp item) (bufferp item) (processp item))
              (list :unavailable (type-of item)))
             ((consp item)
-             (puthash item t seen)
-             (cons (walk (car item)) (walk (cdr item))))
+             ;; Walk list spines iteratively.  Visit each car before checking
+             ;; its cdr so a shared tail gets the usual reference marker.
+             (let (elements)
+               (while (and (consp item) (not (gethash item seen))
+                           (not (functionp item)))
+                 (puthash item t seen)
+                 (push (walk (car item)) elements)
+                 (setq item (cdr item)))
+               (nconc (nreverse elements) (walk item))))
             ((vectorp item)
              (puthash item t seen)
              (vconcat (mapcar #'walk item)))
