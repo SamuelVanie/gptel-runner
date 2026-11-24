@@ -1117,7 +1117,10 @@ Version 4 saves the node conversations, child transcripts and workflow
 progress together. Opening it restores the run and its chat rows.
 Visiting a node opens its editable buffer. The companion gptel-agent
 package can encode the assistant and tool boundaries, settings, and drafts
-inside the runner checkpoint. Plain gptel uses its own saved-chat format.
+inside the runner checkpoint. When the chat uses a function-valued system
+prompt, gptel-agent captures its text and any example turns at checkpoint
+time. Feedback after recovery uses those saved instructions, including
+chat-local overrides. Plain gptel uses its own saved-chat format.
 The runner keeps exclusive ownership even with global
 `gptel-agent-session-mode` enabled. The global agent session browser is for
 independent agent chats. Use `M-x gptel-runner-open-session` to recover
