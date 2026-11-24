@@ -2,6 +2,10 @@
 
 ## 0.1.0 - unreleased
 
+- Answer or dismiss a background agent's question batch from the node panel.
+  Suggested choices and free-text answers return to the requesting
+  conversation, including a subagent or managed discussion.
+
 - Move the optional Atelier chat presentation and its tests into the separate
   `gptel-ui` project. Add that repository to `load-path` and enable
   `gptel-ui-global-mode`; compatibility loaders there preserve the previous

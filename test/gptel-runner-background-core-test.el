@@ -152,6 +152,10 @@
          (gptel-runner-jobs--invocation '(:epoch 3)))
     (should (gptel-runner-jobs--interaction-current-p
              '(:id "current" :call-id "call-1" :generation 2 :epoch 3)))
+    ;; Other requests owned by the call can change its aggregate tool state.
+    (setf (gptel-runner-call-state call) 'waiting-tool)
+    (should (gptel-runner-jobs--interaction-current-p
+             '(:id "current" :call-id "call-1" :generation 2 :epoch 3)))
     (should-not (gptel-runner-jobs--interaction-current-p
                  '(:id "previous" :call-id "call-1" :generation 2 :epoch 3)))
     (should-not (gptel-runner-jobs--interaction-current-p

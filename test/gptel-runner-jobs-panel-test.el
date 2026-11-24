@@ -77,6 +77,44 @@
       (should-error (call-interactively (key-binding (kbd key))) :type 'user-error)
       (should (= (length sent) 1)))))
 
+(ert-deftest gptel-runner-panel-questions-keep-their-own-actions ()
+  (gptel-runner-panel-test--with-panel
+    (let* ((batch '(:id "q1" :call-id "c1" :epoch 2 :generation 3 :kind question
+                    :source-buffer "Planner"
+                    :questions ((:question "Which version?"
+                                 :choices ((:value "Stable" :description "Tagged release"
+                                            :recommended t))))))
+           (pending (cons batch (list first second))))
+      (setf (plist-get run :interactions) pending)
+      (gptel-runner-panel-refresh)
+      (should (string-match-p "1 question · 2 approvals"
+                              (gptel-runner-jobs-ui--interaction-summary pending)))
+      (search-forward "Questions from Planner")
+      (should-error (gptel-runner-panel-approve-selection) :type 'user-error)
+      (search-forward "Stable (recommended) — Tagged release")
+      (search-forward "Cancel questions")
+      (button-activate (button-at (1- (point))))
+      (should (equal (car sent) '(cancel-questions :call-id "c1" :call-epoch 2
+                                                  :generation 3 :interaction-id "q1")))
+      (gptel-runner-panel-approve-all)
+      (should (equal (plist-get (cdar sent) :interaction-ids) '("i1" "i2"))))))
+
+(ert-deftest gptel-runner-job-answer-requires-a-target-and-nonblank-answers ()
+  (let ((args '(:call-id "c1" :call-epoch 2 :generation 0 :interaction-id "q1")))
+    (gptel-runner-jobs--validate-command-arguments 'cancel-questions args)
+    (gptel-runner-jobs--validate-command-arguments 'answer (append args '(:answers ("Yes"))))
+    (dolist (answers '(nil ("") ("  ") (1) ("valid" . "extra")))
+      (should-error (gptel-runner-jobs--validate-command-arguments
+                     'answer (append args (list :answers answers)))))
+    (should-error (gptel-runner-jobs--validate-command-arguments
+                   'cancel-questions (append args '(:answers ("Yes")))))
+    (dolist (key '(:call-id :call-epoch :generation :interaction-id))
+      (let ((missing (copy-sequence args)))
+        (cl-remf missing key)
+        (should-error (gptel-runner-jobs--validate-command-arguments 'cancel-questions missing))
+        (should-error (gptel-runner-jobs--validate-command-arguments
+                       'answer (append missing '(:answers ("Yes")))))))))
+
 (ert-deftest gptel-runner-panel-decides-only-parent-and-child-requests-in-region ()
   (dolist (key '("y" "d"))
     (gptel-runner-panel-test--with-panel

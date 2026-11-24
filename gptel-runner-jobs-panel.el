@@ -65,9 +65,9 @@
                            'rejected))))
            gptel-runner-panel--receipts))
 
-(defun gptel-runner-panel--submit (run call interactions operation &optional outside)
+(defun gptel-runner-panel--submit (run call interactions operation &optional outside answers)
   "Submit OPERATION for displayed INTERACTIONS on CALL in RUN.
-OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
+OUTSIDE requests a conversation-scoped file grant.  ANSWERS accompany `answer'."
   (let* ((ids (mapcar (lambda (item) (plist-get item :id)) interactions))
          (arguments (list :call-id (plist-get call :id)
                           :call-epoch (plist-get call :epoch)
@@ -82,15 +82,15 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
                                                :allow-outside (and outside t)))))
       ('deny
        (setq arguments (append arguments (list :interaction-ids ids))))
-      ((or 'approve 'reject)
+      ((or 'approve 'reject 'answer 'cancel-questions)
        (setq arguments (append arguments (list :interaction-id (car ids))))
+       (when answers (setq arguments (append arguments (list :answers answers))))
        (when outside (setq arguments (append arguments '(:allow-outside t))))))
     (let ((receipt (gptel-runner-job-command run operation arguments)))
       (push (list :ids ids :node (plist-get call :node) :operation operation :receipt receipt)
             gptel-runner-panel--receipts)
       (gptel-runner-panel-refresh)
-      (message "%s submitted; worker status appears in this panel"
-               (if (eq operation 'revoke-outside) "Revocation" "Tool decision")))))
+      (message "Submitted %s to the worker" operation))))
 
 (defun gptel-runner-panel--command (run call operation)
   "Send a non-approval OPERATION for CALL in RUN and keep its receipt inline."
@@ -204,9 +204,50 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
     (unless submitted
       (put-text-property start (point) 'runner-request interaction))))
 
+(defun gptel-runner-panel--read-answer (question)
+  "Read a suggested or free-text answer to QUESTION."
+  (let* ((choices (mapcar (lambda (choice) (plist-get choice :value))
+                          (plist-get question :choices)))
+         (prompt (concat (plist-get question :question) " "))
+         (answer (if choices (completing-read prompt choices) (read-string prompt))))
+    (when (string-blank-p answer) (user-error "Supply an answer for each question"))
+    (substring-no-properties answer)))
+
+(defun gptel-runner-panel--questions (run call interaction)
+  "Display INTERACTION's question batch from CALL in RUN."
+  (let ((id (plist-get interaction :id))
+        (questions (plist-get interaction :questions))
+        (start (point)))
+    (insert (propertize (format "Questions from %s\n" (plist-get interaction :source-buffer))
+                        'face 'bold))
+    (cl-loop for item in questions for number from 1 do
+             (insert (format "  %d. %s\n" number (plist-get item :question)))
+             (dolist (choice (plist-get item :choices))
+               (insert "     " (plist-get choice :value)
+                       (if (eq (plist-get choice :recommended) t) " (recommended)" "")
+                       (if-let* ((detail (plist-get choice :description)))
+                           (concat " — " detail) "")
+                       "\n")))
+    (if (gptel-runner-panel--submitted-p id)
+        (insert (propertize "  Submitted — awaiting worker update\n" 'face 'shadow))
+      (insert "  Choose a suggested answer or enter your own for each question.\n  ")
+      (gptel-runner-panel--button
+       "Answer questions" (list id 'answer)
+       (lambda ()
+         (gptel-runner-panel--submit run call (list interaction) 'answer nil
+                                     (mapcar #'gptel-runner-panel--read-answer questions))))
+      (gptel-runner-panel--button
+       "Cancel questions" (list id 'cancel-questions)
+       (lambda () (gptel-runner-panel--submit run call (list interaction) 'cancel-questions)))
+      (insert "\n"))
+    (insert "\n")
+    (put-text-property start (point) 'runner-section id)))
+
 (defun gptel-runner-panel--call (run call)
-  "Insert CALL's state and approval group in RUN."
-  (let ((interactions (gptel-runner-jobs-ui--call-interactions run call)))
+  "Insert CALL's state and pending interactions in RUN."
+  (let* ((interactions (gptel-runner-jobs-ui--call-interactions run call))
+         (approvals (cl-remove 'question interactions
+                               :key (lambda (item) (plist-get item :kind)))))
     (insert (propertize (format "%s" (plist-get call :node)) 'face 'bold)
             (format "  ·  %s  ·  " (or (plist-get call :agent) "Elisp"))
             (gptel-runner-ui--state (plist-get call :state))
@@ -219,16 +260,20 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
       (insert "\n"))
     (insert "\n")
     (gptel-runner-panel--links run call)
-    (if interactions
+    (dolist (item interactions)
+      (when (eq (plist-get item :kind) 'question)
+        (gptel-runner-panel--questions run call item)))
+    (if approvals
         (progn
-          (insert (propertize (format "Needs your approval · %d requests\n\n" (length interactions))
+          (insert (propertize (format "Needs your approval · %d requests\n\n" (length approvals))
                               'face 'warning))
           (insert "Use y to approve or d to deny the request at point or the requests in a region.\n"
                   "Use a to approve all shown or D to deny all shown.\n\n")
-          (gptel-runner-panel--approval-buttons run call interactions)
-          (dolist (interaction interactions)
+          (gptel-runner-panel--approval-buttons run call approvals)
+          (dolist (interaction approvals)
             (gptel-runner-panel--request run call interaction)))
-      (insert (propertize "No pending tool approvals.\n\n" 'face 'shadow)))))
+      (unless interactions
+        (insert (propertize "No pending questions or tool approvals.\n\n" 'face 'shadow))))))
 
 (defun gptel-runner-panel--receipts (run)
   "Update submitted command statuses from RUN and display them inline."
@@ -293,9 +338,8 @@ OUTSIDE explicitly requests gptel-agent's conversation-scoped file grant."
            (lambda () (gptel-runner-background-visit target)))
           (insert (format " · %s · " (or (plist-get item :agent) "Elisp")))
           (insert (gptel-runner-ui--state (plist-get item :state)))
-          (let ((count (length (gptel-runner-jobs-ui--call-interactions run item))))
-            (when (> count 0)
-              (insert (propertize (format " · %d approvals" count) 'face 'warning))))
+          (when-let* ((pending (gptel-runner-jobs-ui--call-interactions run item)))
+            (insert " · " (gptel-runner-jobs-ui--interaction-summary pending)))
           (insert "\n\n"))))
     (goto-char (gptel-runner-panel--position location))
     (when key

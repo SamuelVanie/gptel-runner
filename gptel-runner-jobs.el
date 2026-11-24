@@ -23,6 +23,8 @@
 (declare-function gptel-runner-launchd-remove "gptel-runner-launchd")
 (declare-function gptel-runner-launchd-delete-schedule "gptel-runner-launchd")
 (declare-function gptel-runner-gptel-answer-interaction "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-answer-questions "gptel-runner-gptel")
+(declare-function gptel-runner-gptel-check-interaction "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-approve-interactions "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-deny-interactions "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-revoke-outside-access "gptel-runner-gptel")
@@ -83,7 +85,7 @@ executes directly and does not need this launcher."
 (define-error 'gptel-runner-job-storage-error "Background job storage failed")
 (defconst gptel-runner-jobs--operations
   '(pause resume cancel retry rerun continue extend extend-repeat decision
-	  pause-call cancel-call feedback accept approve approve-all deny reject
+	  pause-call cancel-call feedback accept approve approve-all deny reject answer cancel-questions
           revoke-outside))
 
 (defvar gptel-runner-headless nil)
@@ -961,6 +963,8 @@ invocation is recorded as skipped without starting another worker."
             ((or 'pause-call 'cancel-call) call-keys)
             ('feedback (cons :feedback call-keys))
             ('accept (cons :result call-keys))
+            ('answer (append '(:interaction-id :generation :answers) call-keys))
+            ('cancel-questions (append '(:interaction-id :generation) call-keys))
             ('approve (append '(:interaction-id :generation :allow-outside) call-keys))
             ('approve-all (append '(:interaction-ids :generation :allow-outside) call-keys))
             ('deny (append '(:interaction-ids :generation) call-keys))
@@ -979,6 +983,10 @@ invocation is recorded as skipped without starting another worker."
                    ((or :node :from-node)
                     (or (symbolp value) (stringp value) (integerp value)))
                    ((or :reset-budget :allow-outside) (memq value '(nil t)))
+                   (:answers
+                    (and (consp value) (proper-list-p value)
+                         (cl-every (lambda (s) (and (stringp s) (not (string-blank-p s))))
+                                   value)))
                    (:interaction-ids
                     (and (consp value) (proper-list-p value)
                          (cl-every (lambda (id) (and (stringp id)
@@ -995,6 +1003,8 @@ invocation is recorded as skipped without starting another worker."
                    ('revoke-outside (cons :generation call-keys))
                    ((or 'approve-all 'deny) (append '(:interaction-ids :generation) call-keys))
                    ('feedback (cons :feedback call-keys))
+                   ('answer (append '(:interaction-id :generation :answers) call-keys))
+                   ('cancel-questions (append '(:interaction-id :generation) call-keys))
                    ((or 'approve 'reject) (cons :interaction-id call-keys))))
       (unless (plist-get arguments key)
         (error "%s requires %S" operation key)))))
@@ -1174,8 +1184,8 @@ Opaque runtime objects and circular references are represented by type."
          (pending (and call
                        (gptel-runner-gptel-interaction-pending-p
                         call (plist-get interaction :id)))))
-    (and call (eq (gptel-runner-call-state call) 'waiting-confirmation)
-         pending
+    ;; A sibling may be executing another tool while this request waits.
+    (and pending
          (equal (plist-get interaction :epoch)
                 (plist-get gptel-runner-jobs--invocation :epoch))
          (= (or (plist-get interaction :generation) -1)
@@ -1365,9 +1375,11 @@ Opaque runtime objects and circular references are represented by type."
       (error "Command arguments must be a property list"))
     ;; A stale selection can be rejected cleanly before the first decision.
     ;; After a tool callback runs, a failure may indicate partial application.
-    (dolist (id (plist-get args :interaction-ids))
-      (unless (gptel-runner-gptel-interaction-pending-p call id)
-        (user-error "Interaction %s is no longer pending; refresh the panel" id)))
+    (dolist (id (or (plist-get args :interaction-ids)
+                    (when-let* ((id (plist-get args :interaction-id))) (list id))))
+      (gptel-runner-gptel-check-interaction
+       call id (if (memq operation '(answer cancel-questions)) 'question 'tool-approval)
+       (plist-get args :answers)))
     (setq gptel-runner-jobs--command-started t)
     (pcase operation
       ('pause (gptel-runner-pause-run run))
@@ -1389,6 +1401,9 @@ Opaque runtime objects and circular references are represented by type."
       ('cancel-call (gptel-runner-abort-call call 'background-command))
       ('feedback (gptel-runner-gptel-feedback call (plist-get args :feedback)))
       ('accept (gptel-runner-complete-call-from-buffer (plist-get args :result) call))
+      ((or 'answer 'cancel-questions)
+       (gptel-runner-gptel-answer-questions call (plist-get args :interaction-id)
+                                            (plist-get args :answers)))
       ((or 'approve 'reject)
        (gptel-runner-gptel-answer-interaction call (plist-get args :interaction-id)
                                               (eq operation 'approve)

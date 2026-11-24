@@ -98,6 +98,8 @@
 (declare-function gptel-agent-supervision-stop "gptel-agent-tools")
 (declare-function gptel-agent-supervision-retry "gptel-agent-tools")
 (declare-function gptel-agent-supervision-request-live-p "gptel-agent-tools")
+(declare-function gptel-agent-supervision-question-live-p "gptel-agent-tools" (scope batch))
+(declare-function gptel-agent-supervision-answer-questions "gptel-agent-tools" (scope batch answers))
 (declare-function gptel-agent-allow-outside-access "gptel-agent-access")
 (declare-function gptel-agent-revoke-outside-access "gptel-agent-access")
 (declare-function gptel-agent-policy-request-trust-tool "gptel-agent-policy-request" (fsm tool))
@@ -132,14 +134,14 @@ must route replies back to that owning process.")
    tools))
 
 (defun gptel-runner-gptel--interactions (call)
-  "Return CALL's private pending approvals, including legacy single entries."
+  "Return CALL's private pending interactions, including legacy single entries."
   (let ((data (gptel-runner-call-driver-data call)))
     (or (plist-get data :pending-interactions)
         (when-let* ((pending (plist-get data :pending-interaction)))
           (list pending)))))
 
 (defun gptel-runner-gptel--set-interactions (call pending)
-  "Store PENDING approvals for CALL, keeping the single-entry view compatible."
+  "Store PENDING interactions for CALL, keeping the single-entry view compatible."
   (setf (gptel-runner-call-driver-data call)
         (plist-put (plist-put (gptel-runner-call-driver-data call)
                               :pending-interactions pending)
@@ -181,12 +183,16 @@ must route replies back to that owning process.")
                             (gptel-runner-call-buffer call)))
          (or (null (plist-get pending :overlay))
              (gptel-runner-gptel--interaction-overlay pending))
-         (or (null (plist-get pending :agent-supervision))
-             (gptel-agent-supervision-request-live-p
-              (plist-get pending :agent-supervision) fsm))
-         (or (null fsm)
-             (and (eq (gptel-fsm-state fsm) 'TOOL)
-                  (eq (plist-get pending :info) (gptel-fsm-info fsm)))))))
+         (if-let* ((batch (plist-get pending :question-batch)))
+             ;; An implicit wait at turn completion can also hold a batch.
+             (gptel-agent-supervision-question-live-p
+              (plist-get pending :agent-supervision) batch)
+           (and (or (null (plist-get pending :agent-supervision))
+                    (gptel-agent-supervision-request-live-p
+                     (plist-get pending :agent-supervision) fsm))
+                (or (null fsm)
+                    (and (eq (gptel-fsm-state fsm) 'TOOL)
+                         (eq (plist-get pending :info) (gptel-fsm-info fsm)))))))))
 
 (defun gptel-runner-gptel-pending-interactions (call)
   "Return data-only descriptions of the currently actionable requests on CALL."
@@ -194,15 +200,36 @@ must route replies back to that owning process.")
            when (gptel-runner-gptel--interaction-live-p call entry)
            collect (copy-tree (plist-get entry :description) t)))
 
+(defun gptel-runner-gptel--live-interaction (call id)
+  "Find the pending interaction with ID on CALL."
+  (cl-find-if (lambda (pending)
+                (and (equal id (plist-get (plist-get pending :description) :id))
+                     (gptel-runner-gptel--interaction-live-p call pending)))
+              (gptel-runner-gptel--interactions call)))
+
 (defun gptel-runner-gptel-interaction-pending-p (call id)
-  "Whether approval ID is still pending on CALL."
-  (cl-some (lambda (pending)
-             (and (equal id (plist-get (plist-get pending :description) :id))
-                  (gptel-runner-gptel--interaction-live-p call pending)))
-           (gptel-runner-gptel--interactions call)))
+  "Whether interaction ID is still pending on CALL."
+  (and (gptel-runner-gptel--live-interaction call id) t))
+
+(defun gptel-runner-gptel-check-interaction (call id kind &optional answers)
+  "Check that ID on CALL is live and accepts KIND and optional ANSWERS.
+Return the private pending entry.  For a question batch, ANSWERS must
+be nil for cancellation or a list with one nonblank string per question."
+  (let* ((pending (gptel-runner-gptel--live-interaction call id))
+         (description (plist-get pending :description)))
+    (unless pending (user-error "Interaction %s is no longer pending" id))
+    (unless (eq kind (or (plist-get description :kind) 'tool-approval))
+      (user-error "Interaction %s does not accept this action" id))
+    (when (and answers (eq kind 'question)
+               (not (and (proper-list-p answers)
+                         (= (length answers) (length (plist-get description :questions)))
+                         (cl-every (lambda (s) (and (stringp s) (not (string-blank-p s))))
+                                   answers))))
+      (user-error "Supply one nonblank answer per question"))
+    pending))
 
 (defun gptel-runner-gptel--sync-interactions (call)
-  "Discard stale approvals and retain CALL's waiting state for live ones."
+  "Discard stale interactions and retain CALL's waiting state for live ones."
   (let* ((previous (gptel-runner-gptel--interactions call))
          (pending
           (cl-loop for entry in previous
@@ -218,46 +245,63 @@ must route replies back to that owning process.")
       (gptel-runner-gptel--observe
        call 'waiting-tool (gptel-runner-call-tool-names call))))))
 
-(defun gptel-runner-gptel--pending-interaction (call tools &optional fsm scope overlay)
-  "Publish CALL's TOOLS from FSM with optional supervisor SCOPE and OVERLAY."
-  (let ((interaction
-         (list :id (gptel-runner--id "interaction") :kind 'tool-approval
-               :call-id (gptel-runner-call-id call)
-               :generation (gptel-runner-call-generation call)
-               :source-buffer (buffer-name
-                               (if fsm (plist-get (gptel-fsm-info fsm) :buffer)
-                                 (gptel-runner-call-buffer call)))
-               :tools (gptel-runner-gptel--tool-data tools)
-               :outside-access
-               (and (fboundp 'gptel-agent-allow-outside-access)
-                    fsm
-                    (cl-some
-                     (lambda (item)
-                       (and (plist-get item :agent-access-pending)
-                            (not (plist-get item :result))
-                            (cl-some
-                             (lambda (tool)
-                               (and (equal (gptel-tool-name (car tool))
-                                           (plist-get item :name))
-                                    (eq (cadr tool) (plist-get item :args))))
-                             tools)))
-                     (plist-get (gptel-fsm-info fsm) :tool-use))
-                    t))))
-    (when overlay
+(defun gptel-runner-gptel--publish-interaction (call fsm scope description private)
+  "Publish DESCRIPTION for CALL and retain PRIVATE handles from FSM and SCOPE."
+  (let* ((info (and fsm (gptel-fsm-info fsm)))
+         (buffer (if info (plist-get info :buffer) (gptel-runner-call-buffer call)))
+         (interaction (append (list :id (gptel-runner--id "interaction")
+                                    :call-id (gptel-runner-call-id call)
+                                    :generation (gptel-runner-call-generation call)
+                                    :source-buffer (buffer-name buffer))
+                              description)))
+    (when-let* ((overlay (plist-get private :overlay)))
       (overlay-put overlay 'gptel-runner-interaction
                    (cons call (plist-get interaction :id))))
     (gptel-runner-gptel--set-interactions
      call (append (gptel-runner-gptel--interactions call)
-                  (list (list :description interaction :tools tools :fsm fsm
-                              :overlay overlay
-                              :agent-supervision scope
-                              :info (and fsm (gptel-fsm-info fsm))
-                              :buffer (if fsm (plist-get (gptel-fsm-info fsm) :buffer)
-                                        (gptel-runner-call-buffer call))))))
+                  (list (append (list :description interaction :fsm fsm
+                                      :agent-supervision scope :info info :buffer buffer)
+                                private))))
     (gptel-runner-gptel--sync-interactions call)
     (run-hook-with-args 'gptel-runner-interaction-hook call
                         (copy-tree interaction t))
     interaction))
+
+(defun gptel-runner-gptel--pending-interaction (call tools &optional fsm scope overlay)
+  "Publish CALL's TOOLS from FSM with optional supervisor SCOPE and OVERLAY."
+  (gptel-runner-gptel--publish-interaction
+   call fsm scope
+   (list :kind 'tool-approval :tools (gptel-runner-gptel--tool-data tools)
+         :outside-access
+         (and (fboundp 'gptel-agent-allow-outside-access)
+              fsm
+              (cl-some
+               (lambda (item)
+                 (and (plist-get item :agent-access-pending)
+                      (not (plist-get item :result))
+                      (cl-some
+                       (lambda (tool)
+                         (and (equal (gptel-tool-name (car tool)) (plist-get item :name))
+                              (eq (cadr tool) (plist-get item :args))))
+                       tools)))
+               (plist-get (gptel-fsm-info fsm) :tool-use))
+              t))
+   (list :tools tools :overlay overlay)))
+
+(defun gptel-runner-gptel-answer-questions (call id answers)
+  "Return ANSWERS to the question batch with ID on CALL, or cancel it with nil."
+  (let ((pending (gptel-runner-gptel-check-interaction call id 'question answers)))
+    ;; The callback can immediately start another batch or finish this call.
+    (gptel-runner-gptel--set-interactions
+     call (remq pending (gptel-runner-gptel--interactions call)))
+    (gptel-runner--emit (gptel-runner-call-run call) 'interaction-answered
+                        (gptel-runner-call-node call) call
+                        (list :id id :decision (if answers 'answer 'cancel-questions)))
+    (gptel-runner-gptel--observe call 'waiting-tool '("AskUserQuestion"))
+    (unwind-protect
+        (gptel-agent-supervision-answer-questions
+         (plist-get pending :agent-supervision) (plist-get pending :question-batch) answers)
+      (gptel-runner-gptel--sync-interactions call))))
 
 (defun gptel-runner-gptel--display-tool-calls (original tools info &rest args)
   "Register the native approval drawn by ORIGINAL for TOOLS, INFO and ARGS."
@@ -292,14 +336,8 @@ DECISION is `approve', `deny', or `cancel'.  ALLOW-OUTSIDE is an explicit
 outside-file grant for the conversation owning an approved request."
   (unless (gptel-runner-call-p call)
     (user-error "Unknown runner call"))
-  (let* ((pending (cl-find interaction-id (gptel-runner-gptel--interactions call)
-                           :key (lambda (entry)
-                                  (plist-get (plist-get entry :description) :id))
-                           :test #'equal))
+  (let* ((pending (gptel-runner-gptel-check-interaction call interaction-id 'tool-approval))
          (description (plist-get pending :description)))
-    (unless (and pending
-                 (gptel-runner-gptel--interaction-live-p call pending))
-      (user-error "Interaction %s is no longer pending" interaction-id))
     (when (and allow-outside
                (not (and (eq decision 'approve) (plist-get description :outside-access)
                          (fboundp 'gptel-agent-allow-outside-access))))
@@ -356,8 +394,7 @@ Ordinary confirmations and file reviews remain enabled."
   (unless (and ids (equal ids (delete-dups (copy-sequence ids))))
     (user-error "Supply a nonempty set of distinct interaction IDs"))
   (dolist (id ids)
-    (unless (gptel-runner-gptel-interaction-pending-p call id)
-      (user-error "Interaction %s is no longer pending; refresh the panel" id))))
+    (gptel-runner-gptel-check-interaction call id 'tool-approval)))
 
 (defun gptel-runner-gptel-deny-interactions (call ids)
   "Decline exactly the pending request IDS on CALL and let their agents continue."
@@ -409,11 +446,20 @@ created by these tools are never included.  Every execution rechecks liveness."
       (unless (fboundp function)
         (error "Update gptel-agent: runner integration requires %s" function)))
     (unless (plist-get (gptel-runner-call-driver-data call) :agent-supervision)
-      (let ((generation (gptel-runner-call-generation call)))
+      (let* ((generation (gptel-runner-call-generation call))
+             (questions
+              (when (and gptel-runner-headless
+                         (fboundp 'gptel-agent-supervision-answer-questions))
+                (lambda (scope fsm items batch)
+                  (when (and (= generation (gptel-runner-call-generation call))
+                             (not (gptel-runner--call-terminal-p call)))
+                    (gptel-runner-gptel--publish-interaction
+                     call fsm scope (list :kind 'question :questions items)
+                     (list :question-batch batch)))))))
         (setf (gptel-runner-call-driver-data call)
               (plist-put
                (gptel-runner-call-driver-data call) :agent-supervision
-               (gptel-agent-supervise
+               (apply #'gptel-agent-supervise
                 (gptel-runner-call-buffer call)
                 :on-state-change
                 (lambda (_scope _fsm event)
@@ -432,7 +478,8 @@ created by these tools are never included.  Every execution rechecks liveness."
                     t)
                    (t
                     (setq gptel-runner-gptel--approval-owner (list call fsm scope))
-                    nil))))))))
+                    nil)))
+                (when questions (list :on-question questions)))))))
     (plist-get (gptel-runner-call-driver-data call) :agent-supervision)))
 
 (defun gptel-runner-gptel--stop-supervision (call)

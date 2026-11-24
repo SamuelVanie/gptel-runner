@@ -709,7 +709,9 @@ changes to another major mode.
 While a tool call is in progress, its agent-call row enters the
 `waiting-tool` state and displays `Calling TOOL-NAME...`.  This makes tools
 that wait for user input, such as `AskUserQuestion`, visible without opening
-the agent transcript. When a node needs permission to run tools, its row shows
+the agent transcript. For a background node with questions pending, press
+`RET` on the row and choose **Answer questions** in the node panel.
+When a node needs permission to run tools, its row shows
 the pending approval count. Press `RET`, click the row, or use `? y` to review
 the tool names, arguments, and requesting conversations together. Choose
 **Approve once** for one request or press `a` to approve all requests shown for
@@ -1448,8 +1450,32 @@ and arguments; several children can await approval simultaneously.  Approve
 or deny them through the node panel. Each child receives its own tool
 results or denials.
 Replies to cancelled, completed, or superseded requests cannot run tools.
-Question forms and separate interactive file-review interfaces still require
-their own headless adapters; this bridge handles gptel tool confirmations.
+
+With a gptel-agent version providing `gptel-agent-supervision-answer-questions`,
+the bundled Agent, Plan and Ask presets can ask questions in background jobs.
+When an agent finishes collecting a batch, open the node row with `RET`.
+Under **Questions from** the requesting conversation, choose **Answer questions**.
+Select a suggested choice or enter free text for each question in order.
+**Cancel questions** dismisses that batch and lets its agent continue.
+Other children's questions and tool approvals have their own controls.
+Foreground chats use the usual gptel-agent question form. Separate interactive
+file reviews still require their own headless adapter.
+
+For programmatic replies, use an entry of `:kind question` from the
+invocation's `:interactions`. Pass its `:epoch` as `:call-epoch` and its
+`:id` as `:interaction-id` when submitting the answers.
+
+```elisp
+(gptel-runner-job-command
+ invocation 'answer
+ (list :call-id (plist-get batch :call-id) :call-epoch (plist-get batch :epoch)
+       :generation (plist-get batch :generation) :interaction-id (plist-get batch :id)
+       :answers '("Small" "Include archived files")))
+```
+
+Supply one nonblank string per question. Use `cancel-questions` with the same
+identifiers to dismiss the batch. Both commands return a receipt.
+
 Nested work is supervised inside the node, not registered as additional
 pipeline nodes or separately charged against the runner's call/concurrency
 limits.  Crash recovery restarts unfinished nodes rather than restoring live

@@ -64,6 +64,20 @@
           (equal (plist-get item :epoch) (plist-get call :epoch))))
    (plist-get run :interactions)))
 
+(defun gptel-runner-jobs-ui--interaction-summary (pending)
+  "Describe the questions and approval requests in PENDING."
+  (let ((questions 0) (approvals 0))
+    (dolist (entry pending)
+      (if (eq (plist-get entry :kind) 'question)
+          (cl-incf questions (length (plist-get entry :questions)))
+        (cl-incf approvals)))
+    (if (zerop questions)
+        (gptel-runner-ui--approval-count approvals)
+      (propertize (concat (format "%d question%s" questions (if (= questions 1) "" "s"))
+                          (if (zerop approvals) " pending"
+                            (format " · %d approval%s" approvals (if (= approvals 1) "" "s"))))
+                  'face 'warning))))
+
 (defun gptel-runner-jobs-ui--entries ()
   "Return external invocation rows using only their compact manifests."
   (let (entries)
@@ -101,7 +115,7 @@
                     (call . ,(plist-get call :id))
                     (state . ,(let ((pending (gptel-runner-jobs-ui--call-interactions run call)))
                                 (if pending
-                                    (gptel-runner-ui--approval-count (length pending))
+                                    (gptel-runner-jobs-ui--interaction-summary pending)
                                   (gptel-runner-ui--state (plist-get call :state)))))
                     (elapsed . ,(gptel-runner-jobs-ui--elapsed call))
                     (attempts . ,(format "%s" (or (plist-get call :attempts) 0)))
@@ -189,7 +203,7 @@
 
 (defconst gptel-runner-jobs-ui--controls-link
   (propertize "Worker controls" 'face 'link 'mouse-face 'highlight
-              'help-echo "Review approvals or send feedback to the worker"
+              'help-echo "Answer questions, review approvals, or send feedback to the worker"
               'local-map (define-keymap
                            "<header-line> <mouse-1>"
                            (lambda (event)
@@ -254,7 +268,7 @@ at point."
         (setq-local gptel-runner-background--target target)))))
 
 (defun gptel-runner-background-visit (&optional target)
-  "Visit TARGET's controls for pending approvals, or its available chat.
+  "Visit TARGET's controls for pending interactions, or its available chat.
 TARGET defaults to the selected background run or node."
   (interactive)
   (let* ((selection (gptel-runner-jobs-ui--selection target))
@@ -400,14 +414,14 @@ publication order, reserving literal names even when they resemble labels."
   "Send OPERATION with ARGUMENTS to the selected invocation's worker.
 When ARGUMENTS is nil, read the arguments needed by OPERATION.  The returned
 receipt acknowledges submission; only the worker can acknowledge application.
-Approval and rejection open the node panel for review before submission."
+Question and approval actions open the node panel for review before submission."
   (interactive
    (list (intern
           (completing-read
            "Background action: "
            gptel-runner-jobs--operations
            nil t))))
-  (if (memq operation '(approve approve-all deny reject))
+  (if (memq operation '(approve approve-all deny reject answer cancel-questions))
       (gptel-runner-background-open)
     (pcase-let* ((`(,run ,call ,_) (gptel-runner-jobs-ui--selection))
 		 (arguments (copy-sequence arguments)))
