@@ -273,18 +273,18 @@
     (should (eq (key-binding (kbd "x")) #'gptel-runner-jobs-remove))
     (should (eq (key-binding (kbd "C")) #'gptel-runner-jobs-clear-finished))
     (should (eq (key-binding (kbd "n"))
-                (lookup-key tabulated-list-mode-map (kbd "n")))))
+                (lookup-key tabulated-list-mode-map (kbd "n"))))
+    (let ((suffixes (transient-suffixes 'gptel-runner-jobs-menu)))
+      (dolist (binding '(("r" gptel-runner-jobs-run)
+                         ("i" gptel-runner-jobs-diagnostics)
+                         ("x" gptel-runner-jobs-remove)
+                         ("C" gptel-runner-jobs-clear-finished)))
+        (let ((suffix (should (object-assoc (car binding) 'key suffixes))))
+          (should (eq (oref suffix command) (cadr binding)))))))
   (dolist (command '(gptel-runner-jobs-create gptel-runner-jobs-edit
                      gptel-runner-job-edit-save gptel-runner-jobs-install
                      gptel-runner-jobs-disable))
-    (should-not (commandp command)))
-  (dolist (binding '(("r" gptel-runner-jobs-run)
-                     ("i" gptel-runner-jobs-diagnostics)
-                     ("x" gptel-runner-jobs-remove)
-                     ("C" gptel-runner-jobs-clear-finished)))
-    (should (eq (plist-get (cdr (transient-get-suffix 'gptel-runner-jobs-menu
-                                                     (car binding))) :command)
-                (cadr binding)))))
+    (should-not (commandp command))))
 
 (ert-deftest gptel-runner-jobs-ui-removes-only-the-selected-definition ()
   (let ((gptel-runner-job-directory (make-temp-file "runner-ui-delete-" t))
@@ -497,17 +497,20 @@
         (should remote)))))
 
 (ert-deftest gptel-runner-jobs-ui-menu-includes-state-aware-cleanup ()
-  (dolist (binding '(("x" gptel-runner-background-forget-run
-                     gptel-runner-jobs-ui--forgettable-at-point-p)
-                    ("X" gptel-runner-background-forget-workflow
-                     gptel-runner-jobs-ui--forgettable-workflow-p)
-                    ("C" gptel-runner-background-clear-finished
-                     gptel-runner-jobs-ui--finished-invocations)
-                    (":" gptel-runner-background-command)))
-    (let ((suffix (cdr (transient-get-suffix 'gptel-runner-background-menu
-                                            (car binding)))))
-      (should (eq (plist-get suffix :command) (nth 1 binding)))
-      (should (eq (plist-get suffix :inapt-if-not) (nth 2 binding))))))
+  (with-temp-buffer
+    (gptel-runner-dashboard-mode)
+    (let ((suffixes (cl-letf (((symbol-function 'gptel-runner-invocation-list) #'ignore))
+                      (transient-suffixes 'gptel-runner-background-menu))))
+      (dolist (binding '(("x" gptel-runner-background-forget-run
+                          gptel-runner-jobs-ui--forgettable-at-point-p)
+                         ("X" gptel-runner-background-forget-workflow
+                          gptel-runner-jobs-ui--forgettable-workflow-p)
+                         ("C" gptel-runner-background-clear-finished
+                          gptel-runner-jobs-ui--finished-invocations)
+                         (":" gptel-runner-background-command)))
+        (let ((suffix (should (object-assoc (car binding) 'key suffixes))))
+          (should (eq (oref suffix command) (nth 1 binding)))
+          (should (eq (oref suffix inapt-if-not) (nth 2 binding))))))))
 
 (ert-deftest gptel-runner-jobs-ui-forgotten-history-stays-hidden-until-restarted ()
   (let ((run '(:id "invocation-1" :epoch 1 :forgotten-epoch 1
