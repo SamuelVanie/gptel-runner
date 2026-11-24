@@ -150,7 +150,8 @@ or nil for calls outside repeats and older checkpoints."
   paused-at snapshot-file (generation 0) options
   (child-chats (make-hash-table :test #'equal))
   (discussions (make-hash-table :test #'equal))
-  (repeat-writes (make-hash-table :test #'equal)))
+  (repeat-writes (make-hash-table :test #'equal))
+  (output-undo (make-hash-table :test #'equal)))
 
 (defun gptel-runner--source-root (source)
   "Return the workflow root represented by SOURCE.
@@ -460,6 +461,47 @@ returns nil even when DEFAULT is non-nil."
   "Return live RUN's blackboard value for KEY, or DEFAULT."
   (gethash key (gptel-runner-run-blackboard run) default))
 
+(defconst gptel-runner--unknown-old-output (make-symbol "unavailable")
+  "Placeholder while reconstructing an older snapshot's displaced outputs.")
+
+(defun gptel-runner--remember-output-write (run node key &optional clearing)
+  "Remember what a write to KEY by NODE in RUN would displace.
+Each subtree needs only its first displaced value per key per execution.
+A composite's own publications can be undone separately from its children.
+CLEARING describes the initial removal of a try's error key before its body."
+  (let* ((table (gptel-runner-run-output-undo run))
+         (missing (make-symbol "missing"))
+         (old (gptel-runner-get run key missing))
+         (path (gptel-runner-node-path run node))
+         (writes (gptel-runner-run-repeat-writes run))
+         (unwritten
+          (cl-loop for ancestor in path
+                   for id = (gptel-runner-node-id ancestor)
+                   when (and (member key (plist-get (gptel-runner-node-properties ancestor)
+                                                    :collect-keys))
+                             (not (member key (gethash id writes))))
+                   collect (cons id (gptel-runner-iteration run id))))
+         ;; A singleton preserves a stored nil, and an empty list means absent.
+         (previous (cond ((eq old missing) nil)
+                         ((eq old gptel-runner--unknown-old-output) 'unavailable)
+                         (t (list old))))
+         (entry (list key previous unwritten)))
+    (unless clearing
+      (dolist (repeat unwritten)
+        (push key (gethash (car repeat) writes))))
+    (dolist (ancestor path)
+      (let* ((id (gptel-runner-node-id ancestor))
+             (record (copy-sequence (gethash id table)))
+             (subtree (plist-get record :subtree)))
+        (unless (assoc key subtree)
+          (setq record (plist-put record :subtree (cons entry subtree))))
+        (when (and (not clearing) (eq ancestor node)
+                   (memq (gptel-runner-node-kind node) '(parallel try)))
+          (let ((own (plist-get record :own)))
+            (unless (assoc key own)
+              (setq record (plist-put record :own (cons entry own))))))
+        (puthash id record table)))))
+
 (defun gptel-runner-put (run key value)
   "Store VALUE at KEY on RUN's blackboard and return VALUE."
   (puthash key value (gptel-runner-run-blackboard run))
@@ -468,14 +510,7 @@ returns nil even when DEFAULT is non-nil."
 
 (defun gptel-runner--put-node-output (run node key value)
   "Store VALUE at NODE's declared output KEY and record its write in RUN."
-  (when-let* ((limits (gptel-runner-run-repeat-limits run))
-              ((> (hash-table-count limits) 0)))
-    (dolist (ancestor (gptel-runner-node-path run node))
-      (when (member key (plist-get (gptel-runner-node-properties ancestor)
-                                   :collect-keys))
-        (cl-pushnew key (gethash (gptel-runner-node-id ancestor)
-                                 (gptel-runner-run-repeat-writes run))
-                    :test #'equal))))
+  (gptel-runner--remember-output-write run node key)
   (gptel-runner-put run key value))
 
 (defun gptel-runner-decisions (run)

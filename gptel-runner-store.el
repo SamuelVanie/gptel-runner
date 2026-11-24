@@ -559,6 +559,7 @@ and for nodes that execute without a gptel conversation."
       (table "repeat-writes" (gptel-runner-run-repeat-writes run) nil)
       (table "node-states" (gptel-runner-run-node-states run) nil)
       (table "node-outcomes" (gptel-runner-run-node-outcomes run) nil)
+      (table "output-undo" (gptel-runner-run-output-undo run) nil)
       (table "discussions" (gptel-runner-run-discussions run) nil)
       (literal "\n  :messages ")
       (value (cl-remove-if-not
@@ -975,6 +976,98 @@ Noninteractive shutdown relies on the best-effort `kill-emacs-hook' flush."
                         :rendered-end (plist-get record :rendered-end)
                         :discussion-wait (plist-get record :discussion-wait)))))
 
+(defun gptel-runner-store--prior-iteration-values (history prior)
+  "Return the latest recorded values through iteration PRIOR in HISTORY."
+  (let (values)
+    (when (proper-list-p history)
+      (dolist (entry history)
+        (let ((iteration (and (consp entry) (plist-get entry :iteration))))
+          ;; A nested repeat starts numbering again in each outer iteration.
+          (when (eql iteration 1) (setq values nil))
+          (when (and (integerp iteration) (<= iteration prior))
+            (setq values (append (plist-get entry :values) values))))))
+    values))
+
+(defun gptel-runner-store--infer-output-undo (run)
+  "Reconstruct displaced values from the current outcomes in an older RUN.
+Replay only executed writers against a scratch blackboard.  Keep unavailable
+values explicit so a targeted retry can reject an ambiguous checkpoint."
+  (let ((shadow (copy-gptel-runner-run run))
+        (unknown gptel-runner--unknown-old-output)
+        (last-writers (make-hash-table :test #'equal))
+        replay)
+    (setf (gptel-runner-run-blackboard shadow) (make-hash-table :test #'equal)
+          (gptel-runner-run-repeat-writes shadow) (make-hash-table :test #'equal)
+          (gptel-runner-run-options shadow) nil)
+    (cl-labels
+        ((write (node key value)
+           (when key
+             (if replay (gptel-runner--put-node-output shadow node key value)
+               ;; Old snapshots saved the final blackboard, including any
+               ;; surviving inputs, but omitted the original input map.
+               (puthash key unknown (gptel-runner-run-blackboard shadow))
+               (puthash key node last-writers))))
+         (walk (node)
+           (let* ((id (gptel-runner-node-id node))
+                  (state (gptel-runner-node-state run node))
+                  (kind (gptel-runner-node-kind node))
+                  (props (gptel-runner-node-properties node))
+                  (body (plist-get props :body))
+                  (key (gptel-runner--node-save-key node))
+                  (history (and replay (eq kind 'repeat)
+                                (eq node (gethash key last-writers))
+                                (gptel-runner-get run key))))
+             (unless (memq state '(pending skipped))
+               (when (eq kind 'try)
+                 ;; These snapshots cleared both wrapper keys on body entry.
+                 (dolist (property '(:save-as :error-as))
+                   (when-let* ((slot (plist-get props property)))
+                     (if replay
+                         (progn
+                           (gptel-runner--remember-output-write shadow node slot t)
+                           (remhash slot (gptel-runner-run-blackboard shadow)))
+                       (write node slot unknown)))))
+               (when (eq kind 'repeat)
+                 ;; The node outcomes describe only the most recent body.
+                 (let* ((completed (gptel-runner-iteration run id))
+                        (prior (if (eq (gptel-runner-node-state run body) 'succeeded)
+                                   (1- completed) completed))
+                        (earlier-values (gptel-runner-store--prior-iteration-values history prior)))
+                   (when (> prior 0)
+                     (dolist (body-key (delete-dups (gptel-runner--node-save-keys body)))
+                       (let ((entry (assoc body-key earlier-values)))
+                         (write node body-key (if entry (cdr entry) unknown))))
+                     (remhash id (gptel-runner-run-repeat-writes shadow)))))
+               (dolist (child (gptel-runner-node-children node))
+                 (walk child)
+                 (when (and (eq kind 'try) (eq child body))
+                   (let* ((outcome (gptel-runner-node-outcome run body))
+                          (status (plist-get outcome :state)))
+                     (when (memq status '(succeeded failed blocked stalled cancelled))
+                       (write node (plist-get props :error-as)
+                              (cond ((eq status 'succeeded) nil)
+                                    ((plist-member outcome :value) outcome)
+                                    (t unknown)))))))
+               (cond
+                ((eq kind 'repeat)
+                 (when (> (gptel-runner-iteration run id) 0)
+                   (write node key (or history unknown))))
+                ((and key (eq state 'succeeded))
+                 (let ((value (gptel-runner-node-result run node unknown)))
+                   (when (eq value unknown)
+                     (when-let* ((event
+                                  (cl-find-if
+                                   (lambda (event)
+                                     (and (eq (gptel-runner-event-type event) 'node-succeeded)
+                                          (equal (gptel-runner-event-node-id event) id)))
+                                   (gptel-runner-run-events run) :from-end t)))
+                       (setq value (gptel-runner-event-data event))))
+                   (write node key value))))))))
+      ;; A blackboard history is evidence only when this repeat last wrote it.
+      (walk (gptel-runner--source-root run))
+      (setq replay t)
+      (walk (gptel-runner--source-root run)))))
+
 (defun gptel-runner-store--infer-repeat-writes (run)
   "Recover known writes in RUN from a snapshot predating write tracking."
   (gptel-runner-map-nodes
@@ -1057,6 +1150,7 @@ A version 2 checkpoint restores execution state only."
                          (plist-get data :node-states))
            :node-outcomes (gptel-runner-store--alist-hash
                            (plist-get data :node-outcomes))
+           :output-undo (gptel-runner-store--alist-hash (plist-get data :output-undo))
            :chats (gptel-runner-store--alist-hash (plist-get data :chats))
            :child-chats (gptel-runner-store--alist-hash (plist-get data :child-chats))
            :discussions (gptel-runner-store--alist-hash (plist-get data :discussions))
@@ -1098,6 +1192,8 @@ A version 2 checkpoint restores execution state only."
            (cons "run" (plist-get (gptel-runner-run-options run) :context)))
      t)
     (gptel-runner--validate-discussions run)
+    (unless (plist-member data :output-undo)
+      (gptel-runner-store--infer-output-undo run))
     (unless (plist-member data :repeat-writes)
       (gptel-runner-store--infer-repeat-writes run))
     (dolist (entry (plist-get data :node-states))

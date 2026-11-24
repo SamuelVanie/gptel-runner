@@ -602,6 +602,7 @@ or directories to remain available.  New execution checks its own inputs."
 (defun gptel-runner--reset-subtree (run node)
   "Reset NODE and descendants for fresh execution in RUN.
 Repeat-local progress is cleared; collected histories and limits are kept."
+  (remhash (gptel-runner-node-id node) (gptel-runner-run-output-undo run))
   (remhash (gptel-runner-node-id node) (gptel-runner-run-discussions run))
   (gptel-runner--clear-repeat-progress run node t)
   (when (eq (gptel-runner-node-kind node) 'branch)
@@ -609,10 +610,7 @@ Repeat-local progress is cleared; collected histories and limits are kept."
              (gptel-runner-run-blackboard run)))
   (when (eq (gptel-runner-node-kind node) 'try)
     (remhash (list 'gptel-runner-try (gptel-runner-node-id node))
-             (gptel-runner-run-blackboard run))
-    (dolist (property '(:save-as :error-as))
-      (when-let* ((key (plist-get (gptel-runner-node-properties node) property)))
-        (remhash key (gptel-runner-run-blackboard run)))))
+             (gptel-runner-run-blackboard run)))
   (gptel-runner--reset-node-state run (gptel-runner-node-id node))
   (mapc (lambda (child) (gptel-runner--reset-subtree run child))
         (gptel-runner-node-children node)))
@@ -1192,9 +1190,7 @@ Return the new history entry, or nil when NODE does not collect history."
            (gptel-runner--checkpoint run))
          (reset (child)
            (when child
-             (gptel-runner--clear-workflow-results run child)
-             (gptel-runner--reset-subtree run child)
-             (gptel-runner--clear-repeat-progress run child)))
+             (gptel-runner--rewind-subtree run child)))
          (finish (state value)
            (when (live-p)
              (setq finalized t)
@@ -1259,10 +1255,12 @@ Return the new history entry, or nil when NODE does not collect history."
              (gptel-runner--execute-node run cleanup #'after-cleanup)
            (after-cleanup 'succeeded nil)))
         (_
-         (reset handler)
          (reset cleanup)
-         (dolist (property '(:save-as :error-as))
-           (when-let* ((key (plist-get props property)))
+         (reset handler)
+         (when-let* ((key (plist-get props :error-as)))
+           (if (gptel-runner-get run slot)
+               (gptel-runner--rewind-outputs run node key)
+             (gptel-runner--remember-output-write run node key t)
              (remhash key (gptel-runner-run-blackboard run))))
          (remember (list :phase 'body))
          (gptel-runner--execute-node run body #'after-body))))))
@@ -1670,9 +1668,7 @@ When CALLBACK is non-nil, replace the previous terminal callback with it."
                          (plist-get (gptel-runner-node-properties root) :finally)))
          (subtree (if (eq phase 'finalizing) finalizer root)))
     (when (eq phase 'complete)
-      (gptel-runner--clear-workflow-results run finalizer)
-      (gptel-runner--reset-subtree run finalizer)
-      (gptel-runner--clear-repeat-progress run finalizer)
+      (gptel-runner--rewind-subtree run finalizer)
       (setf (gptel-runner-run-finalization run) nil))
     (gptel-runner--prepare-terminal-repeat-bodies run subtree)
     (gptel-runner--prepare-node-states-for-resume run subtree))
@@ -1930,44 +1926,100 @@ Return an ordered plist describing the increments that were reapplied."
             (user-error "Node %S is not on an executed workflow path" node-id)))
         path))))
 
-(defun gptel-runner--prepare-retry-path (run path)
-  "Invalidate PATH's step and dependent sequence nodes in RUN.
-Completed preceding nodes and independent parallel siblings remain complete.
-Enclosing repeat histories and counters are retained."
-  (cl-labels
-      ((reset (node)
-         (gptel-runner--clear-workflow-results run node)
-         (gptel-runner--reset-subtree run node)
-         (gptel-runner--clear-repeat-progress run node))
-       (walk (remaining)
-         (let ((node (car remaining))
-               (child (cadr remaining)))
-           (if (null child)
-               (reset node)
-             (walk (cdr remaining))
-             (when (eq (gptel-runner-node-kind node) 'sequence)
-               (mapc #'reset (cdr (memq child (gptel-runner-node-children node)))))
-             (when (eq (gptel-runner-node-kind node) 'parallel)
-               (when-let* ((key (gptel-runner--node-save-key node)))
-                 (remhash key (gptel-runner-run-blackboard run))))
-             (when (eq (gptel-runner-node-kind node) 'try)
-               (let* ((props (gptel-runner-node-properties node))
-                      (slot (list 'gptel-runner-try (gptel-runner-node-id node)))
-                      (phase (cond ((eq child (plist-get props :body)) 'body)
-                                   ((eq child (plist-get props :catch)) 'catch)
-                                   (t 'finally))))
-                 (puthash slot (plist-put (gptel-runner-get run slot)
-                                          :phase phase)
-                          (gptel-runner-run-blackboard run))
-                 (when-let* ((key (plist-get props :save-as)))
-                   (remhash key (gptel-runner-run-blackboard run)))))
-             (when (eq (gptel-runner-node-kind node) 'repeat)
-               (puthash (list 'gptel-runner-retry-repeat
-                              (gptel-runner-node-id node))
-                        t (gptel-runner-run-blackboard run)))
-             (gptel-runner--reset-node-state
-              run (gptel-runner-node-id node))))))
-    (walk path)))
+(defun gptel-runner--rewind-entries (run node &optional key)
+  "Return undo entries for NODE in RUN, or only its own write to KEY."
+  (let ((record (gethash (gptel-runner-node-id node)
+                         (gptel-runner-run-output-undo run))))
+    (if key (when-let* ((entry (assoc key (plist-get record :own)))) (list entry))
+      (plist-get record :subtree))))
+
+(defun gptel-runner--rewind-outputs (run node &optional key)
+  "Undo writes from NODE's current execution in RUN.
+With KEY, undo only NODE's own write to KEY and leave its children alone."
+  (let* ((table (gptel-runner-run-output-undo run))
+         (id (gptel-runner-node-id node))
+         (record (gethash id table))
+         (own (plist-get record :own))
+         (entries (gptel-runner--rewind-entries run node key))
+         (board (gptel-runner-run-blackboard run)))
+    (dolist (entry entries)
+      (let ((key (car entry))
+            (previous (cadr entry)))
+        (if (consp previous) (puthash key (car previous) board) (remhash key board))
+        ;; A restored value from outside this iteration was never collected.
+        (dolist (repeat (nth 2 entry))
+          (when (= (cdr repeat) (gptel-runner-iteration run (car repeat)))
+            (let ((writes (gptel-runner-run-repeat-writes run)))
+              (puthash (car repeat) (remove key (gethash (car repeat) writes))
+                       writes))))))
+    (when (and key entries)
+      (puthash id (plist-put (copy-sequence record) :own (remq (car entries) own)) table))))
+
+(defun gptel-runner--rewind-subtree (run node)
+  "Restore the values displaced by NODE, then reset its execution in RUN."
+  (gptel-runner--rewind-outputs run node)
+  (gptel-runner--reset-subtree run node))
+
+(defun gptel-runner--retry-rewinds (run path)
+  "List whole subtrees and individual node writes to undo along PATH in RUN.
+Undo later writers first so each restores its immediate predecessor."
+  (let (operations)
+    (while (cdr path)
+      (let* ((node (pop path))
+             (child (car path))
+             (kind (gptel-runner-node-kind node))
+             (props (gptel-runner-node-properties node)))
+        (when (memq kind '(parallel try))
+          (when-let* ((key (plist-get props :save-as)))
+            (push (list node key) operations)))
+        (when (memq kind '(sequence try))
+          (dolist (later (reverse (cdr (memq child (gptel-runner-node-children node)))))
+            (push (list later) operations)))
+        (when (and (eq kind 'try) (eq child (plist-get props :body)))
+          (when-let* ((key (plist-get props :error-as)))
+            (push (list node key) operations)))
+        (when (and (eq kind 'finalize)
+                   (eq (plist-get (gptel-runner-run-finalization run) :phase) 'complete))
+          (push (list (plist-get props :finally)) operations))))
+    (nreverse (cons (list (car path)) operations))))
+
+(defun gptel-runner--validate-rewinds (run operations)
+  "Check that OPERATIONS in RUN can restore every displaced value.
+Snapshots that predate write tracking may omit an overwritten value."
+  (let ((old-values (make-hash-table :test #'equal)))
+    (dolist (operation operations)
+      (dolist (entry (apply #'gptel-runner--rewind-entries run operation))
+        (puthash (car entry) (cadr entry) old-values)))
+    (maphash (lambda (key previous)
+               (when (eq previous 'unavailable)
+                 (user-error (concat "Snapshot lacks the earlier value of %S. "
+                                     "Retry from a known writer or start a new run with its inputs")
+                             key)))
+             old-values)))
+
+(defun gptel-runner--prepare-retry-path (run path operations)
+  "Undo OPERATIONS and reset ancestors on PATH for a targeted retry of RUN."
+  (dolist (operation operations)
+    (if (cdr operation)
+        (apply #'gptel-runner--rewind-outputs run operation)
+      (gptel-runner--rewind-subtree run (car operation))))
+  (while (cdr path)
+    (let* ((node (pop path))
+           (child (car path))
+           (id (gptel-runner-node-id node))
+           (props (gptel-runner-node-properties node)))
+      (pcase (gptel-runner-node-kind node)
+        ('finalize (setf (gptel-runner-run-finalization run) nil))
+        ('try
+         (let ((phase (cond ((eq child (plist-get props :body)) 'body)
+                            ((eq child (plist-get props :catch)) 'catch)
+                            (t 'finally)))
+               (slot (list 'gptel-runner-try id)))
+           (puthash slot (plist-put (copy-sequence (gptel-runner-get run slot)) :phase phase)
+                    (gptel-runner-run-blackboard run))))
+        ('repeat
+         (puthash (list 'gptel-runner-retry-repeat id) t (gptel-runner-run-blackboard run))))
+      (gptel-runner--reset-node-state run id))))
 
 (cl-defun gptel-runner-retry (run &key from-node feedback callback)
   "Retry unsuccessful RUN from its safe checkpoint without changing its goal.
@@ -1980,7 +2032,9 @@ succeeds.
 FROM-NODE explicitly selects an executed agent or Elisp node by ID, even if it
 succeeded but its verdict blocked a surrounding loop.  Rerun that node and
 later sequence nodes, retaining earlier results and independent parallel
-siblings.  Enclosing repeats retain their history and consume another
+siblings.  Shared output keys regain their displaced values before retry.
+Older snapshots can lack those values, in which case retry signals an error.
+Enclosing repeats retain their history and consume another
 iteration on completion.  FEEDBACK is an optional string added to the selected
 agent's next prompt, or the next dispatched agent prompt when FROM-NODE is nil
 or selects an Elisp step.
@@ -2001,6 +2055,7 @@ use it for the retried run's next terminal transition."
       (user-error "Run %s is not retryable from state %s"
                   (gptel-runner-run-id run) state))
     (let* ((path (and from-node (gptel-runner--retry-node-path run from-node)))
+           (rewinds (and path (gptel-runner--retry-rewinds run path)))
            (failure (and (eq state 'failed)
                          (gptel-runner--terminal-failure-data run)))
            (budgets (and (eq state 'failed)
@@ -2026,6 +2081,7 @@ use it for the retried run's next terminal transition."
            (repeat-failure
             (and (listp failure)
                  (eq (plist-get failure :type) 'iteration-budget))))
+      (gptel-runner--validate-rewinds run rewinds)
       ;; Validate every needed increment before mutating any limit.
       (when (and budgets missing)
         (user-error
@@ -2053,7 +2109,7 @@ use it for the retried run's next terminal transition."
             (setq repeat-data
                   (list :node-id node-id :additional additional
                         :old-limit old-limit :new-limit new-limit))))
-        (when path (gptel-runner--prepare-retry-path run path))
+        (when path (gptel-runner--prepare-retry-path run path rewinds))
         (remhash 'gptel-runner-retry-feedback (gptel-runner-run-blackboard run))
         (when feedback
           (puthash 'gptel-runner-retry-feedback

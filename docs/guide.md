@@ -938,10 +938,12 @@ The same operation is available from Lisp:
 Use the workflow step's `:id` for `:from-node`.  This creates a fresh agent
 call against the current workspace with the original goal.  Earlier completed
 steps and independent successful parallel siblings are kept.  The selected
-node's saved result and later sequence results are cleared and recomputed;
-downstream steps wait until their prerequisites succeed.  Selecting a
-historical call retries its node in the current workflow state, not the
-historical iteration.  Repeat histories remain available, and completing the
+node and later sequence nodes recompute their results. When several steps
+save to the same key, the retry restores the value displaced by the steps
+being rerun, including a stored nil. A failed step that never wrote its
+output leaves its predecessor's value available. Downstream steps wait until
+their prerequisites succeed. Selecting a historical call retries its node
+in the current workflow state.  Repeat histories remain available, and completing the
 retried body consumes another iteration.  Existing call, request, duration,
 and repeat limits still apply.
 
@@ -950,6 +952,11 @@ the next dispatched agent prompt.  After restarting Emacs, load a saved run
 with `gptel-runner-load-run`, then use `gptel-runner-retry` with its run object
 and node ID, or select the saved agent row in the dashboard.  Durable
 recovery requires enabling `:persist t` before leaving the original session.
+Snapshots made before displaced values were recorded can recover earlier
+outputs from saved node outcomes or repeat history. If an overwritten value
+is unavailable, such as an original input missing from an older snapshot,
+targeted retry reports the key and leaves the run at its checkpoint. Start
+a new run with the original inputs when the saved data cannot recreate them.
 
 `gptel-runner-retry` deliberately rejects exhausted request, call, duration,
 and repeat limits because retrying without more capacity would immediately
