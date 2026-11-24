@@ -1095,7 +1095,12 @@
     (let* ((gptel-runner-job-preload-features
             (eval (car (get 'gptel-runner-job-preload-features 'standard-value)) t))
            (libraries (expand-file-name "libraries" gptel-runner-job-directory))
+           (editor (expand-file-name "editor-only" gptel-runner-job-directory))
+           (load-path (cons editor load-path))
            (init (expand-file-name "init.el" gptel-runner-job-directory)))
+      ;; The worker's explicit library paths exclude this editor-only package.
+      (gptel-runner-jobs--write (expand-file-name "gptel-agent.el" editor)
+                                '(provide 'gptel-agent))
       (gptel-runner-jobs--write (expand-file-name "gptel.el" libraries)
                                 '(provide 'gptel))
       (gptel-runner-jobs--write
@@ -1104,10 +1109,16 @@
           (gptel-runner-elisp-step
            :id 'inspect :function (lambda (_run _node) (featurep 'gptel))
            :save-as 'loaded)))
+      (should (equal (plist-get (gptel-runner-register-job
+                                 "empty-path" :workflow 'plain-job :init-file init
+                                 :load-path nil)
+                                :preload-features)
+                     '(gptel)))
       (let* ((job (gptel-runner-register-job
                    "plain-job" :workflow 'plain-job :init-file init
                    :load-path (list libraries) :base-directory gptel-runner-job-directory))
              (run (gptel-runner-jobs-test--finished (gptel-runner-job-run job))))
+        (should (equal (plist-get job :preload-features) '(gptel)))
         (should (eq (plist-get run :state) 'succeeded))
         (should (eq (gptel-runner-get run 'loaded) t)))
       ;; An explicitly requested companion stays mandatory on the next launch.
@@ -1165,7 +1176,8 @@
    (let* ((libraries (expand-file-name "libraries" gptel-runner-job-directory))
           (dependencies (expand-file-name "dependencies" gptel-runner-job-directory))
           (gptel-runner-job-load-path (list libraries))
-          (gptel-runner-job-preload-features '(gptel gptel-agent))
+          (gptel-runner-job-preload-features
+           (eval (car (get 'gptel-runner-job-preload-features 'standard-value)) t))
           (load-path (cons dependencies load-path))
           (parent-features (mapcar #'featurep '(gptel gptel-agent)))
           invocations)
@@ -1187,6 +1199,11 @@
            (setq runner-test-bootstrap-update
                  (list gptel-agent-dirs (emacs-pid))))
          (provide 'gptel-agent)))
+     ;; A user's list (including nil) overrides automatic companion discovery.
+     (dolist (choice '(nil (gptel)))
+       (let ((gptel-runner-job-preload-features choice))
+         (should (equal (plist-get (gptel-runner-jobs-test--job) :preload-features)
+                        choice))))
      (dolist (label '(first second))
        (let ((init (expand-file-name (format "%s-init.el" label)
                                      gptel-runner-job-directory)))

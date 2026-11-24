@@ -1234,13 +1234,14 @@ Cleanup uses the job ID, so jobs that share a workflow can be cleared
 independently. Saved results and chats stay on disk. Use `C-u C` to delete
 the cleared runs' recovery checkpoints as well.
 
-New jobs preload `gptel` **before** the job's `:init-file`. For jobs that
-use gptel-agent, register the job with `:preload-features '(gptel gptel-agent)`.
-The worker then calls `gptel-agent-update` to discover agent definitions
-and refresh the package's standard presets. Your init file runs afterward
-and has final authority over configuration and preset overrides. If it
-changes `gptel-agent-dirs`, call `gptel-agent-update` there to discover those
-additional definitions.  This bootstrap runs on every worker start,
+New jobs preload `gptel` **before** the job's `:init-file`. When saving a
+new job, Runner also includes `gptel-agent` if it finds the library on
+the worker's search path. In that case the worker calls `gptel-agent-update`
+to discover agent definitions and refresh the package's standard presets.
+Your init file runs afterward and has final authority over configuration
+and preset overrides. If it changes `gptel-agent-dirs`, call
+`gptel-agent-update` there to discover those additional definitions.
+This bootstrap runs on every worker start,
 including checkpoint recovery.  Other agent files still need explicit
 runner registrations if they are used as pipeline steps.
 
@@ -1254,12 +1255,14 @@ configure this once before saving jobs:
 (setq gptel-runner-job-load-path '("~/projects/gptel-agent/"))
 ```
 
-The captured paths and `gptel-runner-job-preload-features` (default
-`'(gptel)`) are stored as `:load-path` and `:preload-features`.
-Existing values survive job updates and schedule changes. Supply either key
-explicitly to replace it. To remove gptel-agent from a saved job, register it again with
-`:preload-features '(gptel)`. Set `:preload-features nil` to disable automatic
-package loading and agent discovery for fake-driver or standalone jobs.
+The default value of `gptel-runner-job-preload-features` is `auto`. Set it
+to a list to choose the required packages for new jobs. Each job stores
+its library paths and resolved list as `:load-path` and `:preload-features`.
+These values survive job updates and schedule changes. Supply either key
+explicitly to replace it. For example, to remove gptel-agent from a saved
+job, register it again with `:preload-features '(gptel)`. Set
+`:preload-features nil` to disable package loading and agent discovery for
+fake-driver or standalone jobs.
 Jobs created before this bootstrap was added must be re-saved once from
 your configured Emacs to capture the new fields for future invocations.
 Existing invocation histories retain their original init-controlled loading

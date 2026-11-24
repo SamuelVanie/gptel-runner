@@ -45,13 +45,16 @@
   "Absolute Emacs executable used for background jobs."
   :type 'file)
 
-(defcustom gptel-runner-job-preload-features '(gptel)
+(defcustom gptel-runner-job-preload-features 'auto
   "Packages loaded in new job workers before their initialization file.
-Saving a job captures this value as :preload-features.  An explicit job
-value overrides it, including nil for fake-driver or other standalone jobs.
+With `auto', saving a new job selects gptel and includes gptel-agent when
+its library is on the worker's search path.  A list selects the required
+features explicitly, including nil for standalone jobs.  The job captures
+the selected list as :preload-features.  An explicit job value overrides it.
 When gptel-agent is included, its definitions are refreshed before the
 initialization file, so that file has final authority over presets."
-  :type '(repeat symbol))
+  :type '(choice (const :tag "Detect gptel-agent when saving a job" auto)
+                 (repeat symbol)))
 
 (defcustom gptel-runner-job-load-path nil
   "Extra Lisp library directories captured when saving a new job.
@@ -225,11 +228,14 @@ workers do not search a different workspace for packages."
                       (member absolute result))
             (push absolute result)))))))
 
-(defun gptel-runner-jobs--bootstrap-value (job old key default)
-  "Resolve bootstrap KEY from JOB, OLD, or DEFAULT, preserving explicit nil."
-  (copy-tree (cond ((plist-member job key) (plist-get job key))
-                   ((plist-member old key) (plist-get old key))
-                   (t default))))
+(defun gptel-runner-jobs--default-preloads (paths)
+  "Return new job preloads for the external library PATHS saved for a worker."
+  (cond ((not (eq gptel-runner-job-preload-features 'auto))
+         (copy-tree gptel-runner-job-preload-features))
+        ((locate-library "gptel-agent" nil
+                         (append paths (list gptel-runner-jobs--package-directory)))
+         (list 'gptel 'gptel-agent))
+        (t (list 'gptel))))
 
 (defun gptel-runner-job-save (job)
   "Validate and save JOB, a plist, and return its saved definition.
@@ -261,14 +267,16 @@ loading the initialization file."
                                    (plist-get old :base-directory)
                                    default-directory))))
          (emacs (or (plist-get job :emacs) gptel-runner-job-emacs-program))
-         (preloads (gptel-runner-jobs--bootstrap-value
-                    job old :preload-features gptel-runner-job-preload-features))
-         (paths (if (or (plist-member job :load-path)
-                        (plist-member old :load-path))
-                    (gptel-runner-jobs--library-paths
-                     (gptel-runner-jobs--bootstrap-value job old :load-path nil) base)
+         ;; Explicit bootstrap fields take precedence over saved ones,
+         ;; including when their value is nil.
+         (bootstrap (append job old))
+         (paths (if-let* ((entry (plist-member bootstrap :load-path)))
+                    (gptel-runner-jobs--library-paths (cadr entry) base)
                   (gptel-runner-jobs--library-paths
-                   (append gptel-runner-job-load-path load-path)))))
+                   (append gptel-runner-job-load-path load-path))))
+         (preloads (if-let* ((entry (plist-member bootstrap :preload-features)))
+                       (copy-tree (cadr entry))
+                     (gptel-runner-jobs--default-preloads paths))))
     (unless (and (stringp init) (file-readable-p init)
                  (not (file-directory-p init)))
       (error "Job initialization file is not readable: %S" init))
