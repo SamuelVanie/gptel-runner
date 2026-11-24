@@ -758,6 +758,16 @@ Call under the invocation control lock, and retain it while writing."
          (equal (plist-get invocation :epoch) (plist-get fresh :epoch))
          fresh)))
 
+(defun gptel-runner-jobs--finish-pending-receipt (file receipt reason)
+  "Finalize pending RECEIPT in FILE with REASON.
+A processing command may have taken effect before its worker stopped."
+  (setq receipt (plist-put receipt :status
+                           (if (eq (plist-get receipt :status) 'processing)
+                               'indeterminate 'rejected))
+        receipt (plist-put receipt :error reason)
+        receipt (plist-put receipt :finished-at (float-time)))
+  (gptel-runner-jobs--write file receipt))
+
 (defun gptel-runner-jobs--fail-receipt (file invocation reason)
   "Finalize pending receipt FILE if it belongs to INVOCATION, using REASON."
   (let ((receipt (gptel-runner-jobs--read file)))
@@ -765,14 +775,7 @@ Call under the invocation control lock, and retain it while writing."
                (or (not (plist-member receipt :invocation))
                    (equal (plist-get receipt :invocation) (plist-get invocation :id)))
                (memq (plist-get receipt :status) '(queued processing)))
-      ;; A processing receipt was committed before attempting the operation.
-      ;; Its effects may already be visible even if its acknowledgment is not.
-      (let ((status (if (eq (plist-get receipt :status) 'processing)
-                        'indeterminate 'rejected)))
-        (setq receipt (plist-put receipt :status status)
-              receipt (plist-put receipt :error reason)
-              receipt (plist-put receipt :finished-at (float-time)))
-        (gptel-runner-jobs--write file receipt)))))
+      (gptel-runner-jobs--finish-pending-receipt file receipt reason))))
 
 (defun gptel-runner-jobs--close-failed (invocation state reason)
   "Resolve INVOCATION's pending commands and publish failure STATE and REASON.
@@ -904,6 +907,11 @@ invocation is recorded as skipped without starting another worker."
   (expand-file-name (concat "receipts/" (gptel-runner-jobs--valid-id id) ".el")
                     (plist-get invocation :directory)))
 
+(defun gptel-runner-jobs--command-file (invocation id)
+  "Return the worker inbox path for command ID in INVOCATION."
+  (expand-file-name (concat "commands/" (gptel-runner-jobs--valid-id id) ".el")
+                    (plist-get invocation :directory)))
+
 (defun gptel-runner-job-command-status (invocation command-id)
   "Read the receipt for COMMAND-ID sent to INVOCATION or its ID."
   (when (stringp invocation) (setq invocation (gptel-runner-invocation-get invocation)))
@@ -977,6 +985,26 @@ invocation is recorded as skipped without starting another worker."
       (unless (plist-get arguments key)
         (error "%s requires %S" operation key)))))
 
+(defun gptel-runner-jobs--submit-command (invocation command receipt)
+  "Publish COMMAND and its RECEIPT under INVOCATION's control lock."
+  (let* ((id (plist-get command :id))
+         (receipt-file (gptel-runner-jobs--receipt-file invocation id))
+         (command-file (gptel-runner-jobs--command-file invocation id)))
+    (condition-case err
+        (progn
+          (gptel-runner-jobs--write receipt-file receipt)
+          (gptel-runner-jobs--write command-file command))
+      (error
+       ;; The worker polls without this lock and retains the immutable
+       ;; command file.  A write error after rename can race acknowledgment.
+       (unless (and (file-exists-p command-file)
+                    (equal command (gptel-runner-jobs--read command-file)))
+         (when (file-exists-p receipt-file)
+           (gptel-runner-jobs--fail-receipt
+            receipt-file invocation
+            (format "Command submission failed: %s" (error-message-string err))))
+         (signal (car err) (cdr err)))))))
+
 (defun gptel-runner-job-command (invocation operation &optional arguments)
   "Send typed OPERATION with ARGUMENTS to INVOCATION or its ID.
 Return a queued receipt; inspect completion with
@@ -1035,10 +1063,7 @@ inside a newly launched worker, never inside the caller's Emacs."
 				 :invocation (plist-get invocation :id)
 				 :epoch (plist-get invocation :epoch)))
              (gptel-runner-jobs--write sequence-file sequence)
-             (gptel-runner-jobs--write (gptel-runner-jobs--receipt-file invocation id) receipt)
-             (gptel-runner-jobs--write
-              (expand-file-name (concat "commands/" id ".el")
-				(plist-get invocation :directory)) command))))
+             (gptel-runner-jobs--submit-command invocation command receipt))))
       (error
        (when restart (gptel-runner-jobs--launch-failed invocation err))
        (signal (car err) (cdr err))))
@@ -1393,14 +1418,27 @@ Opaque runtime objects and circular references are represented by type."
             (gptel-runner-jobs--write receipt-file receipt)))))))
 
 (defun gptel-runner-jobs--abandoned-receipts ()
-  "Mark commands interrupted by an earlier worker as indeterminate."
-  (let ((directory (expand-file-name "receipts" (plist-get gptel-runner-jobs--invocation :directory))))
+  "Settle interrupted submissions and acknowledgments through this epoch.
+Call under the control lock while the worker is idle, so a submitter cannot
+still be publishing a queued receipt's command."
+  (let* ((invocation gptel-runner-jobs--invocation)
+         (directory (expand-file-name "receipts" (plist-get invocation :directory))))
     (when (file-directory-p directory)
       (dolist (file (directory-files directory t "\\.el\\'"))
-        (let ((receipt (gptel-runner-jobs--read file)))
-          (when (eq (plist-get receipt :status) 'processing)
-            (gptel-runner-jobs--write
-             file (plist-put receipt :status 'indeterminate))))))))
+        (let* ((receipt (gptel-runner-jobs--read file))
+               (epoch (plist-get receipt :epoch)))
+          (when (and (natnump epoch) (<= epoch (plist-get invocation :epoch))
+                     (or (not (plist-member receipt :invocation))
+                         (equal (plist-get receipt :invocation) (plist-get invocation :id))))
+            (pcase (plist-get receipt :status)
+              ('processing
+               (gptel-runner-jobs--finish-pending-receipt
+                file receipt "Worker stopped before acknowledging the command"))
+              ('queued
+               (unless (file-exists-p (gptel-runner-jobs--command-file
+                                       invocation (plist-get receipt :id)))
+                 (gptel-runner-jobs--finish-pending-receipt
+                  file receipt "Submission interrupted before command publication"))))))))))
 
 (defun gptel-runner-jobs--unsupported-input (&rest _arguments)
   "Fail synchronous input attempts instead of reading worker stdin."
@@ -1554,7 +1592,8 @@ initialization or persistence error.  This function does not call `kill-emacs'."
               (setf (gptel-runner-run-snapshot-file gptel-runner-jobs--run)
                     (expand-file-name "checkpoint.el" directory))
               (gptel-runner-jobs--flush)
-              (gptel-runner-jobs--abandoned-receipts)
+              (gptel-runner-jobs--with-control-lock
+               gptel-runner-jobs--invocation #'gptel-runner-jobs--abandoned-receipts)
               (while (not finished)
                 (gptel-runner-jobs--commands)
                 (gptel-runner--drain-queue gptel-runner-jobs--run)
@@ -1569,6 +1608,7 @@ initialization or persistence error.  This function does not call `kill-emacs'."
                      ;; before close either apply here or launch a new owner.
                      (gptel-runner-jobs--commands)
                      (when (gptel-runner--run-terminal-p gptel-runner-jobs--run)
+                       (gptel-runner-jobs--abandoned-receipts)
                        (setq gptel-runner-jobs--invocation
                              (plist-put gptel-runner-jobs--invocation :phase 'closing))
                        (gptel-runner-jobs--flush)

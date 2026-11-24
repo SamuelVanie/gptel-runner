@@ -453,6 +453,9 @@
      (setq invocation (gptel-runner-jobs-test--input invocation))
      (let ((receipt-file (gptel-runner-jobs--receipt-file invocation "ambiguous")))
        (gptel-runner-jobs--write receipt-file '(:id "ambiguous" :status processing :epoch 1)))
+     (gptel-runner-jobs--write
+      (gptel-runner-jobs--receipt-file invocation "unsubmitted")
+      '(:id "unsubmitted" :status queued :epoch 1))
      (delete-process (car gptel-runner-jobs-test--processes))
      (accept-process-output nil 0.1)
      (should (eq (plist-get (car (gptel-runner-invocation-list)) :state) 'interrupted))
@@ -461,6 +464,8 @@
      (should (= 2 (plist-get invocation :epoch)))
      (should (eq (plist-get (gptel-runner-job-command-status invocation "ambiguous") :status)
                  'indeterminate))
+     (should (eq (plist-get (gptel-runner-job-command-status invocation "unsubmitted") :status)
+                 'rejected))
      (gptel-runner-jobs-test--command invocation 'cancel)
      (gptel-runner-jobs-test--finished invocation))))
 
@@ -546,6 +551,69 @@
      (should (equal (nreverse operations) '(pause resume)))
      (dolist (id ids)
        (should (eq (plist-get (gptel-runner-job-command-status invocation id) :status) 'applied))))))
+
+(ert-deftest gptel-runner-jobs-live-submission-failure-and-retry ()
+  (gptel-runner-jobs-test--isolated
+    (let* ((invocation (gptel-runner-jobs-test--input
+                        (gptel-runner-job-run
+                         (gptel-runner-jobs-test--job 'background-example-feedback))))
+           (write (symbol-function 'gptel-runner-jobs--write))
+           (args '(:text "Keep the report"))
+           failed acknowledged)
+      (cl-letf (((symbol-function 'gptel-runner-jobs--write)
+                 (lambda (file data)
+                   (if (string-match-p "/commands/" file)
+                       (signal 'file-error '("Injected inbox write failure"))
+                     (funcall write file data)))))
+        (should-error (gptel-runner-job-command invocation 'decision args) :type 'file-error))
+      (setq failed (car (gptel-runner-invocation-commands invocation)))
+      (should (eq (plist-get failed :status) 'rejected))
+      (should (string-match-p "Injected inbox write failure" (plist-get failed :error)))
+      (should (numberp (plist-get failed :finished-at)))
+      ;; The worker can acknowledge the retry while its submitter still has
+      ;; the control lock.  Simulate a write reporting failure after rename.
+      (cl-letf (((symbol-function 'gptel-runner-jobs--write)
+                 (lambda (file data)
+                   (prog1 (funcall write file data)
+                     (when (string-match-p "/commands/" file)
+                       (let ((id (plist-get data :id)))
+                         (gptel-runner-jobs-test--wait
+                          invocation
+                          (lambda (_)
+                            (eq (plist-get (gptel-runner-job-command-status invocation id)
+                                           :status)
+                                'applied)))
+                         (setq acknowledged t))
+                       (signal 'file-error '("Injected post-publication failure")))))))
+        (let ((retry (gptel-runner-jobs-test--command invocation 'decision args)))
+          (should (> (plist-get retry :sequence) (plist-get failed :sequence)))))
+      (should acknowledged)
+      ;; A client can disappear between the receipt and inbox writes.
+      (gptel-runner-jobs--write
+       (gptel-runner-jobs--receipt-file invocation "abandoned")
+       (list :id "abandoned" :epoch 1 :status 'queued :operation 'cancel))
+      (let ((call (car (last (plist-get invocation :calls)))))
+        (gptel-runner-jobs-test--command
+         invocation 'accept (list :call-id (plist-get call :id) :call-epoch 1 :result "OK")))
+      (should (eq (plist-get (gptel-runner-jobs-test--finished invocation) :state) 'succeeded))
+      (should (equal failed (gptel-runner-job-command-status invocation (plist-get failed :id))))
+      (let ((abandoned (gptel-runner-job-command-status invocation "abandoned")))
+        (should (eq (plist-get abandoned :status) 'rejected))
+        (should (numberp (plist-get abandoned :finished-at)))))))
+
+(ert-deftest gptel-runner-jobs-published-restart-survives-write-error ()
+  (gptel-runner-jobs-test--isolated
+    (let* ((first (gptel-runner-jobs-test--finished
+                   (gptel-runner-job-run (gptel-runner-jobs-test--job))))
+           (write (symbol-function 'gptel-runner-jobs--write)))
+      (cl-letf (((symbol-function 'gptel-runner-jobs--write)
+                 (lambda (file data)
+                   (prog1 (funcall write file data)
+                     (when (string-match-p "/commands/" file)
+                       (signal 'file-error '("Injected post-publication failure")))))))
+        (let ((retry (gptel-runner-jobs-test--command first 'rerun)))
+          (should (= (plist-get retry :epoch) 2))))
+      (should (eq (plist-get (gptel-runner-jobs-test--finished first) :state) 'succeeded)))))
 
 (ert-deftest gptel-runner-jobs-restart-write-failure-releases-reservation ()
   (dolist (failure '(manifest receipt command))
