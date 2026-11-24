@@ -244,7 +244,7 @@
       (let ((run (gptel-runner-start
                   (gptel-runner-repeat-until
                    :id 'repeat :max 2 :until (lambda (_run) (= count 2))
-                   :collect-keys '(result) :save-history-as 'history
+                   :collect-keys '(result failure) :save-history-as 'history
                    :body (gptel-runner-try
                           :save-as 'result :error-as 'failure
                           :body (gptel-runner-try-test--step
@@ -261,8 +261,45 @@
         (should (= cleaned 2))
         (should-not (gptel-runner-get run 'failure))
         (should (equal (gptel-runner-get run 'history)
-                       '((:iteration 1 :values ((result . fallback)))
-                         (:iteration 2 :values ((result . ok))))))))))
+                       '((:iteration 1 :values ((result . fallback)
+                                                 (failure :node body :state failed
+                                                          :value (:type elisp-error
+                                                                  :error (error "first")))))
+                         (:iteration 2 :values ((result . ok) (failure))))))))))
+
+(ert-deftest gptel-runner-try-collects-error-during-checkpoint-recovery ()
+  (dolist (legacy '(nil t))
+    (gptel-runner-elisp-test--isolated
+      (gptel-runner-register-agent 'worker)
+      (gptel-runner-defworkflow collect-recovery ()
+        (gptel-runner-repeat-until
+         :id 'repeat :max 1
+         :until (lambda (run) (= (gptel-runner-iteration run 'repeat) 1))
+         :collect-keys '(failure result) :save-history-as 'history
+         :body (gptel-runner-try
+                :id 'try :error-as 'failure :save-as 'result
+                :body (gptel-runner-try-test--step 'body (lambda (&rest _) (error "failed")))
+                :catch (gptel-runner-agent-step :id 'catch :agent 'worker :prompt "recover"))))
+      (let ((driver (gptel-runner-fake-driver-create)))
+        (gptel-runner-fake-queue driver 'worker '(:manual t) '(:value "recovered"))
+        (let* ((run (gptel-runner-start 'collect-recovery :driver driver))
+               (error-value (gptel-runner-get run 'failure)))
+          (should (eq (plist-get error-value :state) 'failed))
+          (gptel-runner-pause-run run)
+          (gptel-runner-store-flush-run run)
+          (let ((file (gptel-runner-run-snapshot-file run)))
+            (gptel-runner-forget-run run)
+            (when legacy
+              (let* ((snapshot (gptel-runner-store--read-file file))
+                     (data (plist-get snapshot :run)))
+                (cl-remf data :repeat-writes)
+                (setf (plist-get snapshot :run) data)
+                (with-temp-file file (prin1 snapshot (current-buffer)))))
+            (setq run (gptel-runner-load-run file nil driver)))
+          (gptel-runner-resume-run run)
+          (should (equal (gptel-runner-get run 'history)
+                         `((:iteration 1 :values ((failure . ,error-value)
+                                                 (result . "recovered")))))))))))
 
 (ert-deftest gptel-runner-try-validates-shape-and-parallel-error-keys ()
   (gptel-runner-elisp-test--isolated

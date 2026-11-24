@@ -63,6 +63,31 @@ optionally tracks inner progress.  Both loops collect the worker's result."
         (should (= (gptel-runner-iteration run 'inner) 2))
         (gptel-runner-nested-repeat-test--assert-history run)))))
 
+(ert-deftest gptel-runner-nested-repeat-collects-only-actual-iteration-writes ()
+  (gptel-runner-elisp-test--isolated
+    (let* ((inner
+            (gptel-runner-repeat-until
+             :id 'inner :max 2
+             :until (lambda (run)
+                      (or (= (gptel-runner-iteration run 'outer) 1)
+                          (= (gptel-runner-iteration run 'inner) 2)))
+             :collect-keys '(answer) :save-history-as 'inner-history
+             :body (gptel-runner-branch
+                    :predicate (lambda (run) (zerop (gptel-runner-iteration run 'inner)))
+                    :then (gptel-runner-elisp-step :function #'ignore :save-as 'answer))))
+           (run (gptel-runner-start
+                 (gptel-runner-repeat-until
+                  :id 'outer :max 2 :body inner
+                  :until (lambda (run) (= (gptel-runner-iteration run 'outer) 2))
+                  :collect-keys '(answer inner-history) :save-history-as 'outer-history)))
+           (inner-history '((:iteration 1 :values ((answer)))
+                            (:iteration 2 :values nil))))
+      (should (eq (gptel-runner-run-state run) 'succeeded))
+      (should (equal (gptel-runner-get run 'inner-history) inner-history))
+      (should (equal (gptel-runner-get run 'outer-history)
+                     `((:iteration 1 :values ((answer) (inner-history . ,inner-history)))
+                       (:iteration 2 :values nil)))))))
+
 (ert-deftest gptel-runner-nested-repeat-clears-progress-between-executions ()
   (gptel-runner-elisp-test--isolated
     (gptel-runner-register-agent 'worker)

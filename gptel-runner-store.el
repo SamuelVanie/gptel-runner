@@ -556,6 +556,7 @@ and for nodes that execute without a gptel conversation."
       (literal "\n  :state ")
       (value (gptel-runner-run-state run) "run state")
       (table "blackboard" (gptel-runner-run-blackboard run) t)
+      (table "repeat-writes" (gptel-runner-run-repeat-writes run) nil)
       (table "node-states" (gptel-runner-run-node-states run) nil)
       (table "node-outcomes" (gptel-runner-run-node-outcomes run) nil)
       (table "discussions" (gptel-runner-run-discussions run) nil)
@@ -974,6 +975,42 @@ Noninteractive shutdown relies on the best-effort `kill-emacs-hook' flush."
                         :rendered-end (plist-get record :rendered-end)
                         :discussion-wait (plist-get record :discussion-wait)))))
 
+(defun gptel-runner-store--infer-repeat-writes (run)
+  "Recover known writes in RUN from a snapshot predating write tracking."
+  (gptel-runner-map-nodes
+   (lambda (repeat)
+     (let* ((props (gptel-runner-node-properties repeat))
+            (keys (plist-get props :collect-keys))
+            (body (plist-get props :body)))
+       (when (and keys
+                  (memq (gptel-runner-node-state run repeat)
+                        '(running failed blocked stalled cancelled))
+                  ;; A completed body may already have been collected before
+                  ;; the repeat stopped at its verdict or iteration limit.
+                  (or (zerop (gptel-runner-iteration run (gptel-runner-node-id repeat)))
+                      (not (eq (gptel-runner-node-state run body) 'succeeded))))
+         (let (written)
+           (dolist (node (gptel-runner-list-nodes body))
+             (let* ((kind (gptel-runner-node-kind node))
+                    (state (gptel-runner-node-state run node))
+                    (id (gptel-runner-node-id node))
+                    (key (gptel-runner--node-save-key node))
+                    (error-key (plist-get (gptel-runner-node-properties node) :error-as)))
+               (when (and (member key keys)
+                          (if (eq kind 'repeat)
+                              (> (gptel-runner-iteration run id) 0)
+                            (eq state 'succeeded)))
+                 (cl-pushnew key written :test #'equal))
+               (when (and (member error-key keys)
+                          (or (memq state '(succeeded failed blocked stalled))
+                              (memq (plist-get (gptel-runner-get run (list 'gptel-runner-try id))
+                                               :phase)
+                                    '(catch finally complete))))
+                 (cl-pushnew error-key written :test #'equal))))
+           (puthash (gptel-runner-node-id repeat) written
+                    (gptel-runner-run-repeat-writes run))))))
+   run))
+
 (defun gptel-runner-load-run (file &optional callback driver)
   "Open the run saved in FILE using CALLBACK and DRIVER.
 The workflow and agents must already be registered.  Its node conversations
@@ -1025,6 +1062,8 @@ A version 2 checkpoint restores execution state only."
            :discussions (gptel-runner-store--alist-hash (plist-get data :discussions))
            :iterations (gptel-runner-store--alist-hash
                         (plist-get data :iterations))
+           :repeat-writes (gptel-runner-store--alist-hash
+                           (plist-get data :repeat-writes))
            :repeat-limits repeat-limits
            :events (plist-get data :messages) :budget budget
            :driver (or driver gptel-runner-default-driver
@@ -1059,6 +1098,8 @@ A version 2 checkpoint restores execution state only."
            (cons "run" (plist-get (gptel-runner-run-options run) :context)))
      t)
     (gptel-runner--validate-discussions run)
+    (unless (plist-member data :repeat-writes)
+      (gptel-runner-store--infer-repeat-writes run))
     (dolist (entry (plist-get data :node-states))
       (unless (gptel-runner-store--node root (car entry))
         (user-error "Snapshot node %S is absent from workflow %S"

@@ -149,7 +149,8 @@ or nil for calls outside repeats and older checkpoints."
   duration-timer duration-remaining active-started-at
   paused-at snapshot-file (generation 0) options
   (child-chats (make-hash-table :test #'equal))
-  (discussions (make-hash-table :test #'equal)))
+  (discussions (make-hash-table :test #'equal))
+  (repeat-writes (make-hash-table :test #'equal)))
 
 (defun gptel-runner--source-root (source)
   "Return the workflow root represented by SOURCE.
@@ -464,6 +465,18 @@ returns nil even when DEFAULT is non-nil."
   (puthash key value (gptel-runner-run-blackboard run))
   (gptel-runner--checkpoint run)
   value)
+
+(defun gptel-runner--put-node-output (run node key value)
+  "Store VALUE at NODE's declared output KEY and record its write in RUN."
+  (when-let* ((limits (gptel-runner-run-repeat-limits run))
+              ((> (hash-table-count limits) 0)))
+    (dolist (ancestor (gptel-runner-node-path run node))
+      (when (member key (plist-get (gptel-runner-node-properties ancestor)
+                                   :collect-keys))
+        (cl-pushnew key (gethash (gptel-runner-node-id ancestor)
+                                 (gptel-runner-run-repeat-writes run))
+                    :test #'equal))))
+  (gptel-runner-put run key value))
 
 (defun gptel-runner-decisions (run)
   "Return a copy of RUN's ordered decision log."

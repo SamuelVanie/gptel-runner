@@ -852,9 +852,12 @@ runner appends an entry to `review-history`:
 ```
 
 Entries and collected keys retain declaration order, including the final
-successful iteration.  A key is omitted when its producing node was skipped
-in that iteration, even if an older value for the key remains on the
-blackboard.  Collected structured values are copied when captured so later
+successful iteration.  Each entry includes the keys that workflow nodes wrote
+during that iteration, including writes inside nested repeats.  A try with
+`:error-as` records its body's error when a handler recovers, and records a
+present nil when the body succeeds.  Skipped writers and reused results from
+a previously collected iteration contribute no entry for their key.
+Collected structured values are copied when captured so later
 iterations cannot mutate earlier list or vector data.  Because the history is
 an ordinary blackboard value, durable snapshots preserve it and downstream
 prompt functions read it with `gptel-runner-get`.

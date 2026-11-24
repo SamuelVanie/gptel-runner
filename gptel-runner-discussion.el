@@ -65,7 +65,7 @@ NODE can be a workflow node or its identifier.  Return nil at a boundary."
          (node (gptel-runner-call-node call))
          (handoff (and (stringp raw) (gptel-runner-handoff-p run node) raw)))
     (when-let* ((key (plist-get (gptel-runner-node-properties node) :save-as)))
-      (gptel-runner-put run key parsed))
+      (gptel-runner--put-node-output run node key parsed))
     (gptel-runner--set-node-state run node 'succeeded parsed handoff)
     (when handoff
       (let ((next (gptel-runner--adjacent-agent run node nil)))

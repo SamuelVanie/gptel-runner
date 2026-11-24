@@ -880,7 +880,7 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
                         (launch))
                     (when (eq state 'succeeded)
                       (when-let* ((key (plist-get props :save-as)))
-                        (gptel-runner-put run key value)))
+                        (gptel-runner--put-node-output run node key value)))
                     (gptel-runner--set-node-state run node state value)
                     (funcall done state value))))))))
       (gptel-runner--set-node-state run node 'running)
@@ -971,23 +971,14 @@ the error handler so errors in later nodes are not attributed to this function."
              (follow arm)))
          done)))))
 
-(defun gptel-runner--node-key-succeeded-p (run node key)
-  "Return non-nil when NODE or a descendant wrote KEY successfully in RUN."
-  (or (and (equal (gptel-runner--node-save-key node) key)
-           (eq (gethash (gptel-runner-node-id node)
-                        (gptel-runner-run-node-states run) 'pending)
-               'succeeded))
-      (cl-some (lambda (child)
-                 (gptel-runner--node-key-succeeded-p run child key))
-               (gptel-runner-node-children node))))
-
 (defun gptel-runner--collect-repeat-history (run node iteration)
   "Append NODE's configured blackboard snapshot for ITERATION in RUN.
 Return the new history entry, or nil when NODE does not collect history."
   (let* ((props (gptel-runner-node-properties node))
          (keys (plist-get props :collect-keys))
          (history-key (plist-get props :save-history-as))
-         (body (plist-get props :body)))
+         (writes (gptel-runner-run-repeat-writes run))
+         (id (gptel-runner-node-id node)))
     (when keys
       (let ((missing (make-symbol "missing"))
             values)
@@ -995,11 +986,12 @@ Return the new history entry, or nil when NODE does not collect history."
           (let ((value (gethash key (gptel-runner-run-blackboard run)
                                 missing)))
             (when (and (not (eq value missing))
-                       (gptel-runner--node-key-succeeded-p run body key))
+                       (member key (gethash id writes)))
               (push (cons key (copy-tree value t)) values))))
         (let ((entry (list :iteration iteration :values (nreverse values))))
-          (gptel-runner-put
-           run history-key
+          (remhash id writes)
+          (gptel-runner--put-node-output
+           run node history-key
            (append (gptel-runner-get run history-key) (list entry)))
           entry)))))
 
@@ -1093,7 +1085,7 @@ Return the new history entry, or nil when NODE does not collect history."
           (unless finalized
             (setq finalized t)
             (when-let* ((key (plist-get props :save-as)))
-              (gptel-runner-put run key value))
+              (gptel-runner--put-node-output run node key value))
             (gptel-runner--set-node-state run node state value)
             (funcall done state value)))
          (cancel-others
@@ -1176,7 +1168,7 @@ Return the new history entry, or nil when NODE does not collect history."
              (when (eq state 'succeeded)
                (remember (list :phase 'complete :state state :value value))
                (when-let* ((key (plist-get props :save-as)))
-                 (gptel-runner-put run key value)))
+                 (gptel-runner--put-node-output run node key value)))
              (gptel-runner--set-node-state run node state value)
              (funcall done state value)))
          (cancel (state value)
@@ -1213,10 +1205,10 @@ Return the new history entry, or nil when NODE does not collect history."
          (after-body (state value)
            (when (live-p)
              (when-let* ((key (plist-get props :error-as)))
-               (gptel-runner-put
-                run key (unless (eq state 'succeeded)
-                          (list :node (gptel-runner-node-id body)
-                                :state state :value value))))
+               (gptel-runner--put-node-output
+                run node key (unless (eq state 'succeeded)
+                               (list :node (gptel-runner-node-id body)
+                                     :state state :value value))))
              (cond
               ((eq state 'cancelled) (cancel state value))
               ((and handler (memq state states))
@@ -2081,6 +2073,7 @@ Include descendants unless NODE-ONLY is non-nil.  Keep histories and limits."
         (node)
         (when (eq (gptel-runner-node-kind node) 'repeat)
           (remhash (gptel-runner-node-id node) (gptel-runner-run-iterations run))
+          (remhash (gptel-runner-node-id node) (gptel-runner-run-repeat-writes run))
           (remhash (list 'gptel-runner-retry-repeat
                          (gptel-runner-node-id node))
                    (gptel-runner-run-blackboard run))
