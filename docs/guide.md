@@ -43,7 +43,17 @@ Jobs, pipelines, and their dashboards remain in this project.
 
 ## Registering agents
 
-Register agents after defining their gptel presets:
+Define a preset with gptel, then register it as a pipeline agent. For example,
+the following reviewer uses only gptel and Runner.
+
+```elisp
+(require 'gptel)
+(require 'gptel-runner)
+(gptel-make-preset 'runner-reviewer :system "Review the supplied changes.")
+(gptel-runner-register-agent 'reviewer :preset 'runner-reviewer)
+```
+
+Agents can also declare workspace access and a parser for structured results.
 
 ```elisp
 (gptel-runner-register-agent
@@ -1191,7 +1201,9 @@ as per-run `:context` must be readable Emacs Lisp data for persistent runs, so
 prefer a named function there.  `:decision-memory` is the
 exception whose package fallback is `t`; use an explicit nil value to opt out.
 
-## Background jobs and macOS schedules
+<a id="background-jobs-and-macos-schedules"></a>
+
+## Background jobs and schedules
 
 A job specifies a named workflow, an initialization file for a fresh worker
 Emacs, start arguments, and an optional recurring schedule. Register jobs and
@@ -1240,9 +1252,8 @@ Supplying `:arguments` replaces the entire argument plist.
 (gptel-runner-job-get "parallel-example")
 ```
 
-Registration only saves the definition. To start one invocation now on macOS,
-evaluate the following form when you want the worker to run. To enable
-recurring triggers, use `gptel-runner-job-schedule` as described below.
+Registration saves the definition. To start one invocation now, evaluate the
+following form. To enable recurring triggers, use `gptel-runner-job-schedule`.
 
 ```elisp
 (setq my-invocation (gptel-runner-job-run "parallel-example"))
@@ -1260,6 +1271,10 @@ The following shortcuts also work directly on a job row.
 Cleanup uses the job ID, so jobs that share a workflow can be cleared
 independently. Saved results and chats stay on disk. Use `C-u C` to delete
 the cleared runs' recovery checkpoints as well.
+
+For a live job that uses ordinary gptel presets, set
+`:preload-features '(gptel)` in `gptel-runner-register-job`. This also
+works when the editor uses `gptel-agent` for other chats.
 
 New jobs preload `gptel` **before** the job's `:init-file`. When saving a
 new job, Runner also includes `gptel-agent` if it finds the library on
@@ -1279,15 +1294,14 @@ those from its own executable.  For a checkout not already on `load-path`,
 configure this once before saving jobs:
 
 ```elisp
-(setq gptel-runner-job-load-path '("~/projects/gptel-agent/"))
+(setq gptel-runner-job-load-path '("~/projects/gptel/"))
 ```
 
 The default value of `gptel-runner-job-preload-features` is `auto`. Set it
 to a list to choose the required packages for new jobs. Each job stores
 its library paths and resolved list as `:load-path` and `:preload-features`.
 These values survive job updates and schedule changes. Supply either key
-explicitly to replace it. For example, to remove gptel-agent from a saved
-job, register it again with `:preload-features '(gptel)`. Set
+explicitly to replace it. Set
 `:preload-features nil` to disable package loading and agent discovery for
 fake-driver or standalone jobs.
 Jobs created before this bootstrap was added must be re-saved once from
@@ -1327,7 +1341,7 @@ blackboard before any prompt or node executes.  Read values using
 Workflows can define a default `:workspace`.  An explicit start argument takes
 precedence, and existing per-node overrides still resolve against the selected
 run workspace.  Saving a job captures its `:base-directory`, so the directory
-from which launchd starts Emacs cannot change file resolution.  Leave
+from which the scheduler starts Emacs cannot change file resolution.  Leave
 `:arguments :workspace` absent to use the pipeline's default, including when
 the pipeline is defined only inside the worker initialization file.  Relative
 defaults resolve against the captured base directory.
@@ -1522,7 +1536,8 @@ workspace.  This is orchestration, not a filesystem security boundary.
 
 ### Run a registered job from a shell
 
-The generic batch entry point can execute a saved job without launchd:
+The `run` command executes a saved job directly. On a Linux system without
+a systemd user manager, you can also use this command in your own crontab.
 
 ```sh
 /absolute/path/to/emacs -Q --batch -L /path/to/gptel-runner \
@@ -1538,7 +1553,7 @@ human-input waits.  It returns exit code `0` for success or a skipped duplicate,
 `1` for another terminal pipeline outcome, and `2` for startup or persistence
 failure. The command runs independently of an interactive Emacs server.
 
-On macOS, the `trigger JOB-ID --root STORE` command dispatches through the
+On Linux and macOS, the `trigger JOB-ID --root STORE` command dispatches through the
 detached launcher and returns after the worker has adopted ownership.  That
 handoff prevents a short-lived trigger from releasing its reservation too
 early.  If worker startup times out, the exact worker service is stopped before
@@ -1547,20 +1562,35 @@ remains visibly uncertain and its reservation stays held until absence is
 confirmed; it is not silently retried.
 
 If the launcher exits before adoption, history shows the reservation as
-interrupted. On dashboard refresh, `gptel-runner-launchd-reap` closes it as
+interrupted. On jobs-view refresh, Runner closes it as
 `startup-error` only after confirming the exact worker service is absent and
 rechecking ownership under the adoption locks. It can then be forgotten even
-without a checkpoint. Launchd workers carry their launch epoch so a delayed
+without a checkpoint. Workers carry their launch epoch so a delayed
 child cannot adopt a newer generation. Loaded services, failed probes, and
 live or unknown owners stay protected. New reservations record their launcher;
-custom launchers and legacy records without current-generation launchd metadata
-remain protected because launchd cannot establish whether they have a pending
+custom launchers and legacy records without evidence from the current scheduler
+remain protected because Runner cannot establish whether they have a pending
 detached worker.
 
-### Schedule a registered job on macOS
+<a id="schedule-a-registered-job-on-macos"></a>
 
-The package schedules recurring work through a LaunchAgent in the current
-user's `gui/<uid>` domain. Its property list lives in `~/Library/LaunchAgents`.
+### Schedule a registered job
+
+On Linux, Runner uses `systemctl --user` to install a timer and
+`systemd-run --user` to launch each worker. You need systemd 240 or newer
+and a running user manager. Run `systemctl --user list-timers` from your login
+session. Unit files live in `$XDG_CONFIG_HOME/systemd/user/`, which defaults
+to `~/.config/systemd/user/`. To run jobs after logging out, the user
+manager must stay active. On systems that allow lingering, enable it for
+your account with `loginctl enable-linger`. [loginctl manual](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html)
+
+On macOS, Runner installs a LaunchAgent in the current user's `gui/<uid>`
+domain. Its property list lives in `~/Library/LaunchAgents/`.
+
+On Windows, Runner uses the built-in `schtasks.exe` to register a task that
+runs while you are logged in. The task starts a batch Emacs directly and
+uses the job definition in your store. Manual runs and checkpoint restarts
+launch a detached Emacs.
 
 Install the hourly rule from the definition above with
 `gptel-runner-job-schedule`. Supply a rule as the second argument to save
@@ -1588,13 +1618,18 @@ job ID or saved record and return the updated record.
 To retire the job entirely, call `(gptel-runner-job-delete "parallel-example")`.
 This removes its definition and schedule and preserves its invocation history.
 
-Schedules support positive integer intervals such as `(:interval 900)` and
-calendar rules such as `(:calendar ((:hour 9 :minute 0)))`.  Multiple calendar
-rules are allowed; `:weekday 1` is Monday, while `0` or `7` is Sunday.  Supported
-fields are `:minute`, `:hour`, `:day`, `:weekday`, and `:month`; omitted fields
-are wildcards.  Rules follow launchd's semantics, including matching either
-day-of-month or weekday when both are supplied.  Calendar times use the Mac's
-local timezone.
+Intervals are measured in seconds. For example, `(:interval 900)` runs
+every 15 minutes. Calendar times use the machine's local time zone.
+
+- On Windows, intervals can range from one minute to 31 days in whole minutes.
+  A calendar schedule accepts up to 48 rules. Use an explicit `:hour` and
+  `:minute` for a daily rule, and add `:weekday` for a weekly rule.
+- On Linux and macOS, intervals accept any positive integer. Calendar rules
+  can use `:minute`, `:hour`, `:day`, `:weekday`, and `:month`. Omitted fields
+  are wildcards. If a rule specifies both a day of the month and a weekday,
+  either can match.
+
+On all three platforms Monday is `:weekday 1`, and Sunday is `0` or `7`.
 
 For a one-time run, set a timer in Emacs and keep that session open until
 it launches the job. This example starts the registered job in two hours.
@@ -1603,19 +1638,81 @@ it launches the job. This example starts the registered job in two hours.
 (run-at-time "2 hours" nil #'gptel-runner-job-run "parallel-example")
 ```
 
-Scheduled triggers exit after dispatching a separate invocation service.  This
-lets schedule disabling and worker cancellation remain independent operations.
-Completed worker registrations are removed during later launches or jobs-view
-refreshes; their history stays on disk. Inspect the registered job's
-`:scheduler` property for the last installation result, or open diagnostics
-from the jobs view for the underlying `launchctl` output.
+Run history stays in the job store after workers exit. Inspect the job's
+`:scheduler` property for the last installation result, or press `? i` on
+its row in the jobs view for diagnostics from the scheduler.
 
 User LaunchAgents require the login session.  Calendar triggers missed while
 the Mac sleeps coalesce into one trigger on wake; interval triggers can be
-missed.  Jobs do not run while the machine is powered off, and cron likewise
-misses executions during sleep.  See Apple's
+missed. Jobs do not run while the machine is powered off. See Apple's
 [scheduled jobs guide](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html)
 and [LaunchAgent lifecycle documentation](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
+
+### Configure a scheduler
+
+Runner selects a scheduler for your operating system. To change its executable
+or arguments, set the options in the Emacs session that installs the schedule.
+Set the program and argument builder to `nil` to return to the platform default.
+
+**Windows Task Scheduler.** The default executable is `schtasks.exe`, with
+an empty list of leading arguments. Runner calls
+`gptel-runner-windows-scheduler-arguments` to build the arguments for each
+operation. You can replace the executable and keep this function. For
+example, if your wrapper accepts a `--log-file` option and forwards the
+remaining arguments to `schtasks.exe`, configure it in your init file.
+
+```elisp
+(when (eq system-type 'windows-nt)
+  (setq gptel-runner-job-scheduler-program "C:/Tools/task-wrapper.exe"
+        gptel-runner-job-scheduler-arguments '("--log-file" "C:/Logs/tasks.log")))
+```
+
+**Another scheduling tool.** Supply an executable and an argument builder
+for its command syntax. These options are available on every platform in
+the `gptel-runner-jobs` Customize group.
+
+| Option | Value |
+| --- | --- |
+| `gptel-runner-job-scheduler-program` | Executable name or absolute path. The Windows default is `"schtasks.exe"`. |
+| `gptel-runner-job-scheduler-arguments` | List of fixed argument strings, prepended to every operation. The default is empty. |
+| `gptel-runner-job-scheduler-function` | A function of `(operation job command)` returning the remaining argument strings. The Windows default is `gptel-runner-windows-scheduler-arguments`. |
+
+The builder handles `install`, `remove`, and `diagnostics`. Use
+`(gptel-runner-job-schedule-id job)` for the task name and
+`(plist-get job :schedule)` for its rule. For installation, `command` is the
+complete action to register, starting with the worker Emacs executable. It
+runs the job directly, checks its enabled flag, and records a scheduled
+invocation. The editor passes each argument literally. If the scheduler takes
+the action as a single command line, the builder handles that scheduler's
+quoting. The Windows builder writes the executable and its arguments into a
+Task Scheduler XML definition.
+
+Runner saves the executable and arguments for removal and diagnostics at
+installation. Those commands still target the installed task after an editor
+restart or a configuration change. Use absolute paths for any scripts they
+reference. Unschedule the job before changing scheduler or task identity,
+then install it with the new settings. A removal command that succeeds for
+an already-absent task also permits cleanup to be retried after interruption.
+
+For manual runs and checkpoint restarts, `gptel-runner-job-launch-function`
+defaults to `gptel-runner-job-launch-native-worker` on all three platforms.
+A custom launcher receives the invocation. It can pass the list returned by
+`gptel-runner-job-worker-command` to a detached process and use
+`gptel-runner-job-await-worker` to wait for that worker to take ownership.
+
+**Linux and macOS command overrides.** The native Linux and macOS backends
+have their own command options.
+
+| Platform | Option | Default |
+| --- | --- | --- |
+| Linux | `gptel-runner-systemctl-command` | `("systemctl" "--user")` |
+| Linux | `gptel-runner-systemd-run-command` | `("systemd-run" "--user")` |
+| macOS | `gptel-runner-launchctl-program` | `"/bin/launchctl"` |
+| macOS | `gptel-runner-launchctl-arguments` | `nil` |
+
+Use an absolute executable path for a wrapper outside the scheduler's search
+path. Reinstall the schedule after changing the command used by an
+unattended trigger.
 
 ## Semantics and safety
 
@@ -1737,12 +1834,32 @@ make package-lint
 make release-check
 ```
 
-The integration target checks the plain gptel adapter in a separate Emacs
-process before loading gptel-agent for the optional delegation suite. It uses
-real state machines and a mocked transport, including a background job worker:
+The integration target checks the plain gptel adapter with real state machines
+and a mocked transport, including a background worker.
 
 ```sh
-make integration-test INTEGRATION_LOAD_PATH="-L /path/to/gptel -L /path/to/gptel-agent -L /path/to/compat -L /path/to/yaml.el"
+make integration-test INTEGRATION_LOAD_PATH="-L /path/to/gptel"
+```
+
+Include `gptel-agent` and its dependencies in `INTEGRATION_LOAD_PATH` to
+run the optional delegation suite in a separate Emacs process.
+
+To test a real schedule in a Linux or macOS login session, run the following
+command with plain gptel on the load path. It installs a temporary five-second
+timer, checks a worker's saved result, and removes the schedule.
+
+```sh
+emacs -Q --batch -L . -L /path/to/gptel \
+  -l test/gptel-runner-native-schedule-integration.el -f ert-run-tests-batch-and-exit
+```
+
+On Windows, run the following in PowerShell to test the default scheduler
+and detached launcher. The test registers a temporary task, starts it,
+checks the worker's result, and removes the task.
+
+```powershell
+$env:GPTEL_RUNNER_WINDOWS_SMOKE = "1"
+emacs -Q --batch -L . -L test -l gptel-runner-windows-test -f ert-run-tests-batch-and-exit
 ```
 
 Live provider smoke tests are opt-in and excluded from ordinary CI.

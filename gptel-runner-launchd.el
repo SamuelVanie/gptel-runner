@@ -14,22 +14,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
-(require 'gptel-runner-core)
-
-(declare-function gptel-runner-job-get "gptel-runner-jobs")
-(declare-function gptel-runner-job-save "gptel-runner-jobs")
-(declare-function gptel-runner-jobs--validate-schedule "gptel-runner-jobs")
-(declare-function gptel-runner-invocation-list "gptel-runner-jobs")
-(declare-function gptel-runner-invocation-live-p "gptel-runner-jobs")
-(declare-function gptel-runner-invocation-get "gptel-runner-jobs")
-(declare-function gptel-runner-jobs--confirm-stopped "gptel-runner-jobs")
-(declare-function gptel-runner-jobs--abandoned-start-p "gptel-runner-jobs")
-(declare-function gptel-runner-jobs--read "gptel-runner-jobs")
-(declare-function gptel-runner-jobs--manifest-file "gptel-runner-jobs")
-(declare-function gptel-runner-jobs--with-control-lock "gptel-runner-jobs")
-(declare-function gptel-runner-jobs--lock-owner-state "gptel-runner-jobs")
-(defvar gptel-runner-job-directory)
-(defvar gptel-runner-jobs--package-directory)
+(require 'gptel-runner-jobs)
 
 (defgroup gptel-runner-launchd nil
   "User-owned macOS schedules for background pipelines."
@@ -41,15 +26,19 @@
   :type 'directory)
 
 (defcustom gptel-runner-launchctl-program "/bin/launchctl"
-  "Absolute path to launchctl."
+  "Absolute path to launchctl or a compatible wrapper."
   :type 'file)
+
+(defcustom gptel-runner-launchctl-arguments nil
+  "Literal arguments passed to launchctl before each operation."
+  :type '(repeat (string :tag "Argument")))
 
 (defcustom gptel-runner-launchd-startup-timeout 15.0
   "Maximum seconds to wait for a worker to adopt its launch reservation."
   :type 'number)
 
 (define-error 'gptel-runner-launchd-cleanup-error
-  "Could not stop an unconfirmed launchd worker")
+  "Could not stop an unconfirmed launchd worker" 'gptel-runner-job-cleanup-error)
 
 (defconst gptel-runner-launchd--prefix "org.gnu.emacs.gptel-runner."
   "Namespace reserved for this package's launchd services.")
@@ -89,10 +78,10 @@ Arguments are passed directly to the executable, without a shell."
   (gptel-runner-launchd--require-macos)
   (unless (file-name-absolute-p gptel-runner-launchctl-program)
     (error "Launchctl must have an absolute path"))
-  (with-temp-buffer
-    (let ((status (apply #'call-process gptel-runner-launchctl-program
-                         nil '(t t) nil arguments)))
-      (list :exit status :output (buffer-string) :arguments arguments))))
+  (unless (proper-list-p gptel-runner-launchctl-arguments)
+    (user-error "Configure launchctl arguments as a list of strings"))
+  (apply #'gptel-runner-job-call-process gptel-runner-launchctl-program
+         (append gptel-runner-launchctl-arguments arguments)))
 
 (defun gptel-runner-launchd--checked (&rest arguments)
   "Invoke launchctl with ARGUMENTS, signaling an error on failure."
@@ -158,19 +147,7 @@ Alists represent dictionaries and vectors represent arrays."
           "<plist version=\"1.0\">\n"
           (gptel-runner-launchd--xml dictionary) "\n</plist>\n"))
 
-(defun gptel-runner-launchd--write (file text)
-  "Atomically write private TEXT to FILE."
-  (let* ((directory (file-name-directory file)) temporary)
-    (make-directory directory t)
-    (setq temporary (make-temp-file (expand-file-name ".runner-" directory)))
-    (unwind-protect
-        (progn
-          (with-temp-file temporary
-            (let ((coding-system-for-write 'utf-8-unix)) (insert text)))
-          (set-file-modes temporary #o600)
-          (rename-file temporary file t)
-          (setq temporary nil))
-      (when temporary (delete-file temporary)))))
+(defalias 'gptel-runner-launchd--write #'gptel-runner-jobs--write-scheduler-file)
 
 (defun gptel-runner-launchd--schedule (schedule)
   "Validate SCHEDULE and return its launchd dictionary entry."
@@ -188,16 +165,7 @@ Alists represent dictionaries and vectors represent arrays."
                    collect (cons (capitalize (substring (symbol-name key) 1)) value)))
         (cadr schedule)))))))
 
-(defun gptel-runner-launchd--arguments (job &rest operation)
-  "Build Emacs arguments for JOB and batch OPERATION."
-  (let ((emacs (plist-get job :emacs)))
-    (unless (and (stringp emacs) (file-name-absolute-p emacs)
-                 (file-executable-p emacs))
-      (error "Job must specify an executable absolute :emacs path"))
-    (vconcat
-     (list emacs "-Q" "--batch" "-L" gptel-runner-jobs--package-directory
-           "-l" "gptel-runner-jobs" "-f" "gptel-runner-jobs-batch-main" "--")
-     operation)))
+(defalias 'gptel-runner-launchd--arguments #'gptel-runner-jobs--batch-arguments)
 
 (defun gptel-runner-launchd--environment (job)
   "Validate and return JOB's explicit environment dictionary."
@@ -221,8 +189,7 @@ Alists represent dictionaries and vectors represent arrays."
 
 (defun gptel-runner-launchd--schedule-label (job)
   "Return the user-wide schedule label for JOB, including older definitions."
-  (gptel-runner-launchd--label "schedule" (or (plist-get job :launchd-id)
-                                              (plist-get job :id))))
+  (gptel-runner-launchd--label "schedule" (gptel-runner-job-schedule-id job)))
 
 (defun gptel-runner-launchd--schedule-file (job)
   "Return the scheduled trigger property-list filename for JOB."
@@ -230,13 +197,7 @@ Alists represent dictionaries and vectors represent arrays."
    (concat (gptel-runner-launchd--schedule-label job) ".plist")
    gptel-runner-launchd-directory))
 
-(defun gptel-runner-launchd--status (job state operation &optional error-data)
-  "Save scheduler STATE for JOB after OPERATION with optional ERROR-DATA."
-  (setq job (copy-sequence job))
-  (setq job (plist-put job :scheduler
-                       (list :state state :operation operation
-                             :updated-at (float-time) :error error-data)))
-  (gptel-runner-job-save job))
+(defalias 'gptel-runner-launchd--status #'gptel-runner-jobs--scheduler-status)
 
 (defun gptel-runner-launchd-install (job)
   "Install or update JOB's recurring schedule for the current user.
@@ -307,29 +268,8 @@ The raw launchctl display is intended for people, not parsed as an API."
                   :saved-status (plist-get job :scheduler)) result)))
 
 (defun gptel-runner-launchd--await-worker (invocation)
-  "Wait until INVOCATION's worker adopts its reservation or exits.
-The launching process stays alive until ownership is handed over, preventing
-a subsequent trigger from reclaiming a dead launcher's reservation."
-  (unless (and (numberp gptel-runner-launchd-startup-timeout)
-               (> gptel-runner-launchd-startup-timeout 0))
-    (error "Worker startup timeout must be positive"))
-  (let ((gptel-runner-job-directory (plist-get invocation :root))
-        (deadline (+ (float-time) gptel-runner-launchd-startup-timeout))
-        adopted)
-    (while (not adopted)
-      (let ((current (gptel-runner-invocation-get (plist-get invocation :id))))
-        (unless (equal (plist-get current :epoch) (plist-get invocation :epoch))
-          (error "Worker ownership changed during launch"))
-        (when (memq (plist-get current :phase) '(open closing closed))
-          (when (memq (plist-get current :state) '(startup-error storage-error))
-            (error "Worker startup failed: %s" (plist-get current :error)))
-          (setq adopted current)))
-      (unless adopted
-        (when (>= (float-time) deadline)
-          (error "Worker did not adopt its launch reservation within %.1f seconds"
-                 gptel-runner-launchd-startup-timeout))
-        (accept-process-output nil 0.05)))
-    adopted))
+  "Wait for INVOCATION to adopt its launch reservation."
+  (gptel-runner-jobs--await-worker invocation gptel-runner-launchd-startup-timeout))
 
 (defun gptel-runner-launchd--stop-unconfirmed (label original-error)
   "Stop exact worker LABEL after ORIGINAL-ERROR before releasing its claim.

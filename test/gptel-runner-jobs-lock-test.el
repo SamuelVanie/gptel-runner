@@ -13,7 +13,11 @@
 
 (defun gptel-runner-jobs-lock-test--dead-owner ()
   "Return an exact local identity that cannot denote this live process."
-  (plist-put (gptel-runner-jobs--owner "dead-owner" nil) :start '(0 0 0 0)))
+  (let* ((owner (gptel-runner-jobs--owner "dead-owner" nil))
+         (start (plist-get owner :start)))
+    (plist-put owner :start (pcase start
+                              (`(linux ,boot ,ticks) (list 'linux boot (1+ ticks)))
+                              (_ '(0 0 0 0))))))
 
 (ert-deftest gptel-runner-jobs-lock-live-owner-is-never-expired ()
   (gptel-runner-jobs-lock-test--directory
@@ -30,12 +34,40 @@
 
 (ert-deftest gptel-runner-jobs-lock-unavailable-live-process-attributes-are-unknown ()
   (let ((owner (gptel-runner-jobs--owner "owner" nil)))
-    (cl-letf (((symbol-function 'process-attributes) (lambda (_) nil))
+    (cl-letf (((symbol-function 'gptel-runner-jobs--process-attributes) #'ignore)
               ((symbol-function 'list-system-processes) (lambda () (list (emacs-pid)))))
       (should (eq (gptel-runner-jobs--lock-owner-state owner) 'unknown)))
-    (cl-letf (((symbol-function 'process-attributes) (lambda (_) nil))
+    (cl-letf (((symbol-function 'gptel-runner-jobs--process-attributes) #'ignore)
               ((symbol-function 'list-system-processes) (lambda () nil)))
       (should (eq (gptel-runner-jobs--lock-owner-state owner) 'dead)))))
+
+(ert-deftest gptel-runner-jobs-lock-linux-uses-boot-and-start-ticks ()
+  (let ((gptel-runner-jobs--linux-boot-id "boot-1")
+        (system-type 'gnu/linux)
+        (state "R") (ticks 125)
+        (estimated-start '(1 2 3 0)))
+    (cl-letf (((symbol-function 'insert-file-contents-literally)
+               (lambda (file)
+                 (should (equal file (format "/proc/%d/stat" (emacs-pid))))
+                 (insert (format "%d (emacs) child\nname) %s%s %d 999\n"
+                                 (emacs-pid) state (apply #'concat (make-list 18 " 0"))
+                                 ticks))))
+              ((symbol-function 'process-attributes)
+               (lambda (_) (list (cons 'state state) (cons 'start estimated-start)))))
+      (let ((owner (gptel-runner-jobs--owner "owner" nil)))
+        (should (equal (plist-get owner :start) '(linux "boot-1" 125)))
+        (setq estimated-start '(1 2 10003 0))
+        (should (gptel-runner-invocation-live-p (list :worker owner)))
+        (let ((gptel-runner-jobs--linux-boot-id "boot-2"))
+          (should (eq 'dead (gptel-runner-jobs--lock-owner-state owner))))
+        (setq state "Z")
+        (should (eq 'dead (gptel-runner-jobs--lock-owner-state owner)))
+        (setq state "R" ticks 126)
+        (should (eq 'dead (gptel-runner-jobs--lock-owner-state owner)))
+        ;; Older Linux records only have a sampled wall-clock time.  A shift
+        ;; in that estimate must never authorize taking a live lock.
+        (setq owner (plist-put owner :start '(1 2 3 0)))
+        (should (eq 'unknown (gptel-runner-jobs--lock-owner-state owner)))))))
 
 (ert-deftest gptel-runner-jobs-lock-reclaim-serializes-competing-inspection ()
   (gptel-runner-jobs-lock-test--directory

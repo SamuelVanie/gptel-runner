@@ -57,6 +57,35 @@
                                      "worker" (plist-get invocation :id) epoch)))
     file))
 
+(ert-deftest gptel-runner-launchd-uses-configured-program-and-literal-arguments ()
+  (let ((system-type 'darwin)
+        (gptel-runner-launchctl-program "/path with spaces/launchctl-wrapper")
+        (gptel-runner-launchctl-arguments '("--profile" "local $HOME")))
+    (cl-letf (((symbol-function 'gptel-runner-job-call-process) #'list))
+      (should (equal (gptel-runner-launchd--invoke "print" "gui/123/job")
+                     '("/path with spaces/launchctl-wrapper" "--profile"
+                       "local $HOME" "print" "gui/123/job"))))))
+
+(ert-deftest gptel-runner-launchd-batch-trigger-carries-native-settings ()
+  (let* ((system-type 'darwin)
+         (gptel-runner-launchctl-program "/path with spaces/$HOME %u")
+         (gptel-runner-launchctl-arguments '("--name" "a\"b\nc"))
+         (gptel-runner-launchd-startup-timeout 23)
+         (job (list :emacs gptel-runner-job-emacs-program))
+         (command (append (gptel-runner-launchd--arguments job "trigger" "job") nil))
+         ;; Run the exact trigger bootstrap and inspect the settings at dispatch.
+         (bootstrap (cl-subseq command 1 (cl-position "-f" command :test #'equal))))
+    (with-temp-buffer
+      (should (zerop (apply #'call-process (car command) nil '(t nil) nil
+                            (append bootstrap
+                                    '("-l" "gptel-runner-launchd" "--eval"
+                                      "(prin1 (list gptel-runner-launchctl-program gptel-runner-launchctl-arguments gptel-runner-launchd-startup-timeout))")))))
+      (should (equal (read (buffer-string))
+                     (list gptel-runner-launchctl-program gptel-runner-launchctl-arguments
+                           gptel-runner-launchd-startup-timeout))))
+    (dolist (operation '("scheduled-run" "worker"))
+      (should-not (member "--eval" (append (gptel-runner-launchd--arguments job operation) nil))))))
+
 (ert-deftest gptel-runner-launchd-plist-preserves-arguments-and-escapes-values ()
   (gptel-runner-launchd-test--fixture
     (let* ((args (gptel-runner-launchd--arguments job "worker" "/tmp/a & b/"))

@@ -50,7 +50,7 @@
 (ert-deftest gptel-runner-startup-reconciles-real-dead-launcher-without-registration ()
   (gptel-runner-startup-test--isolated
     (let ((form `(let ((gptel-runner-job-directory ,gptel-runner-job-directory))
-                   (gptel-runner-jobs--new-invocation ',job 'test))))
+                   (gptel-runner-jobs--new-invocation ',job 'test 'launchd))))
       (should (zerop
                (call-process gptel-runner-job-emacs-program nil nil nil
                              "-Q" "--batch" "-L" gptel-runner-jobs--package-directory
@@ -87,6 +87,18 @@
       (should (eq (plist-get (car (gptel-runner-invocation-list)) :state) 'interrupted))
       (should (eq (plist-get (gptel-runner-invocation-get
                              (plist-get invocation :id)) :state) 'starting))
+      (should-not commands))))
+
+(ert-deftest gptel-runner-startup-external-scheduler-reaps-only-direct-runs ()
+  (gptel-runner-startup-test--isolated
+    (cl-letf (((symbol-function 'gptel-runner-jobs--scheduler) #'ignore))
+      (dolist (launcher '(direct custom))
+        (let* ((definition (plist-put (copy-sequence job) :id (symbol-name launcher)))
+               (run (gptel-runner-startup-test--dead-reservation definition)))
+          (gptel-runner-startup-test--save (plist-put run :launcher launcher))
+          (gptel-runner-jobs--scheduler-call 'reap)
+          (should (eq (plist-get (gptel-runner-invocation-get (plist-get run :id)) :phase)
+                      (if (eq launcher 'direct) 'closed 'starting)))))
       (should-not commands))))
 
 (ert-deftest gptel-runner-startup-keeps-loaded-and-unverifiable-services ()

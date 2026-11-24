@@ -5,10 +5,12 @@ to decide which agents work in parallel, what they pass to the next stage,
 and where the pipeline pauses for your input. Follow the whole run from one
 dashboard.
 
-You can also save a pipeline as a background job which will run at the time you decides. On macOS (only for now, I don't have a linux machine), it uses a timer in
-an open Emacs session to start it once at a time you choose, or uses launchd
-to run it regularly, such as every hour or every Monday at 9 a.m. I use it for example at work to review the dozen of pull requests that we've got every working day at 3pm. 
-[Set up a background job](docs/guide.md#background-jobs-and-macos-schedules)
+You can save a pipeline as a background job and run it even after closing
+Emacs. Recurring jobs use systemd user timers on Linux, launchd on macOS, and
+Windows Task Scheduler on Windows. You can customize the scheduler executable
+and its arguments on each platform.
+For example, I use a weekday schedule to review our open pull requests at
+3 p.m. [Set up a background job](docs/guide.md#background-jobs-and-schedules) · [Configure a scheduler](docs/guide.md#configure-a-scheduler)
 
 ![Emacs dashboard running a 12-agent pipeline, from parallel research to the finished v2.0 release brief.](docs/media/workflow-demo.gif)
 
@@ -20,7 +22,8 @@ The demo uses scripted replies. [Watch the 20-second video](docs/media/workflow-
 ## Installation
 
 Use Emacs 29.1 or newer. For live runs, install gptel 0.9.9.6 or newer and
-configure your model. Choose one of the setups below. [gptel setup](https://github.com/karthink/gptel#setup)
+configure your model. You can define pipeline agents with ordinary gptel
+presets. The companion `gptel-agent` package is optional. [gptel setup](https://github.com/karthink/gptel#setup)
 
 ### use-package with straight.el
 

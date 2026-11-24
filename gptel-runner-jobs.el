@@ -8,7 +8,7 @@
 ;; Jobs are reusable launch configurations.  An invocation has one owning
 ;; batch Emacs, an execution checkpoint, an inspection history, and a typed
 ;; command inbox.  Reading history never creates executable runner objects.
-;; The command line entry point works with cron as well as the launchd adapter.
+;; The command line entry point also works with external schedulers such as cron.
 
 ;;; Code:
 
@@ -18,10 +18,6 @@
 (require 'gptel-runner-flow)
 (require 'gptel-runner-store)
 
-(declare-function gptel-runner-launchd-start-worker "gptel-runner-launchd")
-(declare-function gptel-runner-launchd-install "gptel-runner-launchd")
-(declare-function gptel-runner-launchd-remove "gptel-runner-launchd")
-(declare-function gptel-runner-launchd-delete-schedule "gptel-runner-launchd")
 (declare-function gptel-runner-gptel-answer-interaction "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-answer-questions "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-check-interaction "gptel-runner-gptel")
@@ -32,6 +28,9 @@
 (declare-function gptel-runner-gptel-feedback "gptel-runner-gptel")
 (declare-function gptel-runner-complete-call-from-buffer "gptel-runner-gptel")
 (declare-function gptel-agent-update "gptel-agent")
+
+(autoload 'gptel-runner-windows-scheduler-arguments "gptel-runner-windows")
+(autoload 'gptel-runner-windows-start-worker "gptel-runner-windows")
 
 (defgroup gptel-runner-jobs nil
   "Durable background workflow jobs."
@@ -67,11 +66,44 @@ An explicit job :load-path overrides automatic capture.  Re-saving a job
 preserves its saved paths unless a replacement :load-path is supplied."
   :type '(repeat directory))
 
-(defcustom gptel-runner-job-launch-function #'gptel-runner-jobs--launch
+(defcustom gptel-runner-job-launch-function #'gptel-runner-job-launch-native-worker
   "Function accepting an invocation record and starting its worker.
-The default uses launchd on macOS.  The command line `run' entry point
-executes directly and does not need this launcher."
+The default uses launchd on macOS, systemd user services on GNU/Linux,
+and a detached Emacs process on Windows.
+Custom launchers can use `gptel-runner-job-worker-command' and
+`gptel-runner-job-await-worker'.  The batch `run' command executes directly."
   :type 'function)
+
+(defun gptel-runner-jobs--default-scheduler-program ()
+  "Return the OS default executable for the configurable command scheduler."
+  (when (eq system-type 'windows-nt) "schtasks.exe"))
+
+(defun gptel-runner-jobs--default-scheduler-function ()
+  "Return the OS default argument builder for the configurable scheduler."
+  (when (eq system-type 'windows-nt) #'gptel-runner-windows-scheduler-arguments))
+
+(defcustom gptel-runner-job-scheduler-program (gptel-runner-jobs--default-scheduler-program)
+  "Executable for an external recurring scheduler, or nil for the OS default.
+Windows defaults to schtasks.exe.  GNU/Linux uses systemd user timers
+and macOS uses launchd.  To change the scheduler's command syntax,
+set `gptel-runner-job-scheduler-function'."
+  :type '(choice (const :tag "Native scheduler" nil) string))
+
+(defcustom gptel-runner-job-scheduler-arguments nil
+  "Literal arguments passed to the external scheduler before each operation.
+Each string is a single argument, including when it contains spaces."
+  :type '(repeat string))
+
+(defcustom gptel-runner-job-scheduler-function (gptel-runner-jobs--default-scheduler-function)
+  "Argument builder for `gptel-runner-job-scheduler-program'.
+The function receives OPERATION, JOB and COMMAND.  OPERATION is one of
+`install', `remove' or `diagnostics'.  JOB is the saved job definition.
+COMMAND is a list containing the Emacs executable and its arguments for
+running JOB when the schedule fires.  Return a list of argument strings.
+Runner calls the builder at installation to capture the commands it will
+need later.  Use `gptel-runner-job-schedule-id' to name the task.
+On Windows the default is `gptel-runner-windows-scheduler-arguments'."
+  :type '(choice (const :tag "Native scheduler" nil) function))
 
 (defcustom gptel-runner-job-poll-interval 0.2
   "Seconds between worker command and external lock checks."
@@ -82,6 +114,8 @@ executes directly and does not need this launcher."
   "Directory containing the installed runner Lisp files.")
 
 (defconst gptel-runner-jobs--version 1)
+(define-error 'gptel-runner-job-cleanup-error
+  "Could not confirm that a background worker stopped")
 (define-error 'gptel-runner-job-storage-error "Background job storage failed")
 (defconst gptel-runner-jobs--operations
   '(pause resume cancel retry rerun continue extend extend-repeat decision
@@ -257,7 +291,7 @@ loading the initialization file."
   (let* ((id (or (plist-get job :id) (gptel-runner-jobs--id)))
          (old (when (file-exists-p (gptel-runner-jobs--definition-file id))
                 (gptel-runner-job-get id)))
-         ;; LaunchAgent labels are per macOS user; named job IDs are per store.
+         ;; Native scheduler names are per user, while named job IDs are per store.
          ;; Old definitions already have a service identity equal to their ID.
          (launchd-id (cond (old (or (plist-get old :launchd-id) id))
                            ((plist-get job :id) (gptel-runner-jobs--id))
@@ -375,34 +409,206 @@ to launch it or `gptel-runner-job-schedule' to install its schedule."
         (gptel-runner-job-save job))
    t))
 
+(defun gptel-runner-jobs--scheduler ()
+  "Return the native user scheduler for this operating system."
+  (pcase system-type
+    ('darwin 'launchd)
+    ('gnu/linux 'systemd)
+    ('windows-nt 'windows)))
+
+(defun gptel-runner-job-call-process (program &rest arguments)
+  "Run PROGRAM with literal ARGUMENTS and collect its exit status and output.
+Return a plist with :exit, :output (stdout and stderr), and :arguments.
+PROGRAM can be an absolute filename or a command found via variable `exec-path'."
+  (unless (and (stringp program) (not (string-empty-p program))
+               (cl-every #'stringp arguments))
+    (user-error "A scheduler command needs an executable and string arguments"))
+  (let ((executable (or (executable-find program)
+                        (user-error "Cannot find scheduler executable %s" program))))
+    (with-temp-buffer
+      (let ((status (apply #'call-process executable nil '(t t) nil arguments)))
+        (list :exit status :output (buffer-string) :arguments arguments)))))
+
+(defun gptel-runner-job-schedule-id (job)
+  "Return JOB's stable identity for naming a task in a per-user scheduler."
+  (gptel-runner-jobs--valid-id (or (plist-get job :launchd-id) (plist-get job :id))))
+
+(defun gptel-runner-jobs--schedule-backend (operation job)
+  "Select the backend for schedule OPERATION on JOB."
+  (let* (;; Windows uses the same persisted commands as a user-supplied CLI.
+         (native (pcase (gptel-runner-jobs--scheduler) ('windows 'command) (other other)))
+         (configured (if (or gptel-runner-job-scheduler-program
+                             gptel-runner-job-scheduler-function)
+                         'command native))
+         (status (plist-get job :scheduler))
+         (installed (unless (memq (plist-get status :state) '(nil removed))
+                      ;; Definitions written before backend selection used
+                      ;; the native scheduler on the machine that saved them.
+                      (or (plist-get status :backend) native))))
+    (when (and (eq operation 'install) installed (not (eq configured installed)))
+      (user-error "Unschedule job %s from %s before installing with %s"
+                  (plist-get job :id) installed (or configured system-type)))
+    (or installed configured)))
+
+(defun gptel-runner-jobs--scheduler-call (operation &rest arguments)
+  "Call the selected scheduler's OPERATION with ARGUMENTS."
+  (let ((backend (if (memq operation '(start-worker reap))
+                     (gptel-runner-jobs--scheduler)
+                   (gptel-runner-jobs--schedule-backend operation (car arguments)))))
+    (cond ((memq backend '(command launchd systemd))
+           (require (intern (format "gptel-runner-%s" backend)))
+           (apply (intern (format "gptel-runner-%s-%s" backend operation)) arguments))
+          ((and (eq operation 'start-worker) (eq backend 'windows))
+           (gptel-runner-windows-start-worker (car arguments)))
+          ((and (null backend) (eq operation 'delete-schedule)
+                (memq (plist-get (plist-get (car arguments) :scheduler) :state)
+                      '(nil removed))) nil)
+          ((eq operation 'start-worker)
+           (user-error "Configure gptel-runner-job-launch-function on %s" system-type))
+          ((eq operation 'reap)
+           ;; A scheduled-run owns its process directly.  A custom launcher
+           ;; may still have a pending child after its launching process exits.
+           (dolist (run (gptel-runner-invocation-list))
+             (when (and (eq (plist-get run :launcher) 'direct)
+                        (gptel-runner-jobs--abandoned-start-p run))
+               (gptel-runner-jobs--confirm-stopped run))))
+          (t (user-error "Configure gptel-runner-job-scheduler-program and its argument builder for %s"
+                         (or backend system-type))))))
+
+(defun gptel-runner-jobs--write-scheduler-file (file text)
+  "Atomically write private TEXT to FILE."
+  (let* ((directory (file-name-directory file)) temporary)
+    (make-directory directory t)
+    (setq temporary (make-temp-file (expand-file-name ".runner-" directory)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'utf-8-unix))
+            (with-temp-file temporary (insert text)))
+          (set-file-modes temporary #o600)
+          (rename-file temporary file t)
+          (setq temporary nil))
+      (when temporary (delete-file temporary)))))
+
+(defun gptel-runner-jobs--native-settings-arguments ()
+  "Return batch arguments restoring customized native scheduler settings."
+  (let* ((options
+          (pcase system-type
+            ('darwin '(gptel-runner-launchctl-program gptel-runner-launchctl-arguments
+                       gptel-runner-launchd-startup-timeout))
+            ('gnu/linux '(gptel-runner-systemctl-command gptel-runner-systemd-run-command
+                          gptel-runner-systemd-startup-timeout))))
+         (settings
+          (cl-loop for option in options
+                   for standard = (get option 'standard-value)
+                   when (and (boundp option)
+                             (not (and standard
+                                       (equal (symbol-value option) (eval (car standard) t)))))
+                   append (list option (list 'quote (symbol-value option))))))
+    (when settings
+      (list "--eval" (string-trim-right
+                      (gptel-runner-jobs--data-string (cons 'setq settings)))))))
+
+(defun gptel-runner-jobs--batch-arguments (job &rest operation)
+  "Build Emacs arguments for JOB and batch OPERATION."
+  (let ((emacs (plist-get job :emacs)))
+    (unless (and (stringp emacs) (file-name-absolute-p emacs)
+                 (file-executable-p emacs))
+      (error "Job must specify an executable absolute :emacs path"))
+    (vconcat
+     (list emacs "-Q" "--batch" "-L" gptel-runner-jobs--package-directory
+           "-l" "gptel-runner-jobs")
+     (when (equal (car operation) "trigger")
+       (gptel-runner-jobs--native-settings-arguments))
+     '("-f" "gptel-runner-jobs-batch-main" "--")
+     operation)))
+
+(defun gptel-runner-job-scheduled-command (job)
+  "Return executable and argument strings for running JOB on a scheduler tick.
+The fresh batch Emacs checks the latest saved definition and executes the
+workflow directly, including when the editor has exited."
+  (append (gptel-runner-jobs--batch-arguments
+           job "scheduled-run" (gptel-runner-jobs--valid-id (plist-get job :id))
+           "--root" (expand-file-name (or (plist-get job :root) gptel-runner-job-directory)))
+          nil))
+
+(defun gptel-runner-job-worker-command (invocation)
+  "Return the executable and arguments to adopt INVOCATION's worker reservation."
+  (append (gptel-runner-jobs--batch-arguments
+           (plist-get invocation :job) "worker" (plist-get invocation :directory)
+           "--epoch" (number-to-string (plist-get invocation :epoch))) nil))
+
+(defun gptel-runner-jobs--scheduler-status (job state operation &optional error-data details)
+  "Save scheduler STATE for JOB after OPERATION with ERROR-DATA and DETAILS.
+DETAILS can supply a plist of backend-specific metadata."
+  (setq job (copy-sequence job))
+  (setq job (plist-put job :scheduler
+                       (append (list :state state :operation operation
+                                     :updated-at (float-time) :error error-data)
+                               (or details (list :backend (gptel-runner-jobs--scheduler))))))
+  (if (and (memq operation '(remove disable)) (eq (plist-get job :format) 'runner-job))
+      ;; Cleanup is permitted after the original workspace or init file is
+      ;; gone.  Change only scheduling metadata in the saved definition.
+      (let* ((id (plist-get job :id))
+             (saved (gptel-runner-job-get id)))
+        (setq saved (plist-put saved :scheduler (plist-get job :scheduler))
+              saved (plist-put saved :enabled (plist-get job :enabled))
+              saved (plist-put saved :revision (1+ (or (plist-get saved :revision) 0))))
+        (gptel-runner-jobs--write (gptel-runner-jobs--definition-file id) saved))
+    (gptel-runner-job-save job)))
+
+(defun gptel-runner-job-await-worker (invocation timeout)
+  "Wait up to TIMEOUT seconds for INVOCATION's worker to adopt or exit.
+The launching process stays alive until ownership is handed over, preventing
+a subsequent trigger from reclaiming a dead launcher's reservation."
+  (unless (and (numberp timeout)
+               (> timeout 0))
+    (error "Worker startup timeout must be positive"))
+  (let ((gptel-runner-job-directory (plist-get invocation :root))
+        (deadline (+ (float-time) timeout))
+        adopted)
+    (while (not adopted)
+      (let ((current (gptel-runner-invocation-get (plist-get invocation :id))))
+        (unless (equal (plist-get current :epoch) (plist-get invocation :epoch))
+          (error "Worker ownership changed during launch"))
+        (when (memq (plist-get current :phase) '(open closing closed))
+          (when (memq (plist-get current :state) '(startup-error storage-error))
+            (error "Worker startup failed: %s" (plist-get current :error)))
+          (setq adopted current)))
+      (unless adopted
+        (when (>= (float-time) deadline)
+          (error "Worker did not adopt its launch reservation within %.1f seconds"
+                 timeout))
+        (accept-process-output nil 0.05)))
+    adopted))
+
+(defalias 'gptel-runner-jobs--await-worker #'gptel-runner-job-await-worker)
+
 ;;;###autoload
 (defun gptel-runner-job-schedule (job &optional schedule)
-  "Install or update JOB's recurring macOS schedule and return the saved job.
+  "Install or update JOB's recurring schedule and return the saved job.
 JOB is its string ID or a saved record.  Use its latest saved schedule
 unless SCHEDULE supplies a new (:interval SECONDS) or (:calendar (RULE ...))
 value.  Installing a schedule does not run the job immediately."
-  (require 'gptel-runner-launchd)
   (gptel-runner-jobs--update-definition
    job (lambda (definition)
          (setq schedule (or schedule (plist-get definition :schedule)))
          (gptel-runner-jobs--validate-schedule schedule)
-         (gptel-runner-launchd-install (plist-put definition :schedule schedule)))))
+         (gptel-runner-jobs--scheduler-call
+          'install (plist-put definition :schedule schedule)))))
 
 ;;;###autoload
 (defun gptel-runner-job-unschedule (job)
-  "Remove JOB's recurring macOS trigger and return the updated saved job.
+  "Remove JOB's recurring trigger and return the updated saved job.
 JOB is its string ID or a saved record.  Keep its schedule rule, invocation
 history, and running workers."
-  (require 'gptel-runner-launchd)
-  (gptel-runner-jobs--update-definition job #'gptel-runner-launchd-remove))
+  (gptel-runner-jobs--update-definition
+   job (lambda (definition) (gptel-runner-jobs--scheduler-call 'remove definition))))
 
 (defun gptel-runner-job-delete (id)
   "Remove job ID and its schedule, retaining all invocation history."
   (gptel-runner-jobs--update-definition
    id (lambda (job)
-        (when (eq system-type 'darwin)
-          (require 'gptel-runner-launchd)
-          (gptel-runner-launchd-delete-schedule job))
+        (gptel-runner-jobs--scheduler-call 'delete-schedule job)
         (delete-file (gptel-runner-jobs--definition-file (plist-get job :id))))))
 
 (defun gptel-runner-jobs--manifest-file (invocation)
@@ -494,20 +700,49 @@ An interrupted or corrupt manifest does not hide other invocations."
       (gptel-runner-jobs--read (gptel-runner-jobs--artifact-path invocation file))
     call))
 
+(defconst gptel-runner-jobs--linux-boot-id
+  (when (eq system-type 'gnu/linux)
+    (condition-case nil
+        (with-temp-buffer
+          (insert-file-contents-literally "/proc/sys/kernel/random/boot_id")
+          (let ((id (string-trim (buffer-string))))
+            (if (string-empty-p id) 'unknown id)))
+      (file-error 'unknown)))
+  "Linux boot ID, `unknown' if unavailable, or nil on another OS.")
+
+(defun gptel-runner-jobs--process-attributes (pid &optional legacy)
+  "Return state and stable start identity for PID, or nil if unavailable.
+LEGACY requests the wall-clock start time used by older records."
+  (if (or legacy (null gptel-runner-jobs--linux-boot-id))
+      (process-attributes pid)
+    ;; On Linux, Emacs estimates the absolute start time on each query from
+    ;; the wall clock and /proc/uptime.  Use the kernel's raw start ticks.
+    (when (stringp gptel-runner-jobs--linux-boot-id)
+      (condition-case nil
+          (with-temp-buffer
+            (insert-file-contents-literally (format "/proc/%d/stat" pid))
+            (goto-char (point-max))
+            ;; The command in field 2 can contain spaces, newlines and ')'.
+            (when (search-backward ") " nil t)
+              (forward-char 2)
+              (let* ((fields (split-string (buffer-substring (point) (point-max))))
+                     (ticks (nth 19 fields))) ; Field 22, counting from state.
+                (when (and ticks (string-match-p "\\`[0-9]+\\'" ticks))
+                  (list (cons 'state (car fields))
+                        (list 'start 'linux gptel-runner-jobs--linux-boot-id
+                              (string-to-number ticks)))))))
+        (file-error nil)))))
+
 (defun gptel-runner-jobs--owner (token invocation)
   "Return this process's ownership identity with TOKEN and INVOCATION ID."
-  (list :pid (emacs-pid) :start (alist-get 'start (process-attributes (emacs-pid)))
+  (list :pid (emacs-pid)
+        :start (alist-get 'start (gptel-runner-jobs--process-attributes (emacs-pid)))
         :host (system-name) :token token :invocation invocation
         :created-at (float-time)))
 
 (defun gptel-runner-jobs--owner-live-p (owner)
   "Return non-nil if OWNER's exact process identity still exists."
-  (and (equal (plist-get owner :host) (system-name))
-       (integerp (plist-get owner :pid))
-       (let ((attributes (process-attributes (plist-get owner :pid))))
-         (and attributes
-              (not (equal (alist-get 'state attributes) "Z"))
-              (equal (plist-get owner :start) (alist-get 'start attributes))))))
+  (eq (gptel-runner-jobs--lock-owner-state owner t) 'live))
 
 (defun gptel-runner-invocation-live-p (invocation)
   "Return non-nil when INVOCATION has a live worker or launch reservation."
@@ -550,29 +785,32 @@ transcripts, artifacts, job definitions, and schedules are preserved."
          (setq fresh (plist-put fresh :forgotten-epoch (plist-get fresh :epoch)))
          (gptel-runner-jobs--write (gptel-runner-jobs--manifest-file fresh) fresh))))))
 
-(defun gptel-runner-jobs--lock-owner-state (owner)
+(defun gptel-runner-jobs--lock-owner-state (owner &optional process-only)
   "Classify OWNER as `live', `dead', or `unknown' by exact process identity.
-Incomplete identities and owners on another host are never declared dead."
-  (if (not (and (proper-list-p owner)
-                (not (plist-get owner :uncertain))
-                (equal (plist-get owner :host) (system-name))
-                (integerp (plist-get owner :pid))
-                (> (plist-get owner :pid) 0)
-                (plist-get owner :start)
-                (ignore-errors (time-convert (plist-get owner :start) 'integer))))
-      'unknown
-    (condition-case nil
-        (let ((attributes (process-attributes (plist-get owner :pid))))
-          (cond ((null attributes)
-                 (if (memq (plist-get owner :pid) (list-system-processes))
-                     'unknown 'dead))
-                ((null (alist-get 'start attributes)) 'unknown)
-                ((or (equal (alist-get 'state attributes) "Z")
-                     (not (equal (plist-get owner :start)
-                                 (alist-get 'start attributes))))
-                 'dead)
-                (t 'live)))
-      (error 'unknown))))
+Incomplete identities and owners on another host are never declared dead.
+PROCESS-ONLY checks the process even when its launch outcome is uncertain."
+  (let* ((pid (and (proper-list-p owner) (plist-get owner :pid)))
+         (start (and pid (plist-get owner :start)))
+         (linux (pcase start
+                  (`(linux ,(pred stringp) ,(pred natnump)) t))))
+    (if (not (and (integerp pid) (> pid 0)
+                  (or process-only (not (plist-get owner :uncertain)))
+                  (equal (plist-get owner :host) (system-name))
+                  (if linux (stringp gptel-runner-jobs--linux-boot-id)
+                    (and start (ignore-errors (time-convert start 'integer))))))
+        'unknown
+      (condition-case nil
+          (let* ((attributes (gptel-runner-jobs--process-attributes pid (not linux)))
+                 (observed (alist-get 'start attributes)))
+            (cond ((null attributes)
+                   (if (memq pid (list-system-processes)) 'unknown 'dead))
+                  ((null observed) 'unknown)
+                  ((equal (alist-get 'state attributes) "Z") 'dead)
+                  ((equal start observed) 'live)
+                  ;; A legacy Linux wall-clock mismatch cannot prove PID reuse.
+                  ((and (not linux) (eq system-type 'gnu/linux)) 'unknown)
+                  (t 'dead)))
+        (error 'unknown)))))
 
 (defun gptel-runner-jobs--guard-claims (directory)
   "Read contender claims in stable guard DIRECTORY.
@@ -721,19 +959,21 @@ contention signals a file error instead of silently abandoning the lock."
          (ignore-errors (gptel-runner-jobs--unlock directory token))
          (signal (car err) (cdr err)))))))
 
-(defun gptel-runner-jobs--launch (invocation)
-  "Start INVOCATION independently of the dashboard on macOS."
-  (unless (eq system-type 'darwin)
-    (error "Configure a job launcher on this OS, or use the CLI run command"))
-  (require 'gptel-runner-launchd)
-  (gptel-runner-launchd-start-worker invocation))
+(defun gptel-runner-job-launch-native-worker (invocation)
+  "Start INVOCATION in a detached worker for the current operating system."
+  (gptel-runner-jobs--scheduler-call 'start-worker invocation))
+
+(defalias 'gptel-runner-jobs--launch #'gptel-runner-job-launch-native-worker)
 
 (defun gptel-runner-jobs--launcher ()
-  "Identify the configured launcher for later startup reconciliation.
-A custom launcher may have a detached child outside launchd's control."
-  (if (memq gptel-runner-job-launch-function
-            '(gptel-runner-jobs--launch gptel-runner-launchd-start-worker))
-      'launchd 'custom))
+  "Identify the configured launcher for later startup reconciliation."
+  (pcase gptel-runner-job-launch-function
+    ((or 'gptel-runner-job-launch-native-worker 'gptel-runner-jobs--launch)
+     (or (gptel-runner-jobs--scheduler) 'custom))
+    ('gptel-runner-launchd-start-worker 'launchd)
+    ('gptel-runner-systemd-start-worker 'systemd)
+    ('gptel-runner-windows-start-worker 'windows)
+    (_ 'custom)))
 
 (defun gptel-runner-jobs--new-invocation (job trigger &optional launcher)
   "Create a durable invocation of JOB for TRIGGER, claiming its job lock.
@@ -830,7 +1070,8 @@ The caller must hold the control lock and have verified current ownership."
                  (owner (plist-get fresh :worker))
                  (token (plist-get owner :token))
                  (lock (gptel-runner-jobs--job-lock (plist-get fresh :job-id))))
-       (let ((uncertain (eq (car err) 'gptel-runner-launchd-cleanup-error)))
+       (let ((uncertain (memq 'gptel-runner-job-cleanup-error
+                              (get (car err) 'error-conditions))))
          (when (or (eq (plist-get fresh :phase) 'starting)
                    (and (not uncertain) (memq (plist-get fresh :phase) '(open closing))
                         (eq (gptel-runner-jobs--lock-owner-state owner) 'dead)))
@@ -1614,7 +1855,8 @@ initialization or persistence error.  This function does not call `kill-emacs'."
               (gptel-runner-jobs--preload preloads)
               (when (memq 'gptel-agent preloads)
                 (gptel-agent-update))
-              (load (plist-get job :init-file) nil t)
+              ;; `load' expands dollar expressions even in absolute filenames.
+              (load (string-replace "$" "$$" (plist-get job :init-file)) nil t)
               (setq gptel-runner-jobs--run
                     (if (plist-get gptel-runner-jobs--invocation :restore)
                         (gptel-runner-load-run (expand-file-name "checkpoint.el" directory))
@@ -1692,10 +1934,11 @@ initialization or persistence error.  This function does not call `kill-emacs'."
 
 (defun gptel-runner-jobs-batch-main ()
   "Run the background CLI and exit with a meaningful process status.
-Arguments: worker DIRECTORY [--epoch EPOCH]; run JOB-ID [--root DIRECTORY];
-or trigger JOB-ID [--root DIRECTORY].  `run' executes in the batch process;
-`trigger' uses the configured detached launcher."
-  (let* ((arguments (delete "--" (copy-sequence command-line-args-left)))
+Use worker DIRECTORY [--epoch EPOCH], or run, scheduled-run or trigger
+with JOB-ID [--root DIRECTORY].  Scheduled operations check JOB's enabled
+flag.  Only trigger dispatches a separate worker."
+  (let* ((arguments (if (equal (car command-line-args-left) "--")
+                        (cdr command-line-args-left) command-line-args-left))
          (operation (pop arguments)) (target (pop arguments))
          (epoch-text (cadr (member "--epoch" arguments)))
          (root (cadr (member "--root" arguments)))
@@ -1711,16 +1954,19 @@ or trigger JOB-ID [--root DIRECTORY].  `run' executes in the batch process;
                                  (> (string-to-number epoch-text) 0))))
               (error "Worker epoch must be a positive integer"))
             (gptel-runner-jobs-worker target (and epoch-text (string-to-number epoch-text))))
-           ("run"
-            (let ((invocation (gptel-runner-jobs--new-invocation
-                               (gptel-runner-job-get target) 'cli 'direct)))
-              (if (eq (plist-get invocation :state) 'skipped) 0
-                (gptel-runner-jobs-worker (plist-get invocation :directory)))))
+           ((or "run" "scheduled-run")
+            (let ((job (gptel-runner-job-get target))
+                  (scheduled (equal operation "scheduled-run")))
+              (if (and scheduled (not (plist-get job :enabled))) 0
+                (let ((invocation (gptel-runner-jobs--new-invocation
+                                   job (if scheduled 'schedule 'cli) 'direct)))
+                  (if (eq (plist-get invocation :state) 'skipped) 0
+                    (gptel-runner-jobs-worker (plist-get invocation :directory)))))))
            ("trigger"
             (let ((job (gptel-runner-job-get target)))
               (when (plist-get job :enabled) (gptel-runner-job-run job 'schedule))
               0))
-           (_ (error "Usage: worker DIRECTORY | run JOB-ID | trigger JOB-ID [--root DIRECTORY]"))))
+           (_ (error "Usage: worker DIRECTORY | {run,scheduled-run,trigger} JOB-ID [--root DIRECTORY]"))))
       (error (message "Job launch failed: %s" (error-message-string err))
              (kill-emacs 2)))))
 

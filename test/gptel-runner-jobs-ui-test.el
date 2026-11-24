@@ -2,6 +2,7 @@
 
 (require 'ert)
 (require 'gptel-runner-jobs-ui)
+(defvar gptel-runner-systemctl-command)
 
 (ert-deftest gptel-runner-jobs-ui-observation-is-lazy-and-does-not-restore ()
   (let ((gptel-runner--runs (make-hash-table :test #'equal))
@@ -61,7 +62,8 @@
     (should (equal (cadr (gptel-runner-ui--call-entry run call)) ["" "reviewer"]))))
 
 (ert-deftest gptel-runner-jobs-ui-reap-is-asynchronous-throttled-and-root-scoped ()
-  (let ((system-type 'darwin)
+  (let ((system-type 'gnu/linux)
+        (gptel-runner-systemctl-command '("control wrapper" "--user" "--quiet"))
         (gptel-runner-jobs-ui--reap-process nil)
         (gptel-runner-jobs-ui--last-reap-time nil)
         (gptel-runner-job-directory "/private/tmp/a root with spaces/")
@@ -86,9 +88,13 @@
                  (form (read (car (last command)))))
             (should (equal (car command) gptel-runner-job-emacs-program))
             (should (member "--batch" command))
+            (should (equal (read (cadr (member "--eval" command)))
+                           '(setq gptel-runner-systemctl-command
+                                  '("control wrapper" "--user" "--quiet"))))
             (should (equal (cadr (car (cadr form)))
                            "/private/tmp/a root with spaces/"))
-            (should (equal (car (last form)) '(gptel-runner-launchd-reap)))))
+            (should (equal (car (last form))
+                           '(gptel-runner-jobs--scheduler-call 'reap)))))
       (when-let* ((buffer (get-buffer "*gptel-runner cleanup log*")))
         (kill-buffer buffer)))))
 
@@ -108,6 +114,21 @@
             (should (string-match-p "Could not launch test executable" (buffer-string)))))
       (when-let* ((buffer (get-buffer "*gptel-runner cleanup log*")))
         (kill-buffer buffer)))))
+
+(ert-deftest gptel-runner-jobs-ui-linux-shows-user-timer-diagnostics ()
+  (require 'gptel-runner-systemd)
+  (let ((system-type 'gnu/linux) displayed)
+    (cl-letf (((symbol-function 'gptel-runner-jobs-ui--job)
+               (lambda () '(:id "nightly")))
+              ((symbol-function 'gptel-runner-systemd--invoke)
+               (lambda (program &rest args)
+                 (should (equal program "systemctl"))
+                 (should (member "gptel-runner-schedule-nightly.timer" args))
+                 '(:exit 0 :output "active (waiting)")))
+              ((symbol-function 'gptel-runner-jobs-ui--display)
+               (lambda (_title record) (setq displayed record))))
+      (gptel-runner-jobs-diagnostics)
+      (should (equal (plist-get displayed :output) "active (waiting)")))))
 
 (ert-deftest gptel-runner-jobs-ui-run-reports-skipped-triggers ()
   (let (reported)
@@ -268,6 +289,7 @@
 (ert-deftest gptel-runner-jobs-ui-removes-only-the-selected-definition ()
   (let ((gptel-runner-job-directory (make-temp-file "runner-ui-delete-" t))
         (system-type 'gnu/linux)
+        (gptel-runner-jobs-ui--last-reap-time (float-time))
         (gptel-runner-job-launch-function #'ignore)
         (init (locate-library "gptel-runner"))
         confirm)

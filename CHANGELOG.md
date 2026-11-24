@@ -2,6 +2,12 @@
 
 ## 0.1.0 - unreleased
 
+- Run background jobs on Linux with systemd user timers, on macOS with
+  launchd, and on Windows with Task Scheduler. Runner selects the scheduler
+  automatically. The integration suite can run with plain gptel alone.
+- Customize the scheduler executable and its arguments, or supply an Elisp
+  function to build commands for another scheduling tool.
+
 - Answer or dismiss a background agent's question batch from the node panel.
   Suggested choices and free-text answers return to the requesting
   conversation, including a subagent or managed discussion.

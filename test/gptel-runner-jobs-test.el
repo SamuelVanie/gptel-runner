@@ -168,7 +168,7 @@
           (dolist (invalid '((:calendar ((:hour 24))) (:calendar (nil))
                              (:calendar ((:hour 9 :hour 10)))))
             (should-error (gptel-runner-job-schedule id invalid)))
-          (let ((system-type 'gnu/linux))
+          (let ((system-type 'berkeley-unix))
             (should-error (gptel-runner-job-schedule id '(:interval 15)) :type 'user-error)
             (should-error (gptel-runner-job-unschedule id) :type 'user-error))
           (should-not commands)

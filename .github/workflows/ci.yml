@@ -29,7 +29,12 @@ jobs:
           version: '30.2'
       - run: mkdir -p .packages
       - run: git clone --depth 1 --branch v0.9.9.6 https://github.com/karthink/gptel.git .packages/gptel
-      - run: emacs -Q --batch -L . -L test -L .packages/gptel -l test/gptel-runner-session-test.el -l test/gptel-runner-request-budget-test.el -f ert-run-tests-batch-and-exit
+      - run: make integration-test INTEGRATION_LOAD_PATH="-L .packages/gptel"
+      - name: Run a real systemd user timer and worker
+        run: |
+          sudo systemctl start "user@$(id -u).service"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          emacs -Q --batch -L . -L .packages/gptel -l test/gptel-runner-native-schedule-integration.el -f ert-run-tests-batch-and-exit
 
   gptel-master-warning:
     continue-on-error: true
@@ -42,3 +47,20 @@ jobs:
       - run: mkdir -p .packages
       - run: git clone --depth 1 https://github.com/karthink/gptel.git .packages/gptel
       - run: emacs -Q --batch -L . -L test -L .packages/gptel -l test/gptel-runner-session-test.el -l test/gptel-runner-request-budget-test.el -f ert-run-tests-batch-and-exit
+
+  windows-scheduler:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-emacs
+      - name: Run the default Windows scheduler and a detached worker
+        shell: msys2 {0}
+        env:
+          GPTEL_RUNNER_WINDOWS_SMOKE: "1"
+        run: /ucrt64/bin/emacs.exe -Q --batch -L . -L test -l gptel-runner-windows-test --eval "(ert-run-tests-batch-and-exit 'gptel-runner-windows-native-scheduler-and-worker)"
+      - name: Check Windows scheduler rules and command overrides
+        shell: msys2 {0}
+        run: /ucrt64/bin/emacs.exe -Q --batch -L . -L test -l gptel-runner-windows-test -f ert-run-tests-batch-and-exit

@@ -1,6 +1,7 @@
 ;;; gptel-runner.el --- Workflows over gptel conversations -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
+;; URL: https://github.com/SamuelVanie/gptel-runner
 ;; Package-Requires: ((emacs "29.1") (gptel "0.9.9.6"))
 ;; Keywords: tools, convenience
 

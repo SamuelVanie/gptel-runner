@@ -14,8 +14,6 @@
 (require 'gptel-runner-ui)
 (require 'gptel-runner-jobs)
 
-(declare-function gptel-runner-launchd-diagnostics "gptel-runner-launchd")
-(declare-function gptel-runner-launchd-reap "gptel-runner-launchd")
 (declare-function gptel-runner-invocation-outputs "gptel-runner-jobs")
 (declare-function gptel-runner-invocation-call "gptel-runner-jobs")
 (declare-function gptel-runner-invocation-commands "gptel-runner-jobs")
@@ -651,7 +649,7 @@ With prefix argument DELETE-CHECKPOINTS, also delete recovery checkpoints."
   "Lazily clean completed worker registrations outside the editor process.
 Start at most one subprocess, no more frequently than every thirty seconds.
 No timer is installed: cleanup is requested only when the jobs view refreshes."
-  (when (and (eq system-type 'darwin)
+  (when (and (or (gptel-runner-jobs--scheduler) gptel-runner-job-scheduler-program)
              (not (and (processp gptel-runner-jobs-ui--reap-process)
                        (process-live-p gptel-runner-jobs-ui--reap-process)))
              (or (null gptel-runner-jobs-ui--last-reap-time)
@@ -660,17 +658,17 @@ No timer is installed: cleanup is requested only when the jobs view refreshes."
     (let ((buffer (get-buffer-create "*gptel-runner cleanup log*"))
           (form `(let ((gptel-runner-job-directory
                         ,(expand-file-name gptel-runner-job-directory)))
-                   (require 'gptel-runner-launchd)
-                   (gptel-runner-launchd-reap))))
+                   (gptel-runner-jobs--scheduler-call 'reap))))
       (condition-case err
           (setq gptel-runner-jobs-ui--reap-process
                 (make-process
                  :name "gptel-runner-cleanup" :buffer buffer :noquery t
                  :connection-type 'pipe
-                 :command (list gptel-runner-job-emacs-program "-Q" "--batch"
-                                "-L" gptel-runner-jobs--package-directory
-                                "-l" "gptel-runner-jobs"
-                                "--eval" (prin1-to-string form))
+                 :command (append (list gptel-runner-job-emacs-program "-Q" "--batch"
+                                        "-L" gptel-runner-jobs--package-directory
+                                        "-l" "gptel-runner-jobs")
+                                  (gptel-runner-jobs--native-settings-arguments)
+                                  (list "--eval" (prin1-to-string form)))
                  :sentinel #'gptel-runner-jobs-ui--reap-sentinel))
         (error
          (with-current-buffer buffer
@@ -713,10 +711,9 @@ No timer is installed: cleanup is requested only when the jobs view refreshes."
 (defun gptel-runner-jobs-diagnostics ()
   "Show scheduler diagnostics for the selected job."
   (interactive)
-  (require 'gptel-runner-launchd)
   (gptel-runner-jobs-ui--display
    "*gptel-runner schedule diagnostics*"
-   (gptel-runner-launchd-diagnostics (gptel-runner-jobs-ui--job))))
+   (gptel-runner-jobs--scheduler-call 'diagnostics (gptel-runner-jobs-ui--job))))
 
 (defun gptel-runner-jobs-remove ()
   "Delete the selected job and its schedule, preserving its runs."

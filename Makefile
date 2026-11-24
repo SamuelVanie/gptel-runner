@@ -16,6 +16,7 @@ integration-test:
 	  -f ert-run-tests-batch-and-exit
 	$(EMACS) -Q --batch $(INTEGRATION_LOAD_PATH) -L . -L test \
 	  --eval '(setq load-prefer-newer t)' \
+	  --eval '(unless (locate-library "gptel-agent") (message "Skipping optional gptel-agent delegation tests") (kill-emacs 0))' \
 	  -l test/gptel-runner-request-budget-delegation.el \
 	  -l test/gptel-runner-question-integration.el \
 	  --eval '(ert-run-tests-batch-and-exit "^gptel-runner-delegation-")'
