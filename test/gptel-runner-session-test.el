@@ -177,6 +177,68 @@
           (gptel-runner-gptel-test--handoff next "November report")
           (should (eq 'succeeded (gptel-runner-run-state run))))))))
 
+(ert-deftest gptel-runner-session-legacy-preset-directive ()
+  (skip-unless (and (require 'gptel-agent nil t)
+                    (gptel-runner-store--agent-sessions-p)))
+  (gptel-runner-session-test--with-run
+    ;; Written by the pre-fix Agent (0e91a54) after the first model response.
+    (let* ((fixture (expand-file-name
+                     "fixtures/legacy-agent-directive.eld"
+                     (file-name-directory (locate-library "gptel-runner-session-test"))))
+           (file (expand-file-name "report.snapshot.el" gptel-runner-snapshot-directory))
+           (gptel--known-presets (copy-tree gptel--known-presets)))
+      (copy-file fixture file)
+      (gptel-make-preset 'report-style :system #'gptel-runner-session-test--report-directive
+                         :model 'replacement
+                         :pre (lambda () (ert-fail "Ran a preset hook")))
+      (gptel-runner-register-agent 'reporter :preset 'report-style)
+      (gptel-runner-defworkflow report (:persist t)
+        (gptel-runner-agent-step :id 'draft :agent 'reporter :prompt "Draft a report"))
+      (let* ((run (gptel-runner-load-run file))
+             (call (car (gptel-runner-run-calls run)))
+             (record (cdr (gethash 'draft (gptel-runner-run-chats run))))
+             (settings (plist-get record :settings)))
+        (should (eq 'report-style (alist-get 'gptel--preset settings)))
+        (should-not (assq 'gptel-system-prompt settings))
+        (should-not requests)
+        (gptel-runner-gptel-feedback call "Use November.")
+        (let* ((next (pop requests))
+               (data (plist-get (gptel-fsm-info next) :data))
+               (messages (plist-get data :messages)))
+          (should (equal (plist-get data :model) "runner-test"))
+          (should (string-search "Use the audit style." (plist-get (aref messages 0) :content)))
+          (should (equal "Example finding?" (plist-get (aref messages 1) :content)))
+          (should (equal "An audit finding." (plist-get (aref messages 2) :content)))
+          (gptel-runner-gptel-test--handoff next "November report")
+          (should (eq 'succeeded (gptel-runner-run-state run))))))))
+
+(ert-deftest gptel-runner-session-legacy-directive-respects-saved-settings ()
+  (with-temp-buffer
+    (setq-local gptel--known-presets
+                '((node :parents (early style))
+                  (early :system "Earlier parent")
+                  (style :system-prompt style-directive)
+                  (unrelated :system gptel-runner-session-test--report-directive))
+                gptel-directives
+                '((style-directive . gptel-runner-session-test--report-directive)))
+    (let ((chat (current-buffer)))
+      ;; Opening the node from an unrelated buffer uses the node's registry.
+      (with-temp-buffer
+        (gptel-runner-gptel-restore-preset-directive chat 'node '((gptel--preset . node))))
+      (should (eq gptel-system-prompt #'gptel-runner-session-test--report-directive)))
+    (dolist (settings '(((gptel--preset . node) (gptel-system-prompt))
+                        ((gptel--preset . node) (gptel-system-prompt . "Custom"))
+                        ((gptel--preset . unrelated))))
+      (let ((expected (alist-get 'gptel-system-prompt settings "Default")))
+        (setq-local gptel-system-prompt expected)
+        (gptel-runner-gptel-restore-preset-directive (current-buffer) 'node settings)
+        (should (equal expected gptel-system-prompt))))
+    ;; A static preset cannot identify an old function-valued local override.
+    (setq-local gptel-system-prompt "Default")
+    (gptel-runner-gptel-restore-preset-directive
+     (current-buffer) 'early '((gptel--preset . early)))
+    (should (equal gptel-system-prompt "Default"))))
+
 (defun gptel-runner-session-test--change-mode (mode call)
   "Switch the current node chat to MODE without losing CALL's lifecycle."
   (let ((submitted gptel-runner-gptel--submitted-end)

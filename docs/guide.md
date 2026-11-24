@@ -1136,7 +1136,18 @@ package can encode the assistant and tool boundaries, settings, and drafts
 inside the runner checkpoint. When the chat uses a function-valued system
 prompt, gptel-agent captures its text and any example turns at checkpoint
 time. Feedback after recovery uses those saved instructions, including
-chat-local overrides. Plain gptel uses its own saved-chat format.
+chat-local overrides.
+
+Older gptel-agent checkpoints sometimes stored only the preset name for a
+function-valued system prompt. When that name matches the registered
+workflow node's preset, Runner can use its current directive function,
+including one inherited from a parent preset. Explicit saved instructions
+take precedence, including an empty or disabled prompt. The exact historical
+text of an omitted directive or chat-local override is unavailable. If the
+function was removed or changed, set the desired system prompt in the node
+chat before sending feedback.
+
+Plain gptel uses its own saved-chat format.
 The runner keeps exclusive ownership even with global
 `gptel-agent-session-mode` enabled. The global agent session browser is for
 independent agent chats. Use `M-x gptel-runner-open-session` to recover

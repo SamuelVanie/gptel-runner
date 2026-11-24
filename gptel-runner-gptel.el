@@ -66,6 +66,8 @@
 (defvar gptel-tools)
 (defvar gptel-use-tools)
 (defvar gptel-system-prompt)
+(defvar gptel--known-presets)
+(defvar gptel-directives)
 (defvar gptel--schema)
 (defvar gptel-agent-child-buffer-functions)
 (defvar gptel-agent-session-managed-externally)
@@ -786,6 +788,39 @@ SOURCE is a live buffer or text returned by `gptel-runner-gptel-chat-text'."
   (with-temp-buffer
     (let ((coding-system-for-read 'utf-8-unix)) (insert-file-contents file))
     (gptel-runner-gptel-chat-from-text (buffer-string))))
+
+(defun gptel-runner-gptel--registered-system-setting (preset &optional parents)
+  "Return (VALUE) for PRESET's system setting, following its PARENTS.
+Use only the host registry, without activating hooks or computed settings."
+  (unless (member preset parents)
+    ;; gptel-agent can advise gptel-get-preset to read definitions from
+    ;; the workspace.  A checkpoint must not select code through such files.
+    (let ((spec (if (consp preset) preset
+                  (alist-get preset gptel--known-presets nil nil #'equal)))
+          setting)
+      (cl-loop for (key value) on spec by #'cddr
+               when (memq key '(:system :system-prompt :system-message))
+               do (setq setting (list value)))
+      (or setting
+          ;; gptel applies parents in order, then the preset itself.
+          (cl-loop for parent in (reverse (ensure-list (plist-get spec :parents)))
+                   thereis (gptel-runner-gptel--registered-system-setting
+                            parent (cons preset parents)))))))
+
+(defun gptel-runner-gptel-restore-preset-directive (buffer preset settings)
+  "Recover an omitted legacy directive in BUFFER from the node's local PRESET.
+SETTINGS is the imported chat's alist.  Explicit values, including nil,
+take precedence.  Install only a locally configured directive function."
+  (with-current-buffer buffer
+    (when-let* ((preset) ((symbolp preset))
+                ((eq preset (alist-get 'gptel--preset settings)))
+                ((not (assq 'gptel-system-prompt settings)))
+                (value (car (gptel-runner-gptel--registered-system-setting preset)))
+                (directive (if (and (symbolp value) (not (functionp value)))
+                               (alist-get value gptel-directives)
+                             value))
+                ((functionp directive)))
+      (setq-local gptel-system-prompt directive))))
 
 (defun gptel-runner-gptel--apply-preset-locally (preset)
   "Apply symbol or plist PRESET in the current worker buffer.

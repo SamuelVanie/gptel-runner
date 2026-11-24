@@ -25,6 +25,7 @@
 (declare-function gptel-runner-gptel-submitted-end "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-rendered-end "gptel-runner-gptel")
 (declare-function gptel-runner-gptel-restore-submitted-end "gptel-runner-gptel")
+(autoload 'gptel-runner-gptel-restore-preset-directive "gptel-runner-gptel")
 
 (declare-function gptel-agent-session-buffer-record "gptel-agent-session")
 (declare-function gptel-agent-session-buffer-from-record "gptel-agent-session")
@@ -309,6 +310,9 @@ and for nodes that execute without a gptel conversation."
           ('gptel-agent
            (setq buffer (gptel-runner-store--import-agent-chat
                          #'gptel-agent-session-buffer-from-record (cdr chat)))
+           (gptel-runner-gptel-restore-preset-directive
+            buffer (gptel-runner-agent-preset (gptel-runner-call-agent call))
+            (plist-get (cdr chat) :settings))
            (let ((data (gptel-runner-call-driver-data call)))
              (gptel-runner-gptel-restore-submitted-end
               buffer (plist-get data :submitted-end) (plist-get data :rendered-end))))
