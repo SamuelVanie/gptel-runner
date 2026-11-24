@@ -104,7 +104,8 @@
                                     (gptel-runner-ui--approval-count (length pending))
                                   (gptel-runner-ui--state (plist-get call :state)))))
                     (elapsed . ,(gptel-runner-jobs-ui--elapsed call))
-                    (attempts . ,(format "%s" (or (plist-get call :attempts) 0))))))
+                    (attempts . ,(format "%s" (or (plist-get call :attempts) 0)))
+                    (iteration . ,(or (plist-get call :iteration) "-")))))
            entries))))
     (nreverse entries)))
 

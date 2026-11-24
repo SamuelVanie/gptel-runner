@@ -637,6 +637,10 @@
          (gptel-runner-jobs-test--command invocation (cadr spec) (caddr spec))
          (setq invocation (gptel-runner-jobs-test--finished invocation))
          (should (= 2 (plist-get invocation :epoch)))
+         (when (eq (car spec) 'job-repeat-workflow)
+           (should (equal (mapcar (lambda (call) (plist-get call :iteration))
+                                  (plist-get invocation :calls))
+                          '(1 2))))
          (should (eq (plist-get invocation :state) 'succeeded)))))))
 
 (ert-deftest gptel-runner-jobs-call-pause-accept-and-cancel ()

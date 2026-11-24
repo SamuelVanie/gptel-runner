@@ -55,6 +55,31 @@
       (should (equal "Done" (gptel-runner-get run 'answer)))
       (should (string-search "Done" (with-current-buffer chat (buffer-string)))))))
 
+(ert-deftest gptel-runner-session-dashboard-retains-call-iterations ()
+  (gptel-runner-session-test--with-run
+    (gptel-runner-defworkflow session-iterations (:persist t)
+      (gptel-runner-sequence
+       (gptel-runner-agent-step :id 'prepare :agent 'reader :prompt "Prepare")
+       (gptel-runner-repeat-until
+        :id 'loop :max 3
+        :until (lambda (run) (= (gptel-runner-iteration run 'loop) 3))
+        :body (gptel-runner-agent-step :id 'check :agent 'reader :prompt "Check"))))
+    (let* ((gptel-runner-dashboard-columns '(iteration))
+           (run (gptel-runner-start 'session-iterations))
+           (file (gptel-runner-run-snapshot-file run)))
+      (cl-labels ((cell (call) (aref (cadr (gptel-runner-ui--call-entry run call)) 0)))
+        (dolist (reply '("Prepared" "First" "Second" "Third"))
+          (gptel-runner-gptel-test--handoff (pop requests) reply))
+        (should (eq 'succeeded (gptel-runner-run-state run)))
+        (should (equal (mapcar #'cell (gptel-runner-run-calls run)) '("-" "1" "2" "3")))
+        (gptel-runner-forget-run run)
+        (setq run (gptel-runner-load-run file))
+        (should (equal (mapcar #'cell (gptel-runner-run-calls run)) '("-" "1" "2" "3")))
+        (let ((legacy (gptel-runner-store--call-record (cadr (gptel-runner-run-calls run)))))
+          (cl-remf legacy :iteration)
+          (should (equal (cell (gptel-runner-store--restore-call run legacy)) "-")))
+        (should-not requests)))))
+
 (defun gptel-runner-session-test--checkpoint ()
   "Verify that an editable, paused chat survives the whole run lifecycle."
   (gptel-runner-session-test--with-run

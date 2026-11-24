@@ -122,13 +122,15 @@ deactivated, and to roll back a refused or failed admission attempt.")
 (cl-defstruct (gptel-runner-call
                (:constructor gptel-runner-call-create))
   "One logical agent or Elisp invocation.
-AGENT is nil for Elisp calls, which do not use a provider driver."
+AGENT is nil for Elisp calls, which do not use a provider driver.
+ITERATION is the one-based iteration of the innermost repeat when queued,
+or nil for calls outside repeats and older checkpoints."
   id run node agent prompt workspace buffer fsm
   (state 'pending) (request-attempt 0) retry-timer (generation 0)
   response-parts result error started-at finished-at on-complete
   driver-data repair-p tool-names
   elisp-cleanup elisp-cleanup-reason elisp-timer elisp-deadline
-  discussion-owner follow-up-p)
+  discussion-owner follow-up-p iteration)
 
 (cl-defstruct (gptel-runner-run
                (:constructor gptel-runner-run-create))
@@ -1297,12 +1299,17 @@ OWNER identifies the downstream node whose question this call serves."
                   (gptel-runner-budget-max-calls
                    (gptel-runner-run-budget run))))
         nil)
-    (let ((call (gptel-runner-call-create
-                 :id (gptel-runner--id "call") :run run :node node
-                 :agent agent :prompt prompt
-                 :workspace (gptel-runner-node-workspace run node)
-                 :state 'ready :on-complete done :repair-p repair-p
-                 :discussion-owner owner)))
+    (let* ((repeat (cl-find 'repeat (gptel-runner-node-path run node)
+                            :key #'gptel-runner-node-kind :from-end t))
+           (call (gptel-runner-call-create
+                  :id (gptel-runner--id "call") :run run :node node
+                  :agent agent :prompt prompt
+                  :workspace (gptel-runner-node-workspace run node)
+                  :iteration (when repeat
+                               (1+ (gptel-runner-iteration
+                                    run (gptel-runner-node-id repeat))))
+                  :state 'ready :on-complete done :repair-p repair-p
+                  :discussion-owner owner)))
       (setf (gptel-runner-run-calls run)
             (nconc (gptel-runner-run-calls run) (list call))
             (gptel-runner-run-queue run)

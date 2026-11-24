@@ -8,10 +8,10 @@
         (gptel-runner--workflows (make-hash-table :test #'eq))
         (gptel-runner-dashboard-entry-functions
          '(gptel-runner-jobs-ui--entries))
-        (gptel-runner-dashboard-columns '(workflow run node state))
+        (gptel-runner-dashboard-columns '(iteration))
         (manifest '(:id "invocation-1" :workflow inspect :state running
                     :calls ((:id "call-2" :epoch 1 :node inspect :state succeeded)
-                            (:id "call-2" :epoch 2 :node inspect :state running)))))
+                            (:id "call-2" :epoch 2 :node inspect :state running :iteration 2)))))
     (cl-letf (((symbol-function 'gptel-runner-invocation-list)
                (lambda () (list manifest)))
               ((symbol-function 'gptel-runner-load-run)
@@ -26,6 +26,7 @@
                        '((background-run "invocation-1")
                          (background-call "invocation-1" 1 "call-2")
                          (background-call "invocation-1" 2 "call-2"))))
+        (should (equal (mapcar #'cadr (cdr rows)) '(["-"] ["2"])))
         (should (= (hash-table-count gptel-runner--runs) 0))))))
 
 (ert-deftest gptel-runner-jobs-ui-source-preserves-local-entries ()

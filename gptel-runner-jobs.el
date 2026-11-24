@@ -1198,6 +1198,7 @@ Opaque runtime objects and circular references are represented by type."
                              :started-at (gptel-runner-call-started-at call)
                              :finished-at (gptel-runner-call-finished-at call)
                              :attempts (gptel-runner-call-request-attempt call)
+                             :iteration (gptel-runner-call-iteration call)
                              :record (concat base ".el"))))
           (setq record (append record (gptel-runner-jobs--export-chat call epoch)))
           (when-let* ((children (gethash (gptel-runner-call-id call) children-by-call)))

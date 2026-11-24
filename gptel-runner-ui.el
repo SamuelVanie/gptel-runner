@@ -276,9 +276,7 @@ An elided value retains its complete unpropertized text as hover help."
         (elapsed . ,(gptel-runner-ui--elapsed run call))
         (attempts . ,(number-to-string
                       (gptel-runner-call-request-attempt call)))
-        (iteration . ,(number-to-string
-                       (gptel-runner-iteration
-                        run (gptel-runner-node-id node))))
+        (iteration . ,(or (gptel-runner-call-iteration call) "-"))
         (requests . ,(gptel-runner-ui--remaining
                       run #'gptel-runner-budget-requests
                       #'gptel-runner-budget-max-requests))

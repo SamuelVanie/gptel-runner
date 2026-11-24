@@ -470,6 +470,7 @@ and for nodes that execute without a gptel conversation."
   (list :id (gptel-runner-call-id call)
         :node (gptel-runner-node-id (gptel-runner-call-node call))
         :state (gptel-runner-call-state call)
+        :iteration (gptel-runner-call-iteration call)
         :discussion-owner (gptel-runner-call-discussion-owner call)
         :discussion-wait (plist-get (gptel-runner-call-driver-data call) :discussion-wait)
         :submitted-end (gptel-runner-store--chat-position
@@ -963,6 +964,7 @@ Noninteractive shutdown relies on the best-effort `kill-emacs-hook' flush."
      :agent (gptel-runner--agent (plist-get (gptel-runner-node-properties node) :agent))
      :state (if (or (gptel-runner--terminal-p state) (eq state 'waiting-feedback))
                 state 'paused)
+     :iteration (plist-get record :iteration)
      :discussion-owner (plist-get record :discussion-owner)
      :started-at (plist-get record :started-at) :finished-at (plist-get record :finished-at)
      :result (plist-get record :result) :error (plist-get record :error)

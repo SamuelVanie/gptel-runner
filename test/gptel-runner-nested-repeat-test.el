@@ -56,6 +56,9 @@ optionally tracks inner progress.  Both loops collect the worker's result."
         (should (= (length (gptel-runner-fake-driver-starts driver)) 4))
         (should (equal (nreverse observed)
                        '((0 0) (0 1) (0 2) (1 0) (1 1) (1 2))))
+        (should (equal (mapcar #'gptel-runner-call-iteration
+                               (gptel-runner-run-calls run))
+                       '(1 2 1 2)))
         (should (= (gptel-runner-iteration run 'outer) 2))
         (should (= (gptel-runner-iteration run 'inner) 2))
         (gptel-runner-nested-repeat-test--assert-history run)))))

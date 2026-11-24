@@ -724,6 +724,9 @@ Available symbols are `item`, `workflow`, `run`, `node`, `call`, `job`, `agent`,
 dashboard after changing the variable, or choose `V` from the `?` action menu
 to toggle one column interactively.  The same action is available as
 `M-x gptel-runner-dashboard-toggle-column`.
+The `iteration` column shows the one-based iteration of the innermost repeat
+when the call was queued. Calls outside repeats and older saved calls without
+an iteration show `-`.
 The default `item` column groups job/workflow runs and their nodes into a compact
 tree.  Press `TAB` on a run or node to collapse or expand that run; press `RET`
 or click a row to open it.  Separate workflow, run, node, and job columns remain
