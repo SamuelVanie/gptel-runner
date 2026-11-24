@@ -116,13 +116,16 @@ Signal an error for malformed data or an unknown verdict."
                  (prin1-to-string (gptel-runner-normalize-review review)))))
 
 (defun gptel-runner-workspace-diff-key (run)
-  "Return a Git diff hash for RUN, or nil when Git is unavailable/inapplicable."
-  (when (and (executable-find "git")
-             (file-directory-p
-              (expand-file-name ".git" (gptel-runner-run-workspace run))))
+  "Hash the unstaged Git diff from RUN's workspace.
+Git discovers the worktree from the workspace directory.  Return nil
+when the workspace has no worktree or Git cannot produce a diff."
+  (when-let* ((workspace (gptel-runner-run-workspace run))
+              ((file-directory-p workspace)))
     (with-temp-buffer
-      (let ((default-directory (gptel-runner-run-workspace run)))
-        (when (zerop (process-file "git" nil t nil "diff" "--no-ext-diff"))
+      (let ((default-directory workspace))
+        (when (and (executable-find "git" t)
+                   (equal 0 (process-file "git" nil '(t nil) nil
+                                          "diff" "--no-ext-diff")))
           (secure-hash 'sha256 (buffer-string)))))))
 
 (defun gptel-runner-review-diff-progress-key (run &optional review-key)

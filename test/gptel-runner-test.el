@@ -951,6 +951,57 @@
         (should (eq (gptel-runner-run-state run) 'stalled))
         (should (= (gptel-runner-iteration run 'cycle) 2))))))
 
+(ert-deftest gptel-runner-review-diff-progress-in-linked-worktree ()
+  (skip-unless (executable-find "git"))
+  (gptel-runner-test--isolated
+    (let* ((temp (make-temp-file "runner-review-diff-" t))
+           (process-environment
+            (append (list (concat "GIT_CONFIG_GLOBAL=" null-device)
+                          (concat "GIT_CEILING_DIRECTORIES=" (file-truename temp))
+                          "GIT_CONFIG_NOSYSTEM=1")
+                    (seq-remove (lambda (entry) (string-prefix-p "GIT_" entry))
+                                process-environment)))
+           (primary (expand-file-name "primary/" temp))
+           (linked (expand-file-name "linked/" temp))
+           (workspace (expand-file-name "src/" linked)))
+      (unwind-protect
+          (progn
+            (make-directory (expand-file-name "src" primary) t)
+            (let ((default-directory primary))
+              (should-not (gptel-runner-workspace-diff-key
+                           (gptel-runner-run-create :workspace primary)))
+              (cl-flet ((git (&rest args)
+                          (should (zerop (apply #'process-file "git" nil nil nil
+                                                args)))))
+                (git "init" "-q")
+                (with-temp-file "src/tracked" (insert "original\n"))
+                (git "add" "src/tracked")
+                (git "-c" "user.name=Runner" "-c" "user.email=runner@example.org"
+                     "commit" "--no-gpg-sign" "-qm" "Initial")
+                (git "worktree" "add" "-q" "--detach" linked)))
+            (let* ((clean (gptel-runner-workspace-diff-key
+                           (gptel-runner-run-create :workspace linked)))
+                   (run (gptel-runner-start
+                         (gptel-runner-repeat-until
+                          :id 'cycle :max 4
+                          :progress-key #'gptel-runner-review-diff-progress-key
+                          :body (gptel-runner-elisp-step
+                                 :workspace-mode 'write
+                                 :function
+                                 (lambda (run _node)
+                                   (when (= 1 (gptel-runner-iteration run 'cycle))
+                                     (with-temp-file "tracked" (insert "edited\n"))))))
+                         :workspace workspace :allow-writes t
+                         :inputs '((review :verdict revise :summary "same"
+                                           :issues nil))))
+                   (edited (gptel-runner-workspace-diff-key run)))
+              (should (stringp clean))
+              (should (stringp edited))
+              (should-not (equal clean edited))
+              (should (eq (gptel-runner-run-state run) 'stalled))
+              (should (= (gptel-runner-iteration run 'cycle) 3))))
+        (delete-directory temp t)))))
+
 (ert-deftest gptel-runner-parallel-obeys-concurrency-and-synthesizes ()
   (gptel-runner-test--isolated
     (dolist (agent '(a b c synth)) (gptel-runner-register-agent agent :preset 'p))
