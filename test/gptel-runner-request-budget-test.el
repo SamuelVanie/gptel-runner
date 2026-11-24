@@ -389,5 +389,26 @@
         (should-not requests)
         (should (zerop (gptel-runner-run-active-count run)))))))
 
+(ert-deftest gptel-runner-request-budget-expired-duration-stops-native-send ()
+  (dolist (site '(prompt-transform request-started))
+    (gptel-runner-gptel-test--with-transport
+      (gptel-runner-register-agent 'reader)
+      (let* ((now 100.0)
+             (gptel-prompt-transform-functions
+              (list (lambda () (when (eq site 'prompt-transform) (cl-incf now 1)))))
+             (gptel-runner-event-hook
+              (list (lambda (event)
+                      (when (and (eq site 'request-started)
+                                 (eq (gptel-runner-event-type event) site))
+                        (cl-incf now 1))))))
+        (cl-letf (((symbol-function 'float-time) (lambda (&optional _) now)))
+          (let ((run (gptel-runner-start
+                      (gptel-runner-agent-step :id 'read :agent 'reader :prompt "Read")
+                      :completion 'response :max-duration 1)))
+            (should-not requests)
+            (should (eq (plist-get (gptel-runner-run-terminal-data run) :kind) 'duration))
+            (should (zerop (gptel-runner-run-active-count run)))
+            (should (zerop (gptel-runner-request-budget-test--count run)))))))))
+
 (provide 'gptel-runner-request-budget-test)
 ;;; gptel-runner-request-budget-test.el ends here

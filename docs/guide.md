@@ -130,7 +130,10 @@ with prose, the call waits for feedback. From its dashboard row, use `? f`
 to send another turn or `? a` to accept the current answer. Set
 `:pause-after t` when even an explicit handoff needs human approval.
 The runner applies the node's parser and validator to the accepted message
-and stores the parsed result under `:save-as`. An agent with a JSON schema
+and stores the parsed result under `:save-as`. Prompt and context functions,
+parsers, and validators all count toward the active duration budget. If one
+reaches the deadline, the runner expires the current phase before sending a
+request, accepting a result, or starting a repair. An agent with a JSON schema
 receives the schema as instructions for the handoff message.
 
 For a preset or provider that should complete a node on a normal text
@@ -501,8 +504,9 @@ are nonnegative integers, each defaulting to 1. These allowances include
 retries and repairs. Body work is stopped before finalization starts, and
 late body results are ignored. The finalizer's allowance cannot be increased
 with `gptel-runner-extend`; pause stops its active-duration clock and resume
-uses what remains. As with Elisp steps, a timer cannot interrupt Lisp that
-does not yield; elapsed duration is checked when an Elisp step returns.
+uses what remains. Emacs timers cannot interrupt synchronous Lisp that does
+not yield. The runner checks the finalizer’s own clock when its prompt and
+context functions, parsers, validators, flow predicates, and Elisp steps return.
 
 Cancellation remains an immediate stop by default. `:on-cancel 'finalize`
 explicitly permits finalization after a run or body cancellation. Cancelling

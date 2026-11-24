@@ -697,6 +697,24 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
        (gptel-runner--emit run 'snapshot-error nil nil err)
        nil))))
 
+(defun gptel-runner--duration-due-p (run)
+  "Return non-nil when RUN's active duration allowance has elapsed."
+  (and (gptel-runner-run-duration-remaining run)
+       (gptel-runner-run-active-started-at run)
+       (>= (- (float-time) (gptel-runner-run-active-started-at run))
+           (gptel-runner-run-duration-remaining run))))
+
+(defun gptel-runner--check-duration (run &optional request-reserved)
+  "Expire RUN's active phase if due, otherwise return non-nil.
+If REQUEST-RESERVED, release the unsent attempt before recording expiry."
+  (if (gptel-runner--duration-due-p run)
+      (progn
+        (when request-reserved
+          (cl-decf (gptel-runner-budget-requests (gptel-runner-run-budget run))))
+        (gptel-runner--duration-expired run (gptel-runner-run-generation run))
+        nil)
+    t))
+
 (defun gptel-runner--stop-duration-clock (run)
   "Stop RUN's active-duration clock and preserve remaining seconds."
   (when (timerp (gptel-runner-run-duration-timer run))
@@ -891,7 +909,8 @@ When IMMEDIATE is non-nil, bypass the automatic checkpoint debounce."
 (defun gptel-runner--driver-result (call generation status value metadata)
   "Handle driver STATUS for CALL at GENERATION with VALUE and METADATA."
   (when (and (= generation (gptel-runner-call-generation call))
-             (not (gptel-runner--call-terminal-p call)))
+             (not (gptel-runner--call-terminal-p call))
+             (gptel-runner--check-duration (gptel-runner-call-run call)))
     (pcase status
       ('discussion
        (if (gptel-runner--empty-output-p value)
@@ -975,10 +994,7 @@ Cleanup errors are journaled without interrupting scheduler teardown."
       ;; CPU-bound Lisp cannot service timers.  Check elapsed time before
       ;; publishing output or starting a retry or another workflow node.
       (cond
-       ((and (gptel-runner-run-duration-remaining run)
-             (gptel-runner-run-active-started-at run)
-             (>= (- (float-time) (gptel-runner-run-active-started-at run))
-                 (gptel-runner-run-duration-remaining run)))
+       ((gptel-runner--duration-due-p run)
         (gptel-runner--duration-expired run (gptel-runner-run-generation run)))
        ((and (gptel-runner-call-elisp-deadline call)
              (>= (float-time) (gptel-runner-call-elisp-deadline call)))
@@ -1061,7 +1077,8 @@ are never attributed to this function."
     ;; call, including by yielding to an interactive command.  Never revive it.
     (when (and (eq (gptel-runner-run-state run) 'running)
                (eq (gptel-runner-call-state call) 'ready)
-               (memq call (gptel-runner-run-active-calls run)))
+               (memq call (gptel-runner-run-active-calls run))
+               (gptel-runner--check-duration run))
       (if (not (or driver-counts (gptel-runner--consume-request run)))
           (gptel-runner--finish-call
            call 'failed
@@ -1086,7 +1103,8 @@ are never attributed to this function."
                      (= generation (gptel-runner-call-generation call))
                      (eq (gptel-runner-run-state run) 'running)
                      (eq (gptel-runner-call-state call) 'running)
-                     (memq call (gptel-runner-run-active-calls run)))
+                     (memq call (gptel-runner-run-active-calls run))
+                     (gptel-runner--check-duration run (not driver-counts)))
             (condition-case err
                 (gptel-runner-driver-start
                  (gptel-runner-run-driver run) call
@@ -1452,6 +1470,9 @@ Aborting again during finalization stops it immediately."
   "Fail RUN if its duration timer for GENERATION is still current."
   (when (and (= generation (gptel-runner-run-generation run))
              (not (gptel-runner--run-terminal-p run)))
+    ;; A synchronous check can expire the phase before its timer fires.
+    (when (timerp (gptel-runner-run-duration-timer run))
+      (cancel-timer (gptel-runner-run-duration-timer run)))
     (setf (gptel-runner-run-state run) 'timing-out
           (gptel-runner-run-duration-timer run) nil
           (gptel-runner-run-duration-remaining run) 0

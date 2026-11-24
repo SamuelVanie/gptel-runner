@@ -176,5 +176,128 @@
       (should-not done)
       (should (eq (gptel-runner-node-state run 'owner) 'running)))))
 
+(defun gptel-runner-flow-duration-test--agent (site outcome finalizer)
+  "Exhaust the body or FINALIZER allowance at SITE, returning OUTCOME."
+  (gptel-runner-dispatch-test--isolated
+    (gptel-runner-register-agent 'worker)
+    (let* ((driver (gptel-runner-fake-driver-create))
+           (building (memq site '(prompt context)))
+           (limit (if building 0.02 0.05))
+           (elapsed (if building 0.15 0.3))
+           (now 100.0) (callbacks 0) visits)
+      (gptel-runner-fake-queue driver 'worker '(:value "answer"))
+      (cl-labels ((visit (where value)
+                    (push where visits)
+                    (if (eq site where)
+                        (progn
+                          (cl-incf now elapsed)
+                          (gptel-runner-flow-duration-test--return outcome))
+                      value)))
+        (cl-letf (((symbol-function 'float-time) (lambda (&optional _) now)))
+          (let* ((agent (gptel-runner-agent-step
+                         :id 'worker :agent 'worker :save-as 'answer
+                         :prompt (lambda (&rest _) (visit 'prompt "task"))
+                         :context (list (lambda (&rest _) (visit 'context "context"))
+                                        (lambda (&rest _) (visit 'more "more")))
+                         :parser (lambda (value) (visit 'parser value))
+                         :validator (lambda (_value) (visit 'validator t))
+                         :repair-invalid t :retries 1))
+                 (other (gptel-runner-elisp-step
+                         :id 'other :save-as 'other :function (lambda (&rest _) 'done)))
+                 (run (gptel-runner-start
+                       (gptel-runner-finalize
+                        :max-duration (if finalizer limit 10)
+                        :body (if finalizer other agent)
+                        :finally (if finalizer agent other))
+                       :max-duration (if finalizer 10 limit) :driver driver
+                       :callback (lambda (_run) (cl-incf callbacks))))
+                 (record (gptel-runner-finalization-outcome run))
+                 (result (plist-get record :result))
+                 (failure (if finalizer (plist-get result :value)
+                            (gptel-runner-run-terminal-data run))))
+            (should (equal (nreverse visits)
+                           (pcase site
+                             ('prompt '(prompt))
+                             ('context '(prompt context))
+                             ('parser '(prompt context more parser))
+                             ('validator '(prompt context more parser validator)))))
+            (should (eq (plist-get failure :kind) 'duration))
+            (should (equal (plist-get failure :limit) limit))
+            (should (eq (gptel-runner-node-state run 'worker) 'failed))
+            (should (eq (gptel-runner-run-state run) (if finalizer 'succeeded 'failed)))
+            (should (eq (plist-get result :state) (if finalizer 'failed 'succeeded)))
+            (should (eq (gptel-runner-get run 'other) 'done))
+            (should-not (gptel-runner-get run 'answer))
+            (should (= callbacks 1))
+            (should (= (length (gptel-runner-run-calls run)) (if building 1 2)))
+            (should (= (length (gptel-runner-fake-driver-starts driver))
+                       (if building 0 1)))
+            (should (zerop (gptel-runner-run-active-count run)))
+            (should-not (gptel-runner-run-duration-timer run))))))))
+
+(ert-deftest gptel-runner-flow-duration-agent-functions-obey-phase-deadlines ()
+  (dolist (site '(prompt context parser validator))
+    ;; Include an accepted value, a rejection, and both nonlocal exits.
+    (dolist (outcome '("result" nil error quit))
+      (dolist (finalizer '(nil t))
+        (ert-info ((format "%s returning %S in %s" site outcome
+                           (if finalizer "finalizer" "body")))
+          (gptel-runner-flow-duration-test--agent site outcome finalizer))))))
+
+(ert-deftest gptel-runner-flow-duration-dispatch-rechecks-after-observers ()
+  (dolist (site '(admission call-started request-started))
+    (gptel-runner-dispatch-test--isolated
+      (gptel-runner-register-agent 'worker :workspace-mode 'write)
+      (let* ((now 100.0)
+             (driver (gptel-runner-fake-driver-create))
+             (acquired 0) (released 0)
+             (gptel-runner-call-admission-functions
+              (list (lambda (_call)
+                      (cl-incf acquired)
+                      (when (eq site 'admission) (cl-incf now 1))
+                      t)))
+             (gptel-runner-call-release-hook
+              (list (lambda (_call) (cl-incf released))))
+             (gptel-runner-event-hook
+              (list (lambda (event)
+                      (when (eq (gptel-runner-event-type event) site)
+                        (cl-incf now 1))))))
+        (gptel-runner-fake-queue driver 'worker '(:value "late"))
+        (cl-letf (((symbol-function 'float-time) (lambda (&optional _) now)))
+          (let ((run (gptel-runner-start
+                      (gptel-runner-agent-step :agent 'worker :prompt "work")
+                      :driver driver :max-duration 1 :allow-writes t)))
+            (should (eq (plist-get (gptel-runner-run-terminal-data run) :kind)
+                        'duration))
+            (should-not (gptel-runner-fake-driver-starts driver))
+            (should (= acquired released 1))
+            (should (zerop (gptel-runner-run-writer-active run)))
+            (should (zerop (gptel-runner-budget-requests (gptel-runner-run-budget run))))
+            (should (zerop (gptel-runner-run-active-count run)))))))))
+
+(ert-deftest gptel-runner-flow-duration-manual-acceptance-uses-active-clock ()
+  (dolist (paused '(nil t))
+    (gptel-runner-dispatch-test--isolated
+      (gptel-runner-register-agent 'worker)
+      (let ((now 100.0) (driver (gptel-runner-fake-driver-create)))
+        (gptel-runner-fake-queue driver 'worker '(:value "draft"))
+        (cl-letf (((symbol-function 'float-time) (lambda (&optional _) now)))
+          (let* ((root (gptel-runner-agent-step
+                        :id 'worker :agent 'worker :prompt "review" :save-as 'answer
+                        :pause-after t :parser (lambda (value) (cl-incf now 1) value)))
+                 (workflow (gptel-runner-workflow-create :name 'approval :root root))
+                 (run (gptel-runner-start workflow :driver driver :max-duration 0.05))
+                 (call (car (gptel-runner-run-calls run))))
+            (should (eq (gptel-runner-call-state call) 'waiting-feedback))
+            (when paused (gptel-runner-pause-run run))
+            (gptel-runner-complete-call-from-buffer "approved" call)
+            (if paused
+                (progn
+                  (should (eq (gptel-runner-run-state run) 'succeeded))
+                  (should (equal (gptel-runner-get run 'answer) "approved")))
+              (should (eq (plist-get (gptel-runner-run-terminal-data run) :kind)
+                          'duration))
+              (should-not (gptel-runner-get run 'answer)))))))))
+
 (provide 'gptel-runner-flow-duration-test)
 ;;; gptel-runner-flow-duration-test.el ends here

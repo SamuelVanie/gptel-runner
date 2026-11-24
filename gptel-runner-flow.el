@@ -308,8 +308,8 @@ Return a cons of label and text, or nil when a function omits its context."
       (and value (cons owner value))))
    (t (user-error "Invalid context source for %s: %S" owner source))))
 
-(defun gptel-runner--resolve-context (run node)
-  "Return ordered context entries inherited by agent NODE in RUN."
+(defun gptel-runner--resolve-context (run node check)
+  "Resolve context for agent NODE in RUN, calling CHECK after each source."
   (let* ((workflow (gptel-runner-run-workflow run))
          (root (gptel-runner-workflow-root workflow))
          (workflow-context
@@ -334,7 +334,8 @@ Return a cons of label and text, or nil when a function omits its context."
       (dolist (source (gptel-runner--context-sources (cdr layer)))
         (when-let* ((entry (gptel-runner--resolve-context-source
                             run node source (car layer))))
-          (push entry entries))))))
+          (push entry entries))
+        (funcall check)))))
 
 (defun gptel-runner--prepend-context (prompt entries)
   "Prepend resolved context ENTRIES to PROMPT."
@@ -664,14 +665,45 @@ The caller must defer dispatch through cancellation and failure propagation."
     (dolist (call calls)
       (gptel-runner-abort-call call reason))))
 
-(defun gptel-runner--prompt (run node)
-  "Resolve NODE's prompt for RUN."
+(defun gptel-runner--evaluate-agent-input (run node function)
+  "Evaluate FUNCTION for agent NODE within RUN's current phase.
+FUNCTION receives a checkpoint to call between user functions and returns
+a cons describing success or failure.  Return nil for obsolete work.  A
+paused run accepting a manual response has no active duration clock."
+  (let* ((state (gptel-runner-run-state run))
+         (generation (gptel-runner-run-generation run))
+         (epochs (gptel-runner-run-continuation-epochs run))
+         (id (gptel-runner-node-id node))
+         (epoch (gethash id epochs 0))
+         (outcome
+          (catch 'gptel-runner-interrupted-input
+            (cl-flet ((check ()
+                        (unless (and (= generation (gptel-runner-run-generation run))
+                                     (eq state (gptel-runner-run-state run))
+                                     (= epoch (gethash id epochs 0)))
+                          (throw 'gptel-runner-interrupted-input nil))
+                        (when (gptel-runner--duration-due-p run)
+                          (throw 'gptel-runner-interrupted-input 'expired))))
+              (check)
+              ;; A non-yielding function may return, signal, or quit after
+              ;; expiry.  Check before its outcome reaches any continuation.
+              (unwind-protect (funcall function #'check)
+                (check))))))
+    (if (eq outcome 'expired)
+        (progn (gptel-runner--duration-expired run generation) nil)
+      outcome)))
+
+(defun gptel-runner--prompt (run node check)
+  "Resolve NODE's prompt for RUN, calling CHECK between user functions."
   (let* ((turn (gethash (gptel-runner-node-id node) (gptel-runner-run-discussions run)))
          (prompt (plist-get (gptel-runner-node-properties node) :prompt))
          (resolved (or (plist-get turn :prompt)
-                       (gptel-runner--prepend-context
-                        (if (functionp prompt) (funcall prompt run node) prompt)
-                        (gptel-runner--resolve-context run node))))
+                       (let ((text (if (functionp prompt)
+                                       (funcall prompt run node)
+                                     prompt)))
+                         (funcall check)
+                         (gptel-runner--prepend-context
+                          text (gptel-runner--resolve-context run node check)))))
          (message (unless turn (gptel-runner--incoming-handoff run node)))
          (decisions (and (gptel-runner-decision-memory-p run)
                          (gptel-runner-decisions run)))
@@ -728,24 +760,31 @@ The caller must defer dispatch through cancellation and failure propagation."
                  (gptel-runner--subtree-state-p run child state))
                (gptel-runner-node-children node))))
 
-(defun gptel-runner--parse-agent-result (agent node value)
-  "Parse and validate VALUE for AGENT and NODE.
-Return (t . VALUE) on success or (nil . ERROR) on invalid output."
-  (if (gptel-runner--empty-output-p value)
-      (cons nil (gptel-runner--empty-output-error))
-    (condition-case err
-        (let* ((props (gptel-runner-node-properties node))
-               (parser (or (plist-get props :parser)
-                           (gptel-runner-agent-parser agent)))
-               (validator (or (plist-get props :validator)
-                              (gptel-runner-agent-validator agent)))
-               (parsed (if parser (funcall parser value) value)))
-          (if (and parser (null parsed))
-              (cons nil (list :type 'invalid-output :reason 'empty-parse))
-            (if (and validator (not (funcall validator parsed)))
-                (cons nil (list :type 'invalid-output :reason 'validation))
-              (cons t parsed))))
-      (error (cons nil (list :type 'invalid-output :error err))))))
+(defun gptel-runner--parse-agent-result (call value)
+  "Parse and validate VALUE for CALL.
+Return (t . VALUE) on success, (nil . ERROR) on invalid output, or nil
+if CALL's phase expired or changed while processing the response."
+  (let* ((node (gptel-runner-call-node call))
+         (agent (gptel-runner-call-agent call))
+         (props (gptel-runner-node-properties node))
+         (parser (or (plist-get props :parser) (gptel-runner-agent-parser agent)))
+         (validator (or (plist-get props :validator)
+                        (gptel-runner-agent-validator agent))))
+    (gptel-runner--evaluate-agent-input
+     (gptel-runner-call-run call) node
+     (lambda (check)
+       (if (gptel-runner--empty-output-p value)
+           (cons nil (gptel-runner--empty-output-error))
+         (condition-case err
+             (let ((parsed (if parser (funcall parser value) value)))
+               (funcall check)
+               (cond
+                ((and parser (null parsed))
+                 (cons nil (list :type 'invalid-output :reason 'empty-parse)))
+                ((and validator (not (funcall validator parsed)))
+                 (cons nil (list :type 'invalid-output :reason 'validation)))
+                (t (cons t parsed))))
+           (error (cons nil (list :type 'invalid-output :error err)))))))))
 
 (defun gptel-runner--repair-prompt (run node value error-data)
   "Build an output repair prompt for RUN, NODE, VALUE, ERROR-DATA."
@@ -786,20 +825,22 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
            (funcall done state value))
          (resolve-and-launch
           ()
-          (let* ((generation (gptel-runner-run-generation run))
-                 (resolved
-                  (condition-case err
-                      (cons t (if-let* ((parked (gptel-runner--resuming-chat run node)))
-                                  (gptel-runner-call-prompt parked)
-                                (gptel-runner--prompt run node)))
-                    (error
-                     (finish 'failed (list :type 'prompt :error err))
-                     nil))))
-            (when (and resolved (= generation (gptel-runner-run-generation run)))
-              (launch (cdr resolved)
-                      (plist-get (gethash (gptel-runner-node-id node)
-                                          (gptel-runner-run-discussions run))
-                                 :repair)))))
+          (when-let* ((resolved
+                       (gptel-runner--evaluate-agent-input
+                        run node
+                        (lambda (check)
+                          (condition-case err
+                              (cons t
+                                    (if-let* ((parked (gptel-runner--resuming-chat run node)))
+                                        (gptel-runner-call-prompt parked)
+                                      (gptel-runner--prompt run node check)))
+                            (error (cons nil (list :type 'prompt :error err))))))))
+            (if (car resolved)
+                (launch (cdr resolved)
+                        (plist-get (gethash (gptel-runner-node-id node)
+                                            (gptel-runner-run-discussions run))
+                                   :repair))
+              (finish 'failed (cdr resolved)))))
          (repair-empty
           (call error-data)
           (setq repaired t)
@@ -822,23 +863,18 @@ Include ORIGINAL-PROMPT so the repair instructions identify the task."
              (lambda (call state value)
                (pcase state
                  ('succeeded
-                  (let* ((generation (gptel-runner-run-generation run))
-                         (parsed (gptel-runner--parse-agent-result
-                                  agent node value)))
-                    ;; Parsing may yield while the body expires and its run
-                    ;; finalizer starts.  Do not publish an obsolete result.
-                    (when (= generation (gptel-runner-run-generation run))
-                      (if (car parsed)
-                          (progn
-                            (gptel-runner--accept-agent-result call (cdr parsed) value)
-                            (funcall done 'succeeded (cdr parsed)))
-                        (cond
-                         ((and (gptel-runner--empty-output-error-p (cdr parsed))
-                               (not repaired))
-                          (repair-empty call (cdr parsed)))
-                         ((and repair-allowed (not repaired))
-                          (repair-invalid value (cdr parsed)))
-                         (t (finish 'failed (cdr parsed))))))))
+                  (when-let* ((parsed (gptel-runner--parse-agent-result call value)))
+                    (if (car parsed)
+                        (progn
+                          (gptel-runner--accept-agent-result call (cdr parsed) value)
+                          (funcall done 'succeeded (cdr parsed)))
+                      (cond
+                       ((and (gptel-runner--empty-output-error-p (cdr parsed))
+                             (not repaired))
+                        (repair-empty call (cdr parsed)))
+                       ((and repair-allowed (not repaired))
+                        (repair-invalid value (cdr parsed)))
+                       (t (finish 'failed (cdr parsed)))))))
                  ('blocked (finish 'blocked value))
                  ('cancelled (finish 'cancelled value))
                  (_
@@ -927,10 +963,7 @@ the error handler so errors in later nodes are not attributed to this function."
       ;; CPU-bound functions cannot service timers.  Check elapsed time before
       ;; accepting an outcome, while retaining the generation/owner guard above.
       (cond
-       ((and (gptel-runner-run-duration-remaining run)
-             (gptel-runner-run-active-started-at run)
-             (>= (- (float-time) (gptel-runner-run-active-started-at run))
-                 (gptel-runner-run-duration-remaining run)))
+       ((gptel-runner--duration-due-p run)
         (gptel-runner--duration-expired run generation))
        ((eq (car outcome) 'succeeded)
         (funcall next (cdr outcome)))
@@ -2338,27 +2371,27 @@ for the extended run's next terminal transition."
   (let* ((run (gptel-runner-call-run call))
          (node (gptel-runner-call-node call))
          (owner (gptel-runner-call-discussion-owner call))
-         (turns (gptel-runner-run-discussions run)))
-    (if owner
-        (let ((stack (plist-get (gethash owner turns) :stack)))
-          (unless (and (cdr stack) (equal (car stack) (gptel-runner-node-id node)))
-            (user-error "No pending question for this call"))
-          (gptel-runner--route-discussion run owner stack call value))
-      (let ((parsed (gptel-runner--parse-agent-result
-                     (gptel-runner-call-agent call) node value)))
+         (turns (gptel-runner-run-discussions run))
+         (parsed (unless owner (gptel-runner--parse-agent-result call value))))
+    (when (or owner parsed)
+      (if owner
+          (let ((stack (plist-get (gethash owner turns) :stack)))
+            (unless (and (cdr stack) (equal (car stack) (gptel-runner-node-id node)))
+              (user-error "No pending question for this call"))
+            (gptel-runner--route-discussion run owner stack call value))
         (unless (car parsed)
           (user-error "Manual response is invalid: %S" (cdr parsed)))
         (remhash (gptel-runner-node-id node) turns)
-        (gptel-runner--accept-agent-result call (cdr parsed) value)))
-    (setf (gptel-runner-call-on-complete call) nil)
-    (gptel-runner--finish-call call 'succeeded value)
-    ;; Parallel reviewers can both have finished answers waiting for a human.
-    ;; Restarting now would supersede the other reviewer's pending acceptance.
-    (if (and (eq (gptel-runner-run-state run) 'paused)
-             (not (cl-find 'waiting-feedback (gptel-runner-run-calls run)
-                           :key #'gptel-runner-call-state)))
-        (gptel-runner-resume-run run)
-      (gptel-runner--checkpoint run t))))
+        (gptel-runner--accept-agent-result call (cdr parsed) value))
+      (setf (gptel-runner-call-on-complete call) nil)
+      (gptel-runner--finish-call call 'succeeded value)
+      ;; Parallel reviewers can both have finished answers waiting for a human.
+      ;; Restarting now would supersede the other reviewer's pending acceptance.
+      (if (and (eq (gptel-runner-run-state run) 'paused)
+               (not (cl-find 'waiting-feedback (gptel-runner-run-calls run)
+                             :key #'gptel-runner-call-state)))
+          (gptel-runner-resume-run run)
+        (gptel-runner--checkpoint run t)))))
 
 (provide 'gptel-runner-flow)
 ;;; gptel-runner-flow.el ends here

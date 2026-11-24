@@ -1136,28 +1136,29 @@ RAW is gptel's internal flag for already formatted transcript content."
 (defun gptel-runner-gptel--send-request (fsm handlers)
   "Charge runner FSM's next provider send before executing HANDLERS."
   (let* ((call (plist-get (gptel-fsm-info fsm) :context))
-         (runner-call (gptel-runner-call-p call))
-         (generation (and runner-call (gptel-runner-call-generation call))))
-    (when (or (not runner-call)
+         (run (and (gptel-runner-call-p call) (gptel-runner-call-run call)))
+         (generation (and run (gptel-runner-call-generation call))))
+    (when (or (not run)
               (and (eq fsm (gptel-runner-call-fsm call))
                    (memq (gptel-runner-call-state call)
-                         '(running waiting-tool waiting-confirmation))))
-      (if (and runner-call
-               (not (gptel-runner--consume-request
-                     (gptel-runner-call-run call))))
+                         '(running waiting-tool waiting-confirmation))
+                   (gptel-runner--check-duration run)))
+      (if (and run
+               (not (gptel-runner--consume-request run)))
           (gptel-runner-gptel--request-budget-exhausted call fsm)
         (gptel-runner-gptel--prepare-request fsm)
-        (when runner-call
+        (when run
           (gptel-runner--emit
-           (gptel-runner-call-run call) 'request-started
+           run 'request-started
            (gptel-runner-call-node call) call
            (list :attempt (gptel-runner-call-request-attempt call))))
         ;; An event hook can synchronously cancel or pause this attempt.
         ;; Retiring the FSM does not disarm our captured native handlers.
-        (when (or (not runner-call)
+        (when (or (not run)
                   (and (= generation (gptel-runner-call-generation call))
                        (not (gptel-runner--call-terminal-p call))
-                       (eq fsm (gptel-runner-call-fsm call))))
+                       (eq fsm (gptel-runner-call-fsm call))
+                       (gptel-runner--check-duration run t)))
           (mapc (lambda (handler) (funcall handler fsm)) handlers)
           (when (eq (gptel-fsm-state fsm) 'WAIT)
             (gptel--update-wait fsm)))))))
