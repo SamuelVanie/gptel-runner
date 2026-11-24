@@ -168,7 +168,8 @@ On Windows the default is `gptel-runner-windows-scheduler-arguments'."
     ;; Reading validates that opaque objects and closures containing them do
     ;; not silently turn a durable record into an unreadable file.
     (condition-case err
-        (read-from-string text)
+        (unless (= (cdr (read-from-string text)) (length text))
+          (error "Serialized value has trailing unreadable data"))
       (error (error "Job data is not serializable: %s"
                     (error-message-string err))))
     (concat text "\n")))

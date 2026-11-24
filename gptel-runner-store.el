@@ -71,7 +71,7 @@ terminal run transitions bypass it, but their writes are still asynchronous."
 (cl-defstruct (gptel-runner-store--coordinator
                (:constructor gptel-runner-store--coordinator-create))
   "Save coordination state belonging to one runner RUN."
-  run file (revision 0) (committed-revision 0) (state 'clean)
+  run file (revision 0) (saved-revision 0) (state 'clean)
   timer writer error urgent notify)
 
 (defvar gptel-runner-store--coordinators (make-hash-table :test #'eq)
@@ -748,7 +748,7 @@ The result is one of `clean', `pending', `writing', or `error'."
     (set-file-modes (gptel-runner-store--writer-temporary writer) #o600)
     (rename-file (gptel-runner-store--writer-temporary writer) file t)
     (setf (gptel-runner-store--coordinator-writer coordinator) nil
-          (gptel-runner-store--coordinator-committed-revision coordinator)
+          (gptel-runner-store--coordinator-saved-revision coordinator)
           revision
           (gptel-runner-store--coordinator-error coordinator) nil)
     (if (< revision (gptel-runner-store--coordinator-revision coordinator))
@@ -870,7 +870,7 @@ is reported through a `snapshot-saved' event; failures use `snapshot-error'."
 (defun gptel-runner-store--unsaved-p (coordinator)
   "Return non-nil if COORDINATOR still has uncommitted snapshot work."
   (or (not (eq (gptel-runner-store--coordinator-state coordinator) 'clean))
-      (< (gptel-runner-store--coordinator-committed-revision coordinator)
+      (< (gptel-runner-store--coordinator-saved-revision coordinator)
          (gptel-runner-store--coordinator-revision coordinator))))
 
 (defun gptel-runner-store--flush-coordinator (coordinator)
