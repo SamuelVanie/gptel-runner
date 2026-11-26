@@ -64,7 +64,9 @@
     (gptel-runner-workspace-diff-test--init)
     (let* ((run (gptel-runner-run-create :workspace default-directory))
            (clean (gptel-runner-workspace-diff-key run))
-           (file "nested/-a 'draft'\n$(echo surprise)"))
+           (file (concat "nested/-a 'draft'"
+                         (if (eq system-type 'windows-nt) " " "\n")
+                         "$(echo surprise)")))
       (make-directory "nested")
       (with-temp-file "ignored" (insert "ignored output"))
       (should (equal clean (gptel-runner-workspace-diff-key run)))
@@ -116,7 +118,12 @@
       (with-temp-file "link/file" (insert "tracked before replacement"))
       (gptel-runner-workspace-diff-test--git "add" "link/file")
       (rename-file "link" "ignored")
-      (make-symbolic-link "ignored" "link")
+      (condition-case err
+          (make-symbolic-link "ignored" "link")
+        (file-error
+         (if (eq system-type 'windows-nt)
+             (ert-skip (error-message-string err))
+           (signal (car err) (cdr err)))))
       (let ((linked (gptel-runner-workspace-diff-key run)))
         ;; Git sees link/file as deleted, even though following the symlink
         ;; would find it.  Editing the ignored target must not count.
