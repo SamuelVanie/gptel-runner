@@ -1002,6 +1002,36 @@
               (should (= (gptel-runner-iteration run 'cycle) 3))))
         (delete-directory temp t)))))
 
+(ert-deftest gptel-runner-review-loop-observes-node-workspace-progress ()
+  (skip-unless (executable-find "git"))
+  (gptel-runner-test--isolated
+    (let* ((workspace (make-temp-file "gptel-runner-review-loop-" t))
+           (repository (expand-file-name "component" workspace)))
+      (unwind-protect
+          (progn
+            (should (zerop (process-file "git" nil nil nil "init" "-q" repository)))
+            (let* ((body
+                    (gptel-runner-elisp-step
+                     :workspace "component" :workspace-mode 'write
+                     :save-as 'review
+                     :function
+                     (lambda (run _node)
+                       (let ((iteration (gptel-runner-iteration run 'cycle)))
+                         (when (< iteration 2)
+                           (with-temp-file "draft"
+                             (insert (number-to-string iteration)))))
+                       '(:verdict revise :summary "same" :issues nil))))
+                   (run (gptel-runner-start
+                         (gptel-runner-repeat-until
+                          :id 'cycle :max 4 :body body
+                          :progress-key #'gptel-runner-review-diff-progress-key)
+                         :workspace workspace :allow-writes t)))
+              ;; The second edit advances the loop despite the same review.
+              ;; The third iteration changes neither the review nor the file.
+              (should (eq (gptel-runner-run-state run) 'stalled))
+              (should (= (gptel-runner-iteration run 'cycle) 3))))
+        (delete-directory workspace t)))))
+
 (ert-deftest gptel-runner-parallel-obeys-concurrency-and-synthesizes ()
   (gptel-runner-test--isolated
     (dolist (agent '(a b c synth)) (gptel-runner-register-agent agent :preset 'p))

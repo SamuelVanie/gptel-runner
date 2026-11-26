@@ -76,6 +76,13 @@ one-shot output repair, bounded revisions, and stall detection.  The
 [parallel design](../examples/parallel-design.el) examples demonstrate the
 optional schema helpers and fan-out/synthesis workflows.
 
+Use `:progress-key #'gptel-runner-review-diff-progress-key` on a repeat to
+count both the normalized review and Git changes as progress. It checks the
+whole worktree containing the run workspace and each distinct worktree used
+by a configured agent or Elisp workspace override. It detects new commits,
+staged changes, and edits to tracked or non-ignored untracked files. When no
+Git worktree is available, the review alone determines progress.
+
 ## Core API
 
 Workflows are data, built with `gptel-runner-agent-step`, `gptel-runner-elisp-step`,

@@ -115,21 +115,91 @@ Signal an error for malformed data or an unknown verdict."
     (secure-hash 'sha256
                  (prin1-to-string (gptel-runner-normalize-review review)))))
 
-(defun gptel-runner-workspace-diff-key (run)
-  "Hash the unstaged Git diff from RUN's workspace.
-Git discovers the worktree from the workspace directory.  Return nil
-when the workspace has no worktree or Git cannot produce a diff."
-  (when-let* ((workspace (gptel-runner-run-workspace run))
-              ((file-directory-p workspace)))
+(defun gptel-runner--git-output (directory &rest arguments)
+  "Return Git's stdout in DIRECTORY for ARGUMENTS, or nil on failure."
+  (when directory
+    (let* ((default-directory (file-name-as-directory directory))
+           (coding-system-for-read
+            (coding-system-change-eol-conversion
+             (or file-name-coding-system default-file-name-coding-system 'utf-8) 0))
+           (coding-system-for-write coding-system-for-read))
+      (with-temp-buffer
+        (when (eql 0 (ignore-error file-error
+                       (apply #'process-file "git" nil '(t nil) nil
+                              "--no-optional-locks" arguments)))
+          (buffer-string))))))
+
+(defun gptel-runner--git-dirty-path (record)
+  "Extract a path needing a content hash from Git porcelain v2 RECORD."
+  ;; Ordinary records have eight space-terminated fields, unmerged ones ten.
+  ;; With renames disabled, each record (including its path) is NUL-delimited.
+  (pcase (aref record 0)
+    (?? (substring record 2))
+    (?1 (unless (memq (aref record 3) '(?. ?D)) ; unchanged or deleted
+          (when (string-match "\\`\\(?:[^ ]+ \\)\\{8\\}" record)
+            (substring record (match-end 0)))))
+    (?u (when (string-match "\\`\\(?:[^ ]+ \\)\\{10\\}" record)
+          (substring record (match-end 0))))))
+
+(defun gptel-runner--git-worktree-key (root)
+  "Hash the HEAD, index and visible working tree changes at ROOT."
+  (when-let* ((status (gptel-runner--git-output
+                       root "status" "--porcelain=v2" "-z" "--branch"
+                       "--no-ahead-behind" "--no-renames" "--untracked-files=all"
+                       "--ignore-submodules=none")))
     (with-temp-buffer
-      (let ((default-directory workspace))
-        (when (and (executable-find "git" t)
-                   (equal 0 (process-file "git" nil '(t nil) nil
-                                          "diff" "--no-ext-diff")))
-          (secure-hash 'sha256 (buffer-string)))))))
+      (let ((default-directory root)
+            files)
+        (dolist (record (sort (split-string status "\0" t) #'string<))
+          ;; HEAD also records progress when a worker commits between reviews.
+          (unless (and (eq (aref record 0) ?#)
+                       (not (string-prefix-p "# branch.oid " record)))
+            (insert record "\0")
+            (when-let* ((path (gptel-runner--git-dirty-path record))
+                        (file (concat "./" path))
+                        (attrs (file-attributes file)))
+              (let ((type (file-attribute-type attrs))
+                    (mode (file-attribute-modes attrs)))
+                (cond
+                 ((stringp type) (insert "link " type "\0"))
+                 ((eq (aref mode 0) ?-)
+                  (insert (if (memq (aref mode 3) '(?x ?s)) "+x\0" "-x\0"))
+                  (push file files)))))))
+        ;; Let Git read regular files directly.  Only fixed-size object IDs
+        ;; enter Emacs, even for large binary files.  Never read FIFOs/devices.
+        (catch 'incomplete
+          (dolist (batch (seq-partition (nreverse files) 32))
+            (let ((oids (apply #'gptel-runner--git-output root
+                               "hash-object" "--no-filters" "--" batch)))
+              (unless oids (throw 'incomplete nil))
+              (insert oids)))
+          (secure-hash 'sha256 (current-buffer)))))))
+
+(defun gptel-runner-workspace-diff-key (run)
+  "Hash Git worktrees used by RUN and its explicit node workspace overrides.
+Each distinct worktree contributes its HEAD, staged changes, and unstaged
+and non-ignored untracked changes.  A workspace inside a repository covers
+the whole worktree.  Return nil if no worktree can be fingerprinted."
+  (let* ((workspace (gptel-runner-run-workspace run))
+         (directories (list workspace))
+         roots keys)
+    (when (gptel-runner-run-workflow run)
+      (dolist (node (gptel-runner-list-nodes run))
+        (when (and (memq (gptel-runner-node-kind node) '(agent elisp))
+                   (plist-get (gptel-runner-node-properties node) :workspace))
+          (push (gptel-runner--node-workspace node workspace t) directories))))
+    (dolist (directory (delete-dups directories))
+      (when-let* ((top (gptel-runner--git-output directory "rev-parse" "--show-toplevel")))
+        (push (file-name-as-directory
+               (concat (file-remote-p directory) (string-remove-suffix "\n" top)))
+              roots)))
+    (dolist (root (sort (delete-dups roots) #'string<))
+      (when-let* ((key (gptel-runner--git-worktree-key root)))
+        (push key keys)))
+    (when keys (secure-hash 'sha256 (apply #'concat keys)))))
 
 (defun gptel-runner-review-diff-progress-key (run &optional review-key)
-  "Hash review and optional Git diff progress for RUN at REVIEW-KEY."
+  "Hash the review at REVIEW-KEY and the Git worktree progress of RUN."
   (when-let* ((review (gptel-runner-get run (or review-key 'review))))
     (secure-hash
      'sha256
