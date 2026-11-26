@@ -666,7 +666,9 @@ also selects the instructions for its directory. For example, including
 supply `frontend/AGENTS.md` in the system prompt from the first request.
 Existing `(:file "AGENTS.md")` declarations select that scope too. The agent
 refreshes the rules on each send and honors the chat's project-instructions
-setting. Without managed instruction support, an explicit `AGENTS.md` file
+setting. Editable chat copies opened from the background dashboard retain
+the declared paths, so a follow-up reads the current rules from disk.
+Without managed instruction support, an explicit `AGENTS.md` file
 uses the runner's ordinary starting-context behavior.
 
 Every workflow has decision memory enabled by default.  Record a workflow-wide,

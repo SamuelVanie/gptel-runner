@@ -71,6 +71,7 @@
 (defvar gptel--schema)
 (defvar gptel-agent-child-buffer-functions)
 (defvar gptel-agent-session-managed-externally)
+(defvar gptel-agent-instructions-context-paths)
 ;; gptel ignores unknown preset keys.  Retain an explicitly selected policy
 ;; even in a plain runner process so it cannot dispatch without enforcement.
 (defvar gptel-agent-tool-policy nil)
@@ -653,6 +654,7 @@ When CALL is given, apply its agent preset in its workspace before returning."
             (submitted (gptel-runner-gptel-submitted-end buffer))
             (rendered (gptel-runner-gptel-rendered-end buffer))
             (workspace default-directory)
+            (context-paths (bound-and-true-p gptel-agent-instructions-context-paths))
             (confirmation gptel-confirm-tool-calls)
             (ceiling (and (fboundp 'gptel-agent-policy-buffer-ceiling)
                           (cl-union (gptel-agent-policy-buffer-ceiling buffer)
@@ -675,6 +677,13 @@ When CALL is given, apply its agent preset in its workspace before returning."
           (let ((footer (point)) (print-escape-newlines t))
             (insert "\n;; Local Variables:\n;; mode: " (symbol-name mode) "\n;; End:\n")
             (add-file-local-variable 'gptel-runner-directory workspace)
+            (when context-paths
+              (add-file-local-variable 'gptel-agent-instructions-context-paths
+                                       (mapcar #'substring-no-properties context-paths))
+              (when (local-variable-p 'gptel-agent-use-project-instructions buffer)
+                (add-file-local-variable
+                 'gptel-agent-use-project-instructions
+                 (and (buffer-local-value 'gptel-agent-use-project-instructions buffer) t))))
             (add-file-local-variable 'gptel-confirm-tool-calls confirmation)
             (when ceiling
               (add-file-local-variable 'gptel-runner-tool-policy-ceiling ceiling))
@@ -711,6 +720,8 @@ When EXTERNAL is non-nil, the caller owns the restored chat's persistence."
           (let ((key (intern-soft (match-string 1))))
             (when (memq key '(mode gptel-runner-submitted-end gptel-runner-rendered-end
                               gptel-runner-directory gptel-runner-tool-policy-ceiling
+                              gptel-agent-instructions-context-paths
+                              gptel-agent-use-project-instructions
                               gptel-confirm-tool-calls gptel-model
                               gptel--preset gptel--backend-name gptel-system-prompt
                               gptel--tool-names gptel--bounds gptel-max-tokens
@@ -733,6 +744,9 @@ When EXTERNAL is non-nil, the caller owns the restored chat's persistence."
                       ((or 'gptel--backend-name 'gptel-system-prompt) (stringp (cdr entry)))
                       ('gptel--tool-names (and (proper-list-p (cdr entry))
                                                (cl-every #'stringp (cdr entry))))
+                      ('gptel-agent-instructions-context-paths
+                       (and (proper-list-p (cdr entry)) (cl-every #'stringp (cdr entry))))
+                      ('gptel-agent-use-project-instructions (booleanp (cdr entry)))
                       ('gptel--bounds (proper-list-p (cdr entry)))
                       ((or 'gptel-max-tokens 'gptel--num-messages-to-send) (natnump (cdr entry)))
                       ('gptel-temperature (numberp (cdr entry))))
