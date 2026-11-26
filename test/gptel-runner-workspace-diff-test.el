@@ -125,6 +125,34 @@
         (make-symbolic-link "another target" "link" t)
         (should-not (equal linked (gptel-runner-workspace-diff-key run)))))))
 
+(ert-deftest gptel-runner-workspace-diff-tracks-submodule-checkout ()
+  (gptel-runner-workspace-diff-test--with-directory
+    (make-directory "source")
+    (let ((default-directory (expand-file-name "source/")))
+      (gptel-runner-workspace-diff-test--init))
+    (make-directory "parent")
+    (let* ((default-directory (expand-file-name "parent/"))
+           (run (gptel-runner-run-create :workspace default-directory)))
+      (gptel-runner-workspace-diff-test--init)
+      (gptel-runner-workspace-diff-test--git
+       "-c" "protocol.file.allow=always" "submodule" "add" "../source" "child")
+      (gptel-runner-workspace-diff-test--git "commit" "--quiet" "-m" "Record A")
+      (let ((original (gptel-runner-workspace-diff-key run))
+            keys)
+        ;; Leave the parent index at A while moving the child to B, then C.
+        (dolist (revision '("B" "C"))
+          (with-temp-file "child/tracked" (insert revision))
+          (gptel-runner-workspace-diff-test--git
+           "-C" "child" "commit" "-qam" revision)
+          (let ((key (gptel-runner-workspace-diff-key run)))
+            (should (stringp key))
+            (should (equal key (gptel-runner-workspace-diff-key run)))
+            (push key keys)))
+        (should-not (equal original (cadr keys)))
+        (should-not (equal (car keys) (cadr keys)))
+        (gptel-runner-workspace-diff-test--git "-C" "child" "checkout" "--detach" "HEAD~2")
+        (should (equal original (gptel-runner-workspace-diff-key run)))))))
+
 (ert-deftest gptel-runner-workspace-diff-outside-git ()
   (gptel-runner-workspace-diff-test--with-directory
     (let ((run (gptel-runner-run-create :workspace default-directory)))

@@ -80,8 +80,10 @@ Use `:progress-key #'gptel-runner-review-diff-progress-key` on a repeat to
 count both the normalized review and Git changes as progress. It checks the
 whole worktree containing the run workspace and each distinct worktree used
 by a configured agent or Elisp workspace override. It detects new commits,
-staged changes, and edits to tracked or non-ignored untracked files. When no
-Git worktree is available, the review alone determines progress.
+staged changes, and edits to tracked or non-ignored untracked files. For
+submodules, the parent tracks the checked-out commit and Git's dirty flags.
+Configure the submodule as a workspace to track successive file edits within
+it. When no Git worktree is available, the review alone determines progress.
 
 ## Core API
 

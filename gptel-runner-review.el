@@ -162,6 +162,13 @@ Signal an error for malformed data or an unknown verdict."
                     (mode (file-attribute-modes attrs)))
                 (cond
                  ((stringp type) (insert "link " type "\0"))
+                 ;; Submodule status carries the index gitlink and dirty flags.
+                 ;; Read the checkout's HEAD to distinguish successive commits.
+                 ((and (eq type t) (string-match-p "\\`[1u] .. S" record))
+                  (when-let* ((head (gptel-runner--git-output
+                                     root "--git-dir" (concat file "/.git")
+                                     "rev-parse" "--verify" "HEAD")))
+                    (insert "gitlink " head "\0")))
                  ((eq (aref mode 0) ?-)
                   (insert (if (memq (aref mode 3) '(?x ?s)) "+x\0" "-x\0"))
                   (push file files)))))))
