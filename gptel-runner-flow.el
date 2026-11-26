@@ -288,7 +288,7 @@ When WORKSPACE is non-nil, also require every declared file to be readable."
 
 (defun gptel-runner--resolve-context-source (run node source owner)
   "Resolve SOURCE for RUN and agent NODE, labeling it with OWNER.
-Return a cons of label and text, or nil when a function omits its context."
+Return (LABEL . TEXT), or nil when SOURCE adds no user message text."
   (cond
    ((null source) nil)
    ((stringp source) (cons owner source))
@@ -298,8 +298,10 @@ Return a cons of label and text, or nil when a function omits its context."
            run (gptel-runner-get run (cadr source)))))
    ((gptel-runner--context-file-p source)
     (let ((file (cadr source)))
-      (cons (format "%s (file %s)" owner file)
-            (gptel-runner--read-context-file run node file))))
+      (unless (gptel-runner-driver-manages-context-file-p
+               (gptel-runner-run-driver run) file)
+        (cons (format "%s (file %s)" owner file)
+              (gptel-runner--read-context-file run node file)))))
    ((gptel-runner--context-function source)
     (let ((value (funcall (gptel-runner--context-function source) run node)))
       (unless (or (null value) (stringp value))
@@ -308,15 +310,13 @@ Return a cons of label and text, or nil when a function omits its context."
       (and value (cons owner value))))
    (t (user-error "Invalid context source for %s: %S" owner source))))
 
-(defun gptel-runner--resolve-context (run node check)
-  "Resolve context for agent NODE in RUN, calling CHECK after each source."
+(defun gptel-runner--node-context-sources (run node agent)
+  "Return labeled context sources for AGENT at NODE in RUN, in prompt order."
   (let* ((workflow (gptel-runner-run-workflow run))
          (root (gptel-runner-workflow-root workflow))
          (workflow-context
           (plist-get (gptel-runner-workflow-options workflow) :context))
          (run-context (plist-get (gptel-runner-run-options run) :context))
-         (agent (gptel-runner--agent
-                 (plist-get (gptel-runner-node-properties node) :agent)))
          (layers
           (append
            (list (cons "Workflow" workflow-context)
@@ -332,10 +332,26 @@ Return a cons of label and text, or nil when a function omits its context."
          entries)
     (dolist (layer layers (nreverse entries))
       (dolist (source (gptel-runner--context-sources (cdr layer)))
-        (when-let* ((entry (gptel-runner--resolve-context-source
-                            run node source (car layer))))
-          (push entry entries))
-        (funcall check)))))
+        (push (cons (car layer) source) entries)))))
+
+(defun gptel-runner--resolve-context (run node check)
+  "Resolve context for agent NODE in RUN, calling CHECK after each source."
+  (let ((agent (gptel-runner--agent
+                (plist-get (gptel-runner-node-properties node) :agent))))
+    (cl-loop for (owner . source) in (gptel-runner--node-context-sources run node agent)
+             for entry = (gptel-runner--resolve-context-source run node source owner)
+             do (funcall check)
+             when entry collect entry)))
+
+(defun gptel-runner--context-file-paths (call)
+  "Return the declared file paths for CALL without reading or evaluating context."
+  (let ((run (gptel-runner-call-run call)))
+    (when (gptel-runner-run-workflow run)
+      (cl-loop for (_owner . source) in
+               (gptel-runner--node-context-sources
+                run (gptel-runner-call-node call) (gptel-runner-call-agent call))
+               when (gptel-runner--context-file-p source)
+               collect (expand-file-name (cadr source) (gptel-runner-call-workspace call))))))
 
 (defun gptel-runner--prepend-context (prompt entries)
   "Prepend resolved context ENTRIES to PROMPT."

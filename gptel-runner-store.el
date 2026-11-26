@@ -33,6 +33,7 @@
 (declare-function gptel-agent-session-import-buffer "gptel-agent-session")
 
 (defvar gptel-mode)
+(defvar gptel-agent-instructions-context-paths)
 
 (defgroup gptel-runner-store nil
   "Persistent snapshots for gptel-runner."
@@ -263,8 +264,12 @@ terminal run transitions bypass it, but their writes are still asynchronous."
     (gptel-runner--checkpoint run)))
 
 (defun gptel-runner-store--install-chat-hooks ()
-  "Install lifecycle hooks for the current owned node chat."
-  (when (gptel-runner-store--chat-owner)
+  "Restore instruction paths and lifecycle hooks for the current node chat."
+  (when-let* ((call (gptel-runner-store--chat-owner)))
+    ;; Opening an archive or switching major mode recreates the buffer locals.
+    (when (default-boundp 'gptel-agent-instructions-context-paths)
+      (setq-local gptel-agent-instructions-context-paths
+                  (gptel-runner--context-file-paths call)))
     ;; Reinstall after changing modes too: Emacs can retain a permanent
     ;; after-change function without activating it until the hook is read.
     (add-hook 'after-change-functions #'gptel-runner-store--chat-changed nil t)

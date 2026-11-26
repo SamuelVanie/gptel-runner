@@ -12,7 +12,8 @@ test: clean
 integration-test:
 	$(EMACS) -Q --batch $(INTEGRATION_LOAD_PATH) -L . -L test \
 	  --eval '(setq load-prefer-newer t)' \
-	  -l test/gptel-runner-session-test.el -l test/gptel-runner-request-budget-test.el \
+	  --eval "(require 'gptel-runner-instructions-integration)" \
+	  --eval "(require 'gptel-runner-request-budget-test)" \
 	  -f ert-run-tests-batch-and-exit
 	$(EMACS) -Q --batch $(INTEGRATION_LOAD_PATH) -L . -L test \
 	  --eval '(setq load-prefer-newer t)' \

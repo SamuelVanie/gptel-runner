@@ -1348,6 +1348,12 @@ When supplied, TERMINAL-HANDLER handles all three terminal states."
   "Charge each gptel transport send, including tool and feedback rounds."
   t)
 
+(cl-defmethod gptel-runner-driver-manages-context-file-p
+  ((_driver gptel-runner-gptel-driver) file)
+  "Let gptel-agent control delivery when FILE names an AGENTS.md."
+  (and (default-boundp 'gptel-agent-instructions-context-paths)
+       (equal (file-name-nondirectory file) "AGENTS.md")))
+
 (defun gptel-runner-gptel--request-turn (call fsm schema callback)
   "Submit CALL's chat up to its prompt marker using FSM, SCHEMA and CALLBACK."
   (save-restriction

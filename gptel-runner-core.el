@@ -320,6 +320,13 @@ status; request budgets, retry limits, and `:permanent' still apply.")
 (cl-defgeneric gptel-runner-driver-cancel (driver call)
   "Ask DRIVER to cancel CALL.")
 
+(cl-defgeneric gptel-runner-driver-manages-context-file-p (driver file)
+  "Whether DRIVER delivers context FILE separately from user history.")
+
+(cl-defmethod gptel-runner-driver-manages-context-file-p (_driver _file)
+  "Ordinary drivers receive every explicit context file in the prompt."
+  nil)
+
 (cl-defgeneric gptel-runner-driver-counts-requests-p (driver)
   "Return non-nil if DRIVER accounts for each provider send itself.
 By default the core charges one request per `gptel-runner-driver-start'.

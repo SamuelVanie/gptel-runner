@@ -618,7 +618,7 @@ agent step even when the function belongs to a broader scope:
 (gptel-runner-defworkflow context-aware
     ;; Workflow options are quoted by the macro, so write file descriptors
     ;; as data here.  This context reaches every agent in the workflow.
-    (:context ((:file "AGENTS.md")))
+    (:context ((:file "docs/release-plan.md")))
   (gptel-runner-sequence
    :id 'delivery
    :context "Keep all changes within the requested feature."
@@ -657,6 +657,15 @@ and non-string function results are reported as context errors.  Use
  :context "The migration must remain backward compatible."
  :allow-writes t)
 ```
+
+With gptel-agent's managed project instructions loaded, each `:file` path
+also selects the instructions for its directory. For example, including
+`frontend/notes.md` places the notes in the user turn and lets gptel-agent
+supply `frontend/AGENTS.md` in the system prompt from the first request.
+Existing `(:file "AGENTS.md")` declarations select that scope too. The agent
+refreshes the rules on each send and honors the chat's project-instructions
+setting. Without managed instruction support, an explicit `AGENTS.md` file
+uses the runner's ordinary starting-context behavior.
 
 Every workflow has decision memory enabled by default.  Record a workflow-wide,
 run-scoped choice from Lisp with:
